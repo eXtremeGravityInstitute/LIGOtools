@@ -9,8 +9,8 @@ This file mirrors the functional algorithm in BWtest.c and BayesLine.c:
 3. Run BayesLine burn-in:
    - wavelet clean non-Gaussian excess power,
    - build the initial smooth PSD with Akima splines,
-   - find spectral lines with the C four-pass windowed-Lorentzian startup,
-   - write xx.dat with frequency, cleaned periodogram, smooth PSD, line PSD.
+   - find spectral lines with a four-pass windowed-Lorentzian startup,
+   - optionally write BL_start.dat with frequency, cleaned periodogram, smooth PSD, line PSD.
 4. Run the Lorentzian+spline RJMCMC refinement.
 5. Write output files using the same normalization convention expected by
    ADtest.py.
@@ -36,8 +36,8 @@ Important output files:
     frequency_data.dat
         Final cleaned complex frequency-domain data, scaled for ADtest.py.
 
-    xx.dat
-        Startup diagnostic: frequency, periodogram, smooth PSD, line PSD.
+    BL_start.dat
+        Optional startup diagnostic: frequency, periodogram, smooth PSD, line PSD.
 
     BWpsd_components.dat
         Final total, smooth, and line PSD components.
@@ -48,9 +48,10 @@ To run the functional whitening check used during development:
         --known-parameters --normal-mean 0 --normal-variance 1
 
 The original C code uses GSL, OpenMP, and a large RJMCMC implementation. This
-Python version uses NumPy plus optional numba acceleration for hot loops. When
-numba is unavailable the same code runs through a small compatibility decorator,
-just slower.
+Python version uses NumPy plus optional numba acceleration for hot loops. SciPy
+is used, when available, to speed up windowed-Lorentzian lookup generation with
+FFT convolution. When numba or SciPy is unavailable the same code keeps running
+through slower compatibility paths.
 """
 
 from __future__ import annotations
@@ -60,9 +61,17 @@ from dataclasses import dataclass, field
 import math
 from pathlib import Path
 import sys
+import time
 from typing import Optional, Tuple
 
 import numpy as np
+
+try:
+    from scipy.signal import fftconvolve
+    SCIPY_AVAILABLE = True
+except Exception:  # pragma: no cover - exercised on systems without scipy
+    fftconvolve = None
+    SCIPY_AVAILABLE = False
 
 try:
     from numba import njit
@@ -93,11 +102,12 @@ LINEMUL = 9.0
 T_RISE = 1.0
 FSTEP = 10.0
 Q_S = 8.0
-STHRESH = 10.0
+STHRESH = 9.0
 WARM = 6.0
 DEFAULT_ANALYSIS_FMIN = 20.0
 DEFAULT_ANALYSIS_FMAX = 1024.0
 TRIGGER_OFFSET_FROM_END = 4.0
+BL_START_FILENAME = "BL_start.dat"
 
 
 @dataclass
@@ -323,6 +333,52 @@ def logprior_bounds_numba(lower: np.ndarray, upper: np.ndarray, sn: np.ndarray) 
 
 
 @njit(cache=True)
+def positive_range_numba(sn: np.ndarray, ilow: int, ihigh: int) -> bool:
+    """Check positivity only over bins touched by a local proposal."""
+
+    lo = max(0, ilow)
+    hi = min(sn.size, ihigh)
+    for i in range(lo, hi):
+        if sn[i] <= 0.0:
+            return False
+    return True
+
+
+@njit(cache=True)
+def delta_logprior_bounds_range_numba(lower: np.ndarray, upper: np.ndarray,
+                                      sn_new: np.ndarray, sn_old: np.ndarray,
+                                      ilow: int, ihigh: int) -> float:
+    """Soft-bound prior difference over a local proposal window."""
+
+    val = 0.0
+    tiny = np.finfo(np.float64).tiny
+    lo = max(0, ilow)
+    hi = min(sn_new.size, ihigh)
+    for i in range(lo, hi):
+        snew = max(sn_new[i], tiny)
+        sold = max(sn_old[i], tiny)
+
+        old_penalty = 0.0
+        if sold > upper[i]:
+            ds = math.log(sold) - math.log(max(upper[i], tiny))
+            old_penalty -= 0.5 * ds * ds
+        if sold < lower[i]:
+            ds = math.log(sold) - math.log(max(lower[i], tiny))
+            old_penalty -= 0.5 * ds * ds
+
+        new_penalty = 0.0
+        if snew > upper[i]:
+            ds = math.log(snew) - math.log(max(upper[i], tiny))
+            new_penalty -= 0.5 * ds * ds
+        if snew < lower[i]:
+            ds = math.log(snew) - math.log(max(lower[i], tiny))
+            new_penalty -= 0.5 * ds * ds
+
+        val += new_penalty - old_penalty
+    return val
+
+
+@njit(cache=True)
 def lookup_line_delta(sn_old: np.ndarray, data_imin: int, t_obs: float,
                       nf: int, nnu: int, wdth: int, lnumin: float, lnumax: float,
                       ltemplate: np.ndarray, f0: float, amp: float, nu: float,
@@ -377,6 +433,131 @@ def lookup_line_delta(sn_old: np.ndarray, data_imin: int, t_obs: float,
 
 
 @njit(cache=True)
+def lorentzian_lookup_params(t_obs: float, nf: int, nnu: int, lnumin: float,
+                             lnumax: float, f0: float, nu: float) -> Tuple[int, int, int, float, float]:
+    """Return the llook grid indices and interpolation weights."""
+
+    k = int(round(f0 * t_obs))
+    xoff = f0 - k / t_obs
+    if xoff * t_obs <= -0.5:
+        k -= 1
+        xoff = f0 - k / t_obs
+    if xoff * t_obs >= 0.5:
+        k += 1
+        xoff = f0 - k / t_obs
+
+    dfx = 1.0 / (nf * t_obs)
+    dnux = (lnumax - lnumin) / nnu
+    ii = (nf + int(math.floor(2.0 * xoff * t_obs * nf))) // 2
+    if ii < 0:
+        ii = 0
+    if ii >= nf:
+        ii = nf - 1
+
+    fgrid = (2.0 * ii - nf) / nf * 0.5 / t_obs
+    y = (xoff - fgrid) / dfx
+
+    lognu = math.log(nu)
+    if lognu < lnumin:
+        lognu = lnumin
+    if lognu > lnumax:
+        lognu = lnumax
+    xn = (lognu - lnumin) / dnux
+    jj = int(xn)
+    z = xn - jj
+    if jj < 0:
+        jj = 0
+        z = 0.0
+    if jj >= nnu:
+        jj = nnu - 1
+        z = 1.0
+    return k, ii, jj, y, z
+
+
+@njit(cache=True)
+def lorentzian_lookup_value(ltemplate: np.ndarray, ii: int, jj: int,
+                            y: float, z: float, amp: float, i: int) -> float:
+    """Evaluate one bin of the interpolated windowed-Lorentzian template."""
+
+    logv = (1.0 - z) * ((1.0 - y) * ltemplate[ii, jj, i] + y * ltemplate[ii + 1, jj, i])
+    logv += z * ((1.0 - y) * ltemplate[ii, jj + 1, i] + y * ltemplate[ii + 1, jj + 1, i])
+    return amp * math.exp(logv)
+
+
+@njit(cache=True)
+def local_lorentzian_template(t_obs: float, nf: int, nnu: int, wdth: int,
+                              lnumin: float, lnumax: float, ltemplate: np.ndarray,
+                              f0: float, amp: float, nu: float) -> Tuple[int, np.ndarray]:
+    """C llook equivalent: return center bin and only the local wdth template."""
+
+    lt = np.empty(wdth, dtype=np.float64)
+    k, ii, jj, y, z = lorentzian_lookup_params(t_obs, nf, nnu, lnumin, lnumax, f0, nu)
+
+    for i in range(wdth):
+        lt[i] = lorentzian_lookup_value(ltemplate, ii, jj, y, z, amp, i)
+    return k, lt
+
+
+@njit(cache=True)
+def add_lookup_line_inplace(line_model: np.ndarray, t_obs: float, nf: int, nnu: int,
+                            wdth: int, lnumin: float, lnumax: float,
+                            ltemplate: np.ndarray, f0: float, amp: float,
+                            nu: float, sign: float) -> None:
+    """Add/subtract one local lookup line into an existing full line model."""
+
+    k, ii, jj, y, z = lorentzian_lookup_params(t_obs, nf, nnu, lnumin, lnumax, f0, nu)
+    istart = k - wdth // 2
+    for i in range(wdth):
+        idx = istart + i
+        if 0 < idx < line_model.size:
+            line_model[idx] += sign * lorentzian_lookup_value(ltemplate, ii, jj, y, z, amp, i)
+
+
+@njit(cache=True)
+def add_lookup_line_band_inplace(line_model: np.ndarray, data_imin: int, t_obs: float,
+                                 nf: int, nnu: int, wdth: int, lnumin: float,
+                                 lnumax: float, ltemplate: np.ndarray, f0: float,
+                                 amp: float, nu: float, sign: float) -> Tuple[int, int]:
+    """Add/subtract one lookup line into an active-band model and return touched bins."""
+
+    k, ii, jj, y, z = lorentzian_lookup_params(t_obs, nf, nnu, lnumin, lnumax, f0, nu)
+    imid = k - data_imin
+    idelt = wdth // 2
+    istart = imid - idelt
+    istop = imid + idelt
+    ilow = line_model.size
+    ihigh = 0
+    for i in range(wdth):
+        idx = istart + i
+        if 0 <= idx < line_model.size:
+            line_model[idx] += sign * lorentzian_lookup_value(ltemplate, ii, jj, y, z, amp, i)
+            if idx < ilow:
+                ilow = idx
+            if idx + 1 > ihigh:
+                ihigh = idx + 1
+    if ihigh <= ilow:
+        ilow = 0
+        ihigh = 0
+    return ilow, ihigh
+
+
+@njit(cache=True)
+def delta_loglike_range(power: np.ndarray, sn_new: np.ndarray, sn_old: np.ndarray,
+                        ilow: int, ihigh: int) -> float:
+    """Likelihood difference over a local proposal window."""
+
+    val = 0.0
+    tiny = np.finfo(np.float64).tiny
+    lo = max(0, ilow)
+    hi = min(power.size, ihigh)
+    for i in range(lo, hi):
+        snew = max(sn_new[i], tiny)
+        sold = max(sn_old[i], tiny)
+        val += power[i] / sold - power[i] / snew + math.log(sold / snew)
+    return val
+
+
+@njit(cache=True)
 def sline_from_lookup(ncut: int, data_imin: int, t_obs: float,
                       nf: int, nnu: int, wdth: int, lnumin: float, lnumax: float,
                       ltemplate: np.ndarray, lf: np.ndarray, la: np.ndarray,
@@ -385,8 +566,8 @@ def sline_from_lookup(ncut: int, data_imin: int, t_obs: float,
 
     out = np.zeros(ncut, dtype=np.float64)
     for k in range(nlines):
-        out = lookup_line_delta(out, data_imin, t_obs, nf, nnu, wdth, lnumin, lnumax,
-                                ltemplate, lf[k], la[k], lnu[k], 1.0)
+        add_lookup_line_band_inplace(out, data_imin, t_obs, nf, nnu, wdth, lnumin, lnumax,
+                                     ltemplate, lf[k], la[k], lnu[k], 1.0)
     return out
 
 
@@ -496,6 +677,37 @@ def akima_eval_array(x: np.ndarray, y: np.ndarray, n: int, xq: np.ndarray) -> np
             h11 = t3 - t2
             out[j] = h00 * y[lo] + h10 * h * d[lo] + h01 * y[lo + 1] + h11 * h * d[lo + 1]
     return out
+
+
+@njit(cache=True)
+def getrangeakima_numba(iu: int, nsy: int, x: np.ndarray, t_obs: float, nend: int) -> Tuple[int, int]:
+    """C getrangeakima: bins affected by changing Akima control point iu."""
+
+    nst = 3
+    if nsy <= 0 or nend <= 0:
+        return 0, 0
+    if iu < 0:
+        iu = 0
+    if iu >= nsy:
+        iu = nsy - 1
+
+    if iu > nst - 1:
+        imin = int(math.floor((x[iu - nst] - x[0]) * t_obs))
+    else:
+        imin = 0
+
+    if iu < nsy - nst:
+        imax = int(math.ceil((x[iu + nst] - x[0]) * t_obs + 1.0))
+    else:
+        imax = nend
+
+    if imin < 0:
+        imin = 0
+    if imax > nend:
+        imax = nend
+    if imax < imin:
+        imax = imin
+    return imin, imax
 
 
 def robust_smooth(power: np.ndarray, width: int = 24) -> np.ndarray:
@@ -849,7 +1061,10 @@ def windowed_lorentzian_template(f0: float, nu: float, amp: float, jwidth: int, 
     freqs = np.arange(j1, j2, dtype=np.float64) / tlong
     pf = lorentzraw_grid(f0, nu, amp, freqs)
     kernel = np.concatenate((twl[:0:-1], twl))
-    conv = np.convolve(pf, kernel, mode="full")
+    if fftconvolve is not None:
+        conv = fftconvolve(pf, kernel, mode="full")
+    else:
+        conv = np.convolve(pf, kernel, mode="full")
     line = np.zeros(n, dtype=np.float64)
     for i in range(m - jwidth, m + jwidth):
         if i % oversample == 0 and 0 < i < n * oversample // 2:
@@ -926,6 +1141,8 @@ def load_lorentzian_lookup(t_obs: float, tukey_rise: float = T_RISE,
     filename = Path(f"lookup_{int(round(t_obs))}_{tukey_rise:.2f}.dat")
     if not filename.exists():
         print(f"{filename} not found; generating windowed Lorentzian lookup table")
+        if not SCIPY_AVAILABLE:
+            print("warning: scipy is not available; falling back to slow np.convolve lookup generation")
         nf, nnu, wdth, numin, numax, ltemplate = generate_lorentzian_lookup(
             t_obs, tukey_rise=tukey_rise, n_samples=n_samples
         )
@@ -998,20 +1215,48 @@ def subtract_lines_lmcmc(data_fft: np.ndarray, smooth: np.ndarray, line_power: n
                          rng: np.random.Generator) -> np.ndarray:
     """Subtract line contributions conservatively using lmcmc per frequency bin."""
 
+    seed = int(rng.integers(1, 2**31 - 1))
+    return subtract_lines_lmcmc_numba(data_fft, smooth, line_power, seed)
+
+
+@njit(cache=True)
+def subtract_lines_lmcmc_numba(data_fft: np.ndarray, smooth: np.ndarray,
+                               line_power: np.ndarray, seed: int) -> np.ndarray:
+    """Numba version of lmcmc subtraction, preserving the same MCMC update."""
+
+    np.random.seed(seed)
     cleaned = data_fft.copy()
     n2 = min(cleaned.size, smooth.size, line_power.size)
+    tiny = np.finfo(np.float64).tiny
     for i in range(1, n2):
-        SM = float(smooth[i])
-        SL = float(line_power[i])
+        SM = smooth[i]
+        SL = line_power[i]
         total = SM + SL
         if total <= 0.0:
             continue
         frac = SL / total
         if frac > 1.0e-2:
-            dr = float(data_fft[i].real)
-            di = float(data_fft[i].imag)
-            hr, hi = lmcmc_sample(1000, SM, SL, dr, di, frac * dr, frac * di, rng)
-            cleaned[i] = complex(dr - hr, di - hi)
+            dr = data_fft[i].real
+            di = data_fft[i].imag
+            hrx = frac * dr
+            hix = frac * di
+            sigma2 = 0.25 * SM * SL / max(total, tiny)
+            sigma = math.sqrt(max(sigma2, 0.0))
+            x = dr - hrx
+            y = di - hix
+            logLx = -2.0 * (x * x + y * y) / max(SM, tiny)
+            for _ in range(1, 1000):
+                hry = hrx + sigma * np.random.normal()
+                hiy = hix + sigma * np.random.normal()
+                x = dr - hry
+                y = di - hiy
+                logLy = -2.0 * (x * x + y * y) / max(SM, tiny)
+                alpha = math.log(max(np.random.random(), tiny))
+                if alpha < logLy - logLx:
+                    logLx = logLy
+                    hrx = hry
+                    hix = hiy
+            cleaned[i] = (dr - hrx) + 1j * (di - hix)
     return cleaned
 
 
@@ -1019,17 +1264,26 @@ def lineget_candidates(power: np.ndarray, smooth: np.ndarray, freqs: np.ndarray,
                        istart: int, iend: int, max_lines: int) -> np.ndarray:
     """Find local periodogram peaks above LINEMUL, preserving C scan order."""
 
+    return lineget_candidates_numba(power, smooth, freqs, istart, iend, max_lines)
+
+
+@njit(cache=True)
+def lineget_candidates_numba(power: np.ndarray, smooth: np.ndarray, freqs: np.ndarray,
+                             istart: int, iend: int, max_lines: int) -> np.ndarray:
+    """Compiled local peak finder for the C lineget scan."""
+
     start = max(3, istart)
     stop = min(iend, power.size - 3)
-    found = []
+    found = np.empty(max_lines, dtype=np.float64)
+    count = 0
     for i in range(start, stop):
-        if power[i] / max(smooth[i], np.finfo(float).tiny) > LINEMUL:
+        if power[i] / max(smooth[i], np.finfo(np.float64).tiny) > LINEMUL:
             if power[i] > power[i - 1] and power[i] > power[i + 1]:
-                found.append(i)
-    if not found:
-        return np.empty(0, dtype=np.float64)
-    found = np.array(found[:max_lines], dtype=np.int64)
-    return freqs[found]
+                found[count] = freqs[i]
+                count += 1
+                if count >= max_lines:
+                    break
+    return found[:count]
 
 
 def lookup_unit(line: LorentzianParams, n2: int, t_obs: float, f0: float, nu: float,
@@ -1043,9 +1297,12 @@ def lookup_unit(line: LorentzianParams, n2: int, t_obs: float, f0: float, nu: fl
                              f0, amp, nu, 1.0)
 
 
-def lpeak_windowed(line: LorentzianParams, power: np.ndarray, smooth: np.ndarray, n: int,
-                   spread: int, f0: float, nu: float, t_obs: float) -> Tuple[float, float]:
-    """C Lpeak: choose amplitude from local excess and score a trial line."""
+@njit(cache=True)
+def lpeak_windowed_numba(power: np.ndarray, smooth: np.ndarray, n: int, spread: int,
+                         f0: float, nu: float, t_obs: float, nf: int, nnu: int,
+                         wdth: int, lnumin: float, lnumax: float,
+                         ltemplate: np.ndarray) -> Tuple[float, float]:
+    """Compiled C Lpeak using only the local lookup window."""
 
     k = int(round(f0 * t_obs))
     y = (f0 - k / t_obs) * t_obs
@@ -1054,6 +1311,7 @@ def lpeak_windowed(line: LorentzianParams, power: np.ndarray, smooth: np.ndarray
     if y > 0.5:
         k += 1
     y = (f0 - k / t_obs) * t_obs
+
     if 1 < k < n // 2 - 2:
         if y < 0.0:
             peak = (-y) * (power[k - 1] - smooth[k - 1]) + (1.0 + y) * (power[k] - smooth[k])
@@ -1061,17 +1319,147 @@ def lpeak_windowed(line: LorentzianParams, power: np.ndarray, smooth: np.ndarray
             peak = y * (power[k + 1] - smooth[k + 1]) + (1.0 - y) * (power[k] - smooth[k])
     else:
         peak = 0.0
-    peak = max(float(peak), 0.0)
-    template = lookup_unit(line, n // 2, t_obs, f0, nu, peak)
+    if peak < 0.0:
+        peak = 0.0
+
+    k, ii, jj, yl, zl = lorentzian_lookup_params(t_obs, nf, nnu, lnumin, lnumax, f0, nu)
     logL = 0.0
-    for i in range(line.wdth // 2 - spread, line.wdth // 2 + spread + 1):
-        idx = k - line.wdth // 2 + i
+    j = k - wdth // 2
+    tiny = np.finfo(np.float64).tiny
+    ilo = wdth // 2 - spread
+    ihi = wdth // 2 + spread
+    if ilo < 0:
+        ilo = 0
+    if ihi >= wdth:
+        ihi = wdth - 1
+    for i in range(ilo, ihi + 1):
+        idx = i + j
         if 0 < idx < n // 2:
-            s0 = max(smooth[idx], np.finfo(float).tiny)
-            s1 = max(smooth[idx] + template[idx], np.finfo(float).tiny)
+            s0 = max(smooth[idx], tiny)
+            lt_i = lorentzian_lookup_value(ltemplate, ii, jj, yl, zl, peak, i)
+            s1 = max(smooth[idx] + lt_i, tiny)
             logL += -math.log(s1) - power[idx] / s1
             logL += math.log(s0) + power[idx] / s0
     return logL, peak
+
+
+@njit(cache=True)
+def best_lpeak_for_candidate_numba(fpeak: float, power: np.ndarray, smooth: np.ndarray,
+                                   n: int, spread: int, t_obs: float, nf: int,
+                                   nnu: int, wdth: int, lnumin: float, lnumax: float,
+                                   ltemplate: np.ndarray, freq_offsets: np.ndarray,
+                                   nu_grid: np.ndarray) -> Tuple[float, float, float, float]:
+    """Search the same startup frequency/nu grid as C lorentzfit for one peak."""
+
+    best_logL = -1.0e40
+    best_f = fpeak
+    best_nu = nu_grid[0]
+    best_amp = 0.0
+    for ii in range(freq_offsets.size):
+        fx = fpeak + freq_offsets[ii]
+        for jj in range(nu_grid.size):
+            logL, amp = lpeak_windowed_numba(
+                power, smooth, n, spread, fx, nu_grid[jj], t_obs, nf, nnu, wdth, lnumin, lnumax, ltemplate
+            )
+            if logL > best_logL:
+                best_logL = logL
+                best_f = fx
+                best_nu = nu_grid[jj]
+                best_amp = amp
+    return best_logL, best_f, best_nu, best_amp
+
+
+def lpeak_windowed(line: LorentzianParams, power: np.ndarray, smooth: np.ndarray, n: int,
+                   spread: int, f0: float, nu: float, t_obs: float) -> Tuple[float, float]:
+    """C Lpeak: choose amplitude from local excess and score a trial line."""
+
+    if line.ltemplate is None:
+        raise RuntimeError("Lorentzian lookup table has not been loaded")
+    return lpeak_windowed_numba(power, smooth, n, spread, f0, nu, t_obs, line.nf, line.nnu,
+                                line.wdth, line.lnumin, line.lnumax, line.ltemplate)
+
+
+@njit(cache=True)
+def cut_lorentz_windowed_numba(smooth: np.ndarray, line_model: np.ndarray,
+                               power: np.ndarray, f0: float, nu: float, amp: float,
+                               t_obs: float, nf: int, nnu: int, wdth: int,
+                               lnumin: float, lnumax: float, numin: float, numax: float,
+                               ltemplate: np.ndarray, freq_offsets: np.ndarray,
+                               log_offsets: np.ndarray) -> Tuple[float, float, float, float]:
+    """Compiled C cut_lorentz equivalent, mutating line_model in-place."""
+
+    n2 = power.size
+    old_k, old_ii, old_jj, old_y, old_z = lorentzian_lookup_params(
+        t_obs, nf, nnu, lnumin, lnumax, f0, nu
+    )
+    imin = old_k - wdth // 2
+    imax = old_k + wdth // 2
+    if imin < 1:
+        imin = 1
+    if imax > n2:
+        imax = n2
+    local_n = imax - imin
+    base = np.empty(local_n, dtype=np.float64)
+    for i in range(local_n):
+        base[i] = line_model[imin + i]
+
+    old_start = old_k - wdth // 2
+    for i in range(wdth):
+        idx = old_start + i
+        if imin <= idx < imax:
+            base[idx - imin] -= lorentzian_lookup_value(ltemplate, old_ii, old_jj, old_y, old_z, amp, i)
+
+    tiny = np.finfo(np.float64).tiny
+    logLx = 0.0
+    for i in range(local_n):
+        idx = imin + i
+        s = smooth[idx] + base[i]
+        if s > 0.0:
+            logLx += -(math.log(s) + power[idx] / s)
+
+    lognu = math.log(max(nu, tiny))
+    logamp = math.log(max(amp, tiny))
+    best_logL = -1.0e60
+    best_f = f0
+    best_nu = nu
+    best_amp = amp
+
+    for ii in range(freq_offsets.size):
+        fx = f0 + freq_offsets[ii]
+        for jj in range(log_offsets.size):
+            nux = math.exp(lognu + log_offsets[jj])
+            if nux >= numin and nux <= numax:
+                k, ii, jj_lookup, yl, zl = lorentzian_lookup_params(
+                    t_obs, nf, nnu, lnumin, lnumax, fx, nux
+                )
+                trial_start = k - wdth // 2
+                for kk in range(log_offsets.size):
+                    ax = math.exp(logamp + log_offsets[kk])
+                    logLy = 0.0
+                    for i in range(local_n):
+                        idx = imin + i
+                        sline = base[i]
+                        offset = idx - trial_start
+                        if 0 <= offset < wdth:
+                            sline += lorentzian_lookup_value(ltemplate, ii, jj_lookup, yl, zl, ax, offset)
+                        s = smooth[idx] + sline
+                        if s > 0.0:
+                            logLy += -(math.log(s) + power[idx] / s)
+                    if logLy > best_logL:
+                        best_logL = logLy
+                        best_f = fx
+                        best_nu = nux
+                        best_amp = ax
+
+    dlogL = best_logL - logLx
+    for i in range(local_n):
+        line_model[imin + i] = base[i]
+
+    if dlogL >= 10.0:
+        add_lookup_line_inplace(line_model, t_obs, nf, nnu, wdth, lnumin, lnumax,
+                                ltemplate, best_f, best_amp, best_nu, 1.0)
+        return dlogL, best_f, best_nu, best_amp
+    return dlogL, f0, nu, amp
 
 
 def cut_lorentz_windowed(line: LorentzianParams, smooth: np.ndarray, line_model: np.ndarray,
@@ -1079,56 +1467,15 @@ def cut_lorentz_windowed(line: LorentzianParams, smooth: np.ndarray, line_model:
                          t_obs: float) -> Tuple[float, float, float, float, np.ndarray]:
     """C cut_lorentz: refine one candidate and remove it if it is not needed."""
 
-    n2 = power.size
-    old = lookup_unit(line, n2, t_obs, f0, nu, amp)
-    base_model = line_model - old
-    k = int(round(f0 * t_obs))
-    xoff = f0 - k / t_obs
-    if xoff * t_obs <= -0.5:
-        k -= 1
-    if xoff * t_obs >= 0.5:
-        k += 1
-    imin = max(1, k - line.wdth // 2)
-    imax = min(n2, k + line.wdth // 2)
-
-    logL0 = 0.0
-    for i in range(imin, imax):
-        s = smooth[i] + base_model[i]
-        if s > 0.0:
-            logL0 += -(math.log(s) + power[i] / s)
-
-    best_logL = -1.0e60
-    best_f = f0
-    best_nu = nu
-    best_amp = amp
-    best_model = base_model.copy()
-    lognu = math.log(max(nu, np.finfo(float).tiny))
-    logamp = math.log(max(amp, np.finfo(float).tiny))
-    for ii in range(-5, 6):
-        fx = f0 + 0.01 * ii / t_obs
-        for jj in range(-4, 5):
-            nux = math.exp(lognu + jj / 8.0)
-            if nux < line.numin or nux > line.numax:
-                continue
-            for kk in range(-4, 5):
-                ax = math.exp(logamp + kk / 8.0)
-                trial_model = base_model + lookup_unit(line, n2, t_obs, fx, nux, ax)
-                logL = 0.0
-                for i in range(imin, imax):
-                    s = smooth[i] + trial_model[i]
-                    if s > 0.0:
-                        logL += -(math.log(s) + power[i] / s)
-                if logL > best_logL:
-                    best_logL = logL
-                    best_f = fx
-                    best_nu = nux
-                    best_amp = ax
-                    best_model = trial_model
-
-    dlogL = best_logL - logL0
-    if dlogL < 10.0:
-        return dlogL, f0, nu, amp, base_model
-    return dlogL, best_f, best_nu, best_amp, best_model
+    if line.ltemplate is None:
+        raise RuntimeError("Lorentzian lookup table has not been loaded")
+    freq_offsets = 0.01 * np.arange(-5, 6, dtype=np.float64) / t_obs
+    log_offsets = np.arange(-4, 5, dtype=np.float64) / 8.0
+    dlogL, best_f, best_nu, best_amp = cut_lorentz_windowed_numba(
+        smooth, line_model, power, f0, nu, amp, t_obs, line.nf, line.nnu, line.wdth,
+        line.lnumin, line.lnumax, line.numin, line.numax, line.ltemplate, freq_offsets, log_offsets
+    )
+    return dlogL, best_f, best_nu, best_amp, line_model
 
 
 def lorentzfit_four_pass(line: LorentzianParams, data_fft: np.ndarray, freqs: np.ndarray,
@@ -1136,6 +1483,8 @@ def lorentzfit_four_pass(line: LorentzianParams, data_fft: np.ndarray, freqs: np
                          rng: np.random.Generator) -> np.ndarray:
     """Four-pass C lorentzfit startup using windowed lines and lmcmc cleanup."""
 
+    if line.ltemplate is None:
+        raise RuntimeError("Lorentzian lookup table has not been loaded")
     n2 = data_fft.size - 1
     n = 2 * n2
     dhold = data_fft.copy()
@@ -1145,14 +1494,19 @@ def lorentzfit_four_pass(line: LorentzianParams, data_fft: np.ndarray, freqs: np
     lnumax = line.lnumax
     lnu1 = min(math.log(2.0e-4), lnumax)
     lnu2 = min(math.log(2.0e-3), lnumax)
-    lf: list[float] = []
-    lnu: list[float] = []
-    lamp: list[float] = []
-    lgL: list[float] = []
+    lf = np.zeros(max_lines, dtype=np.float64)
+    lnu = np.zeros(max_lines, dtype=np.float64)
+    lamp = np.zeros(max_lines, dtype=np.float64)
+    lgL = np.zeros(max_lines, dtype=np.float64)
+    nltotal = 0
     line_model = np.zeros(n2, dtype=np.float64)
+    freq_offsets = np.arange(-100, 101, dtype=np.float64) / (200.0 * t_obs)
+    cut_freq_offsets = 0.01 * np.arange(-5, 6, dtype=np.float64) / t_obs
+    cut_log_offsets = np.arange(-4, 5, dtype=np.float64) / 8.0
 
     for m in range(4):
         lnm = lnu1 if m == 0 else (lnu2 if m == 1 else lnumax)
+        nu_grid = np.exp(lnumin + (lnm - lnumin) * np.arange(21, dtype=np.float64) / 20.0)
         power = 2.0 * np.abs(dprime[:n2]) ** 2
         PG, _, SM = medspecspline_power(power, 1.0 / t_obs, n)
         candidates = lineget_candidates(PG, SM, freqs[:n2], istart, iend, max_lines)
@@ -1160,53 +1514,52 @@ def lorentzfit_four_pass(line: LorentzianParams, data_fft: np.ndarray, freqs: np
 
         added = 0
         for fpeak in candidates:
-            if len(lf) + added >= max_lines:
+            if nltotal + added >= max_lines:
                 break
-            best_logL = -1.0e40
-            best_f = float(fpeak)
-            best_nu = math.exp(lnumin)
-            best_amp = 0.0
-            for ii in range(-100, 101):
-                fx = float(fpeak) + ii / (200.0 * t_obs)
-                for jj in range(21):
-                    nu = math.exp(lnumin + (lnm - lnumin) * jj / 20.0)
-                    logL, amp = lpeak_windowed(line, PG, SM, n, 2, fx, nu, t_obs)
-                    if logL > best_logL:
-                        best_logL = logL
-                        best_f = fx
-                        best_nu = nu
-                        best_amp = amp
+            best_logL, best_f, best_nu, best_amp = best_lpeak_for_candidate_numba(
+                float(fpeak), PG, SM, n, 2, t_obs, line.nf, line.nnu, line.wdth,
+                line.lnumin, line.lnumax, line.ltemplate, freq_offsets, nu_grid
+            )
             if best_logL > 10.0 and best_amp > 0.0:
-                lf.append(best_f)
-                lnu.append(best_nu)
-                lamp.append(best_amp)
-                lgL.append(best_logL)
-                line_model += lookup_unit(line, n2, t_obs, best_f, best_nu, best_amp)
+                idx = nltotal + added
+                lf[idx] = best_f
+                lnu[idx] = best_nu
+                lamp[idx] = best_amp
+                lgL[idx] = best_logL
+                add_lookup_line_inplace(line_model, t_obs, line.nf, line.nnu, line.wdth,
+                                        line.lnumin, line.lnumax, line.ltemplate,
+                                        best_f, best_amp, best_nu, 1.0)
                 added += 1
+        nltotal += added
 
-        if lf:
-            order = np.argsort(np.array(lgL))[::-1]
-            new_lf: list[float] = []
-            new_lnu: list[float] = []
-            new_lamp: list[float] = []
-            new_lgL: list[float] = []
+        if nltotal > 0:
+            order = np.argsort(lgL[:nltotal])[::-1]
+            new_lf = np.zeros(max_lines, dtype=np.float64)
+            new_lnu = np.zeros(max_lines, dtype=np.float64)
+            new_lamp = np.zeros(max_lines, dtype=np.float64)
+            new_lgL = np.zeros(max_lines, dtype=np.float64)
+            kept = 0
             for idx in order:
-                dlogL, fnew, nunew, ampnew, trial_model = cut_lorentz_windowed(
-                    line, SM, line_model, PR, lf[int(idx)], lnu[int(idx)], lamp[int(idx)], t_obs
+                iidx = int(idx)
+                dlogL, fnew, nunew, ampnew = cut_lorentz_windowed_numba(
+                    SM, line_model, PR, lf[iidx], lnu[iidx], lamp[iidx], t_obs,
+                    line.nf, line.nnu, line.wdth, line.lnumin, line.lnumax,
+                    line.numin, line.numax, line.ltemplate, cut_freq_offsets, cut_log_offsets
                 )
-                line_model = trial_model
-                if dlogL > 8.0 and len(new_lf) < max_lines:
-                    new_lf.append(fnew)
-                    new_lnu.append(nunew)
-                    new_lamp.append(ampnew)
-                    new_lgL.append(lgL[int(idx)])
+                if dlogL > 8.0 and kept < max_lines:
+                    new_lf[kept] = fnew
+                    new_lnu[kept] = nunew
+                    new_lamp[kept] = ampnew
+                    new_lgL[kept] = lgL[iidx]
+                    kept += 1
             lf, lnu, lamp, lgL = new_lf, new_lnu, new_lamp, new_lgL
+            nltotal = kept
 
         cleaned = subtract_lines_lmcmc(dhold[:n2], SM, line_model, rng)
         dprime = dhold.copy()
         dprime[:n2] = cleaned
 
-    line.n = min(len(lf), line.size)
+    line.n = min(nltotal, line.size)
     for i in range(line.n):
         line.f[i] = lf[i]
         line.nu[i] = lnu[i]
@@ -1249,6 +1602,35 @@ def spline_eval_one(points: np.ndarray, values: np.ndarray, xq: float, spline_fl
     if spline_flag == 1:
         return float(akima_eval_one(points, values, points.size, xq))
     return float(np.interp(xq, points, values, left=values[0], right=values[-1]))
+
+
+def spline_proposal_update(prop_points: np.ndarray, prop_sdata: np.ndarray,
+                           freq: np.ndarray, data: DataParams,
+                           sbase: np.ndarray, sline: np.ndarray, snx: np.ndarray,
+                           power: np.ndarray, logLx: float, spline_flag: int,
+                           changed_index: int) -> Tuple[np.ndarray, np.ndarray, Optional[float], int, int]:
+    """Build a proposed PSD after a spline move, using local Akima updates.
+
+    The Akima branch mirrors BayesLine.c: changing one spline knot only affects
+    the frequency bins bracketed by three neighboring knots on either side.
+    Cubic/linear interpolation is kept on the existing full-band path.
+    """
+
+    if spline_flag != 1 or changed_index < 0:
+        sbase_prop = np.exp(spline_eval_array(prop_points, prop_sdata, freq, spline_flag))
+        return sbase_prop, sbase_prop + sline, None, 0, freq.size
+
+    imin, imax = getrangeakima_numba(changed_index, prop_points.size, prop_points,
+                                     data.t_obs, data.ncut)
+    sbase_prop = sbase.copy()
+    sn_prop = snx.copy()
+    if imax > imin:
+        sbase_prop[imin:imax] = np.exp(
+            akima_eval_array(prop_points, prop_sdata, prop_points.size, freq[imin:imax])
+        )
+        sn_prop[imin:imax] = sbase_prop[imin:imax] + sline[imin:imax]
+    logLy_local = logLx + delta_loglike_range(power, sn_prop, snx, imin, imax)
+    return sbase_prop, sn_prop, logLy_local, imin, imax
 
 
 def create_dataParams(freq: np.ndarray, n: int, t_obs: float, max_lines: int, fmin: float, fmax: float) -> DataParams:
@@ -1404,8 +1786,9 @@ def blstart(line: LorentzianParams, data: np.ndarray, residual: np.ndarray, n: i
 
 
 def BayesLineBurnin(bayesline: BayesLineParams, timeData: np.ndarray, freqData: np.ndarray,
-                    ifo: str, fprop: np.ndarray, SplineFlag: int) -> None:
-    """Run the C burn-in/startup path and write startup diagnostics."""
+                    ifo: str, fprop: np.ndarray, SplineFlag: int,
+                    write_start: bool = False) -> None:
+    """Run the C burn-in/startup path and optionally write startup diagnostics."""
 
     del ifo, SplineFlag
     BayesLineInitialize(bayesline)
@@ -1427,8 +1810,9 @@ def BayesLineBurnin(bayesline: BayesLineParams, timeData: np.ndarray, freqData: 
                                                bayesline.freq, 1))
     full_spectrum_spline(bayesline.Sline, data, bayesline.lines_x)
     bayesline.Snf = bayesline.Sbase + bayesline.Sline
-    np.savetxt("xx.dat", np.column_stack((bayesline.freq, bayesline.power,
-                                           bayesline.Sbase, bayesline.Sline)))
+    if write_start:
+        np.savetxt(BL_START_FILENAME, np.column_stack((bayesline.freq, bayesline.power,
+                                                       bayesline.Sbase, bayesline.Sline)))
     fprop[:data.ncut] = 1.0
     fprop[:data.ncut][2.0 * bayesline.power / np.maximum(bayesline.Sbase, np.finfo(float).tiny) > 10.0] = 100.0
     fsum = float(np.sum(fprop[:data.ncut]))
@@ -1519,12 +1903,16 @@ def BayesLineLorentzSplineMCMC(bayesline: BayesLineParams, heat: float, steps: i
         prop_points = spline.points
         prop_sdata = spline.data
         prop_nlines = lines.n
-        prop_f = lines.f[:lines.n].copy()
-        prop_a = lines.a[:lines.n].copy()
-        prop_nu = lines.nu[:lines.n].copy()
+        prop_f = lines.f[:lines.n]
+        prop_a = lines.a[:lines.n]
+        prop_nu = lines.nu[:lines.n]
         sn_prop = None
         sbase_prop = sbase
         sline_prop = sline
+        logLy_local = None
+        proposal_ilow = 0
+        proposal_ihigh = ncut
+        spline_changed_index = -1
 
         if rng.random() > 0.5:
             alpha = rng.random()
@@ -1546,6 +1934,9 @@ def BayesLineLorentzSplineMCMC(bayesline: BayesLineParams, heat: float, steps: i
                         order = np.argsort(prop_points)
                         prop_points = prop_points[order]
                         prop_sdata = prop_sdata[order]
+                        spline_changed_index = int(np.searchsorted(prop_points, newfreq, side="left"))
+                        if spline_changed_index >= prop_points.size:
+                            spline_changed_index = prop_points.size - 1
                         logqy = rjden(mdl, newval, sp, prange)
                         logpy = -math.log(prange)
                     else:
@@ -1557,6 +1948,7 @@ def BayesLineLorentzSplineMCMC(bayesline: BayesLineParams, heat: float, steps: i
                         newfreq = float(spline.points[ki])
                         prop_points = np.delete(spline.points, ki)
                         prop_sdata = np.delete(spline.data, ki)
+                        spline_changed_index = min(ki, prop_points.size - 1)
                         mdl = spline_eval_one(prop_points, prop_sdata, newfreq, SplineFlag)
                         ji = min(max(int((newfreq - flow) * t_obs), 0), ncut - 1)
                         lower = max(priors.lower[ji], np.finfo(float).tiny) if priors.lower is not None else max(sbase[ji] / 10.0, np.finfo(float).tiny)
@@ -1580,6 +1972,9 @@ def BayesLineLorentzSplineMCMC(bayesline: BayesLineParams, heat: float, steps: i
                     order = np.argsort(prop_points)
                     prop_points = prop_points[order]
                     prop_sdata = prop_sdata[order]
+                    spline_changed_index = int(np.searchsorted(prop_points, newfreq, side="left"))
+                    if spline_changed_index >= prop_points.size:
+                        spline_changed_index = prop_points.size - 1
             else:
                 lbl = 2
                 typ = 4
@@ -1598,15 +1993,20 @@ def BayesLineLorentzSplineMCMC(bayesline: BayesLineParams, heat: float, steps: i
                     prop_sdata[ii] += rng.normal(0.0, e1)
                     if 0 < ii < spline.n - 1:
                         prop_points[ii] += rng.normal(0.0, e1)
+                    spline_changed_index = ii
                 else:
                     if 0 < ii < spline.n - 1:
                         prop_points[ii] = flow + (fhigh - flow) * rng.random()
+                    newfreq = float(prop_points[ii])
                     ji = min(max(int((prop_points[ii] - flow) * t_obs), 0), ncut - 1)
                     lower = max(priors.lower[ji], np.finfo(float).tiny) if priors.lower is not None else max(sbase[ji] / 10.0, np.finfo(float).tiny)
                     prop_sdata[ii] = math.log(lower) + math.log(100.0) * rng.random()
                     order = np.argsort(prop_points)
                     prop_points = prop_points[order]
                     prop_sdata = prop_sdata[order]
+                    spline_changed_index = int(np.searchsorted(prop_points, newfreq, side="left"))
+                    if spline_changed_index >= prop_points.size:
+                        spline_changed_index = prop_points.size - 1
 
             if not check:
                 if np.any(np.diff(prop_points) < 2.0):
@@ -1620,8 +2020,10 @@ def BayesLineLorentzSplineMCMC(bayesline: BayesLineParams, heat: float, steps: i
                     if np.any(prop_sdata < low) or np.any(prop_sdata > high):
                         check = True
                 if not check:
-                    sbase_prop = np.exp(spline_eval_array(prop_points, prop_sdata, freq, SplineFlag))
-                    sn_prop = sbase_prop + sline
+                    sbase_prop, sn_prop, logLy_local, proposal_ilow, proposal_ihigh = spline_proposal_update(
+                        prop_points, prop_sdata, freq, data, sbase, sline, snx,
+                        power, logLx, SplineFlag, spline_changed_index
+                    )
 
         else:
             if tmax == 0:
@@ -1634,18 +2036,31 @@ def BayesLineLorentzSplineMCMC(bayesline: BayesLineParams, heat: float, steps: i
                         nf = draw_line_frequency(fprop, data, rng)
                         na = math.exp(lAmin + (lAmax - lAmin) * rng.random())
                         nn = math.exp(lnumin + (lnumax - lnumin) * rng.random())
-                        prop_f = np.append(prop_f, nf)
-                        prop_a = np.append(prop_a, na)
-                        prop_nu = np.append(prop_nu, nn)
                         prop_nlines = lines.n + 1
+                        prop_f = np.empty(prop_nlines, dtype=np.float64)
+                        prop_a = np.empty(prop_nlines, dtype=np.float64)
+                        prop_nu = np.empty(prop_nlines, dtype=np.float64)
+                        prop_f[:lines.n] = lines.f[:lines.n]
+                        prop_a[:lines.n] = lines.a[:lines.n]
+                        prop_nu[:lines.n] = lines.nu[:lines.n]
+                        prop_f[lines.n] = nf
+                        prop_a[lines.n] = na
+                        prop_nu[lines.n] = nn
                         logqy = line_proposal_log_density(nf, fprop, data)
                         logpy = -math.log(float(ncut))
-                        sn_prop = lookup_line_delta(snx, data.imin, t_obs, lines.nf, lines.nnu,
-                                                    lines.wdth, lines.lnumin, lines.lnumax,
-                                                    lines.ltemplate, nf, na, nn, 1.0)
-                        sline_prop = lookup_line_delta(sline, data.imin, t_obs, lines.nf, lines.nnu,
-                                                       lines.wdth, lines.lnumin, lines.lnumax,
-                                                       lines.ltemplate, nf, na, nn, 1.0)
+                        sn_prop = snx.copy()
+                        sline_prop = sline.copy()
+                        ilow, ihigh = add_lookup_line_band_inplace(
+                            sn_prop, data.imin, t_obs, lines.nf, lines.nnu, lines.wdth,
+                            lines.lnumin, lines.lnumax, lines.ltemplate, nf, na, nn, 1.0
+                        )
+                        add_lookup_line_band_inplace(
+                            sline_prop, data.imin, t_obs, lines.nf, lines.nnu, lines.wdth,
+                            lines.lnumin, lines.lnumax, lines.ltemplate, nf, na, nn, 1.0
+                        )
+                        proposal_ilow = ilow
+                        proposal_ihigh = ihigh
+                        logLy_local = logLx + delta_loglike_range(power, sn_prop, snx, ilow, ihigh)
                     else:
                         check = True
                 else:
@@ -1657,26 +2072,46 @@ def BayesLineLorentzSplineMCMC(bayesline: BayesLineParams, heat: float, steps: i
                         on = prop_nu[ki]
                         logqx = line_proposal_log_density(of, fprop, data)
                         logpx = -math.log(float(ncut))
-                        prop_f = np.delete(prop_f, ki)
-                        prop_a = np.delete(prop_a, ki)
-                        prop_nu = np.delete(prop_nu, ki)
                         prop_nlines = lines.n - 1
-                        sn_prop = lookup_line_delta(snx, data.imin, t_obs, lines.nf, lines.nnu,
-                                                    lines.wdth, lines.lnumin, lines.lnumax,
-                                                    lines.ltemplate, of, oa, on, -1.0)
-                        sline_prop = lookup_line_delta(sline, data.imin, t_obs, lines.nf, lines.nnu,
-                                                       lines.wdth, lines.lnumin, lines.lnumax,
-                                                       lines.ltemplate, of, oa, on, -1.0)
+                        prop_f = np.empty(prop_nlines, dtype=np.float64)
+                        prop_a = np.empty(prop_nlines, dtype=np.float64)
+                        prop_nu = np.empty(prop_nlines, dtype=np.float64)
+                        if ki > 0:
+                            prop_f[:ki] = lines.f[:ki]
+                            prop_a[:ki] = lines.a[:ki]
+                            prop_nu[:ki] = lines.nu[:ki]
+                        if ki < prop_nlines:
+                            prop_f[ki:] = lines.f[ki + 1:lines.n]
+                            prop_a[ki:] = lines.a[ki + 1:lines.n]
+                            prop_nu[ki:] = lines.nu[ki + 1:lines.n]
+                        sn_prop = snx.copy()
+                        sline_prop = sline.copy()
+                        ilow, ihigh = add_lookup_line_band_inplace(
+                            sn_prop, data.imin, t_obs, lines.nf, lines.nnu, lines.wdth,
+                            lines.lnumin, lines.lnumax, lines.ltemplate, of, oa, on, -1.0
+                        )
+                        add_lookup_line_band_inplace(
+                            sline_prop, data.imin, t_obs, lines.nf, lines.nnu, lines.wdth,
+                            lines.lnumin, lines.lnumax, lines.ltemplate, of, oa, on, -1.0
+                        )
+                        proposal_ilow = ilow
+                        proposal_ihigh = ihigh
+                        logLy_local = logLx + delta_loglike_range(power, sn_prop, snx, ilow, ihigh)
                     else:
                         check = True
             else:
                 lbl = 5
                 if lines.n > 0:
+                    prop_f = lines.f[:lines.n].copy()
+                    prop_a = lines.a[:lines.n].copy()
+                    prop_nu = lines.nu[:lines.n].copy()
                     ii = int(rng.integers(0, lines.n))
+                    oldf = prop_f[ii]
+                    olda = prop_a[ii]
+                    oldnu = prop_nu[ii]
                     if rng.random() > 0.8:
                         lbl = 4
                         typ = 0
-                        oldf = prop_f[ii]
                         newf = draw_line_frequency(fprop, data, rng)
                         prop_f[ii] = newf
                         prop_nu[ii] = math.exp(lnumin + (lnumax - lnumin) * rng.random())
@@ -1704,17 +2139,50 @@ def BayesLineLorentzSplineMCMC(bayesline: BayesLineParams, heat: float, steps: i
                     if prop_nu[ii] < numin or prop_nu[ii] > numax:
                         check = True
                     if not check:
-                        sline_prop = sline_from_lookup(ncut, data.imin, t_obs, lines.nf, lines.nnu,
-                                                       lines.wdth, lines.lnumin, lines.lnumax,
-                                                       lines.ltemplate, prop_f, prop_a, prop_nu,
-                                                       prop_nlines)
-                        sn_prop = sbase + sline_prop
+                        sn_prop = snx.copy()
+                        sline_prop = sline.copy()
+                        ilowx, ihighx = add_lookup_line_band_inplace(
+                            sn_prop, data.imin, t_obs, lines.nf, lines.nnu, lines.wdth,
+                            lines.lnumin, lines.lnumax, lines.ltemplate, oldf, olda, oldnu, -1.0
+                        )
+                        add_lookup_line_band_inplace(
+                            sline_prop, data.imin, t_obs, lines.nf, lines.nnu, lines.wdth,
+                            lines.lnumin, lines.lnumax, lines.ltemplate, oldf, olda, oldnu, -1.0
+                        )
+                        ilowy, ihighy = add_lookup_line_band_inplace(
+                            sn_prop, data.imin, t_obs, lines.nf, lines.nnu, lines.wdth,
+                            lines.lnumin, lines.lnumax, lines.ltemplate,
+                            prop_f[ii], prop_a[ii], prop_nu[ii], 1.0
+                        )
+                        add_lookup_line_band_inplace(
+                            sline_prop, data.imin, t_obs, lines.nf, lines.nnu, lines.wdth,
+                            lines.lnumin, lines.lnumax, lines.ltemplate,
+                            prop_f[ii], prop_a[ii], prop_nu[ii], 1.0
+                        )
+                        ilow = min(ilowx, ilowy)
+                        ihigh = max(ihighx, ihighy)
+                        proposal_ilow = ilow
+                        proposal_ihigh = ihigh
+                        logLy_local = logLx + delta_loglike_range(power, sn_prop, snx, ilow, ihigh)
                 else:
                     check = True
 
-        if not check and sn_prop is not None and np.all(sn_prop > 0.0):
-            logLy = 1.0 if bayesline.constantLogLFlag else loglike(power, sn_prop)
-            logPsy = logprior_bounds(priors, sn_prop) if priorFlag == 1 else 0.0
+        if not check and sn_prop is not None and positive_range_numba(sn_prop, proposal_ilow, proposal_ihigh):
+            if bayesline.constantLogLFlag:
+                logLy = 1.0
+            elif logLy_local is not None:
+                logLy = logLy_local
+            else:
+                logLy = loglike(power, sn_prop)
+            if priorFlag == 1:
+                if priors.lower is not None and priors.upper is not None and logLy_local is not None:
+                    logPsy = logPsx + delta_logprior_bounds_range_numba(
+                        priors.lower, priors.upper, sn_prop, snx, proposal_ilow, proposal_ihigh
+                    )
+                else:
+                    logPsy = logprior_bounds(priors, sn_prop)
+            else:
+                logPsy = 0.0
             logpy -= 0.5 * float(prop_nlines)
             logpx -= 0.5 * float(lines.n)
             logH = (logLy - logLx) * heat + logpy - logqy - logpx + logqx
@@ -1888,6 +2356,17 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         default=None,
         help="optional fetched strain text file name, default <IFO>.txt",
     )
+    parser.add_argument(
+        "--write_bl_start",
+        "--write-bl-start",
+        action="store_true",
+        help=f"write BayesLine startup diagnostic to {BL_START_FILENAME}",
+    )
+    parser.add_argument(
+        "--timing",
+        action="store_true",
+        help="print wall-clock timing for the main BWtest phases",
+    )
     return parser.parse_args(argv[1:])
 
 
@@ -1924,6 +2403,18 @@ def main(argv: list[str]) -> int:
     """Driver matching BWtest.c: preprocess data, run BayesLine, write outputs."""
 
     args = parse_args(argv)
+    timing_marks: list[Tuple[str, float]] = []
+    timing_start = time.perf_counter()
+    timing_last = timing_start
+
+    def timing_mark(label: str) -> None:
+        nonlocal timing_last
+        if not args.timing:
+            return
+        now = time.perf_counter()
+        timing_marks.append((label, now - timing_last))
+        timing_last = now
+
     ok, nyquist = valid_power_of_two_frequency(args.nyquist)
     if not ok:
         print(f"warning: requested Nyquist frequency {args.nyquist:g} Hz is not a power of two")
@@ -1940,6 +2431,7 @@ def main(argv: list[str]) -> int:
     except (OSError, RuntimeError, ValueError) as exc:
         print(f"warning: {exc}")
         return 1
+    timing_mark("read_input")
 
     ND = timeX.size
     print(f"Number of points in data = {ND}")
@@ -1990,6 +2482,7 @@ def main(argv: list[str]) -> int:
     fdata = np.zeros(N, dtype=np.float64)
     fdata[2:N:2] = dataf_c[1:N // 2].real
     fdata[3:N + 1:2] = dataf_c[1:N // 2].imag
+    timing_mark("preprocess_fft")
 
     psd = np.zeros(N // 2, dtype=np.float64)
     invpsd = np.zeros(N // 2, dtype=np.float64)
@@ -1998,7 +2491,9 @@ def main(argv: list[str]) -> int:
 
     bptr = BayesLineParams(maxBLLines=1000)
     BayesLineSetup(bptr, fdata, fmin, fmax, dt, Tobs)
-    BayesLineBurnin(bptr, data, fdata, "H1", fprop, 1)
+    timing_mark("BayesLineSetup")
+    BayesLineBurnin(bptr, data, fdata, "H1", fprop, 1, write_start=args.write_bl_start)
+    timing_mark("BayesLineBurnin")
 
     assert bptr.data is not None and bptr.Sbase is not None and bptr.Snf is not None
     imin = int(bptr.data.fmin * Tobs)
@@ -2009,8 +2504,11 @@ def main(argv: list[str]) -> int:
                                                    bptr.Sbase[:model_len], bptr.Snf[:model_len])))
     fprop_freq = np.arange(bptr.data.imin, N // 2, dtype=np.float64) / Tobs
     np.savetxt("fprop.dat", np.column_stack((fprop_freq, fprop[:fprop_freq.size])))
+    timing_mark("startup_diagnostics")
 
-    BayesLineRJMCMC(bptr, fdata, psd, invpsd, splinePSD, N, 100000, 1.0, 1, fprop, 1)
+    rjmcmc_steps = 100000
+    BayesLineRJMCMC(bptr, fdata, psd, invpsd, splinePSD, N, rjmcmc_steps, 1.0, 1, fprop, 1)
+    timing_mark("BayesLineRJMCMC")
 
     bw_freq = np.arange(N // 2, dtype=np.float64) / Tobs
     freq_out = np.zeros((N // 2, 3), dtype=np.float64)
@@ -2027,6 +2525,18 @@ def main(argv: list[str]) -> int:
     line_out = psd_out - smooth_out
     np.savetxt("BWpsd_components.dat", np.column_stack((bw_freq, psd_out, smooth_out, line_out)))
     np.savetxt("frequency_data.dat", freq_out)
+    timing_mark("write_outputs")
+
+    if args.timing:
+        total = time.perf_counter() - timing_start
+        print("Timing summary")
+        for label, elapsed in timing_marks:
+            print(f"  {label:22s} {elapsed:10.3f} s")
+        print(f"  {'total':22s} {total:10.3f} s")
+        for label, elapsed in timing_marks:
+            if label == "BayesLineRJMCMC" and rjmcmc_steps > 0:
+                print(f"  {'RJMCMC per 100K':22s} {elapsed * 100000.0 / rjmcmc_steps:10.3f} s")
+                break
 
     return 0
 
