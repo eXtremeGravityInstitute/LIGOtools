@@ -919,7 +919,6 @@ void BayesLineLorentzSplineMCMC(struct BayesLineParams *bayesline, double heat, 
   int ilowx, ihighx, ilowy, ihighy, imin, imax;
   int i, j, k=0, ki=0, ii=0, jj=0, ji, newki, mc, iu;
   int sl;
-  int szz;
   int check=0;
   int lbl;
   double alpha, alpha1;
@@ -930,7 +929,6 @@ void BayesLineLorentzSplineMCMC(struct BayesLineParams *bayesline, double heat, 
   double numin, numax;
   int *ac, *cc;
   double *Sn, *Sbase, *Sbasex, *Sline, *Snx;
-  double *Snav, *Snvar;
   double *xint;
   double e1, e2, e3, e4;
   double x2, x3, x4;
@@ -979,8 +977,6 @@ void BayesLineLorentzSplineMCMC(struct BayesLineParams *bayesline, double heat, 
   Sbasex = malloc((size_t)(sizeof(double)*(ncut)));
   Sbase  = malloc((size_t)(sizeof(double)*(ncut)));
   Sline  = malloc((size_t)(sizeof(double)*(ncut)));
-  Snav   = malloc((size_t)(sizeof(double)*(ncut)));
-  Snvar  = malloc((size_t)(sizeof(double)*(ncut)));
 
   sdatay   = malloc((size_t)(sizeof(double)*(nspline)));
   spointsy = malloc((size_t)(sizeof(double)*(nspline)));
@@ -994,15 +990,12 @@ void BayesLineLorentzSplineMCMC(struct BayesLineParams *bayesline, double heat, 
     if(SplineFlag == 1) AkimaSplineGSL(0,ncut,spline_x->n,spointsx,sdatax,freq,xint);
     else if(SplineFlag == 0) CubicSplineGSL(0,ncut,spline_x->n,spointsx,sdatax,freq,xint);
     
-    szz = 0;
     for(i=0; i<ncut; i++)
     {
       Sbase[i] = exp(xint[i]);
       Sbasex[i] = Sbase[i];
       if(HMean ==0) baseav += xint[i];
       if(HMean ==1) baseav += pow(xint[i],-1.0);
-      Snav[i] = 0.0;
-      Snvar[i] = 0.0;
     }
 
     baseav /= (double)(ncut);
@@ -1639,32 +1632,9 @@ void BayesLineLorentzSplineMCMC(struct BayesLineParams *bayesline, double heat, 
           }
           printf("\n");
       }
-      
-      if(mc > steps/4 && mc%100 ==0)
-      {
-          szz++;
-          for(i=0; i<ncut; i++)
-          {
-            Snav[i] += Snx[i];
-            Snvar[i] += Snx[i]*Snx[i];
-          }
-      }
+     
 
   }//End MCMC loop
-    
-    for(i=0; i<ncut; i++)
-    {
-      Snav[i] /= (double)(szz);
-      Snvar[i] /= (double)(szz);
-    }
-    
-    FILE* spec;
-    spec = fopen("psd_av.dat","w");
-    for(i=0; i<ncut; i++)
-    {
-      fprintf(spec,"%e %e %e\n", freq[i], Snav[i], sqrt(Snvar[i]-Snav[i]*Snav[i]));
-    }
-    fclose(spec);
     
   //Interpolate {spointsx,sdatax} ==> {freq,xint}
   if(SplineFlag == 1) AkimaSplineGSL(0,ncut,spline_x->n,spointsx,sdatax,freq,xint);
@@ -1721,8 +1691,6 @@ void BayesLineLorentzSplineMCMC(struct BayesLineParams *bayesline, double heat, 
   free(Sbase);
   free(Sbasex);
   free(Sline);
-  free(Snav);
-  free(Snvar);
   free(sdatay);
   free(spointsy);
     
@@ -1744,7 +1712,6 @@ void BayesLineFree(struct BayesLineParams *bptr)
 
   free(bptr->fa);
   free(bptr->Sna);
-  free(bptr->Sns);
   free(bptr->freq);
   free(bptr->power);
   free(bptr->Snf);
@@ -1824,7 +1791,6 @@ void BayesLineSetup(struct BayesLineParams *bptr, double *freqData, double fmin,
 
   bptr->fa  = malloc((size_t)(sizeof(double)*(n)));
   bptr->Sna = malloc((size_t)(sizeof(double)*(n)));
-  bptr->Sns = malloc((size_t)(sizeof(double)*(n)));
 
   //starting resolution for the spline
   nspline = (int)((bptr->data->fmax)/bptr->data->fgrid);
@@ -2063,12 +2029,12 @@ void copy_bayesline_params(struct BayesLineParams *origin, struct BayesLineParam
 #include <gsl/gsl_statistics.h>
 #include <gsl/gsl_sort.h>
 
-#define Qs 16.0          // Q used in the glitch cleaning for spectral estimation
+#define Qs 8.0          // Q used in the glitch cleaning for spectral estimation
 #define fsp 4.0         // spacing of spline points in Hz
 #define TPI 6.2831853071795862319959269370884
 #define RTPI 1.772453850905516                    // sqrt(Pi)
 #define sthresh 9.0
-#define warm 6.0
+#define warm 5.0
 #define LN2 0.6931471805599453                 // ln 2
 
 
@@ -2547,23 +2513,25 @@ static void clean(double *D, double *Draw, double *sqf, double *freqs, double *S
     out = fopen("pcheck.dat","w");
     for(i = 1; i < N/2; i++) fprintf(out,"%e %e %e\n", (double)(i)/Tobs, Sn[i], specD[i]);
     fclose(out);
-    double f, t, dt;
-    dt = Tobs/(double)(N);
-    out = fopen("Qtransform.dat","w");
-    for(j = 0; j < Nf; j++)
-    {
-        f = freqs[j];
-        
-        for(i = 0; i < N; i++)
+    
+        double f, t, dt;
+        dt = Tobs/(double)(N);
+        out = fopen("Qtransform.dat","w");
+        for(j = 0; j < Nf; j++)
         {
-            t = (double)(i)*dt;
-            if(t > 0.5 && t < Tobs-0.5) fprintf(out,"%e %e %e\n", t-Tobs/2.0, f, tfD[j][i]);
+            f = freqs[j];
+            
+            for(i = 0; i < N; i++)
+            {
+                t = (double)(i)*dt;
+                if(t > 1.0 && t < Tobs-1.0) fprintf(out,"%e %e %e\n", t-Tobs/2.0, f, tfD[j][i]);
+            }
+            
+            fprintf(out,"\n");
         }
-        
-        fprintf(out,"\n");
-    }
-    fclose(out);
-     */
+        fclose(out);
+    */
+     
   
   k = 0;
   //  apply threshold
@@ -3477,7 +3445,7 @@ void blstart(lorentzianParams *line, double *data, double *residual, int N, doub
   int istart, iend;
   double SNR, max;
   double Tobs, f, df, x, y, dx;
-  double fmax, Q, fny, scale;
+  double fmax, fmn, Q, fny, scale;
   double *freqs;
   double *Draw;
   double *D;
@@ -3508,9 +3476,9 @@ void blstart(lorentzianParams *line, double *data, double *residual, int N, doub
   df = 1.0/Tobs;  // frequency resolution
   fny = 1.0/(2.0*dt);  // Nyquist
   
-  // Set the range of the spectrogram. fmin, fmax must be a power of 2
+  // Set the range of the spectrogram.
   fmax = fny;
-  
+  fmn = 1.0/Tobs; // want to clean below where the data is used to avoid edge effects
   
   D = (double*)malloc(sizeof(double)* (N));
   Draw = (double*)malloc(sizeof(double)* (N));
@@ -3532,12 +3500,12 @@ void blstart(lorentzianParams *line, double *data, double *residual, int N, doub
   
   // logarithmic frequency spacing
   subscale = 40;  // number of semi-tones per octave
-  octaves = (int)(rint(log(fmax/fmin)/log(2.0))); // number of octaves
+  octaves = (int)(rint(log(fmax/fmn)/log(2.0))); // number of octaves
   Nf = subscale*octaves+1;
   freqs = (double*)malloc(sizeof(double)* (Nf));   // frequencies used in the analysis
   sqf = (double*)malloc(sizeof(double)* (Nf));
   dx = log(2.0)/(double)(subscale);
-  x = log(fmin);
+  x = log(fmn);
   for(i=0; i< Nf; i++)
   {
     freqs[i] = exp(x);
@@ -3545,7 +3513,7 @@ void blstart(lorentzianParams *line, double *data, double *residual, int N, doub
     x += dx;
   }
   
-  //printf("frequency layers = %d\n", Nf);
+  printf("frequency layers = %d\n", Nf);
   
   scale = Getscale(freqs, Q, Tobs, fmax, N, Nf);
   
@@ -3947,6 +3915,65 @@ void lorentzraw(double f0, double nu, double S, int J, double *freqs, double *pf
     
 }
 
+static int llook_sparse_setup(lorentzianParams *restrict ll, double f0, double nu, double Tobs, int *ii, int *jj, double *y, double *z)
+{
+    double x, f, dfx, dnux, lnu;
+    int k;
+    
+    if(f0 < 0.0) printf("neg\n");
+    
+    k = (int)(rint(f0*Tobs));
+    x = (f0-(double)(k)/Tobs);
+    
+    if(x*Tobs <= -0.5)
+    {
+        k -= 1;
+        x = (f0-(double)(k)/Tobs);
+    }
+    
+    if(x*Tobs >= 0.5)
+    {
+        k += 1;
+        x = (f0-(double)(k)/Tobs);
+    }
+    
+    dfx = 1.0/((double)(ll->nf)*Tobs);
+    dnux = (ll->lnumax-ll->lnumin)/(double)(ll->nnu);
+    
+    *ii = (ll->nf + (int)(floor(2.0*x*Tobs*(double)(ll->nf))))/2;
+    
+    // edge case
+    if(*ii == ll->nf)
+    {
+        *ii -= 1;
+    }
+    
+    f = (double)(2*(*ii)-ll->nf)/(double)(ll->nf)*0.5/Tobs;
+    *y = (x-f)/dfx;
+    
+    lnu = log(nu);
+    if(lnu < ll->lnumin) lnu = ll->lnumin;
+    if(lnu > ll->lnumax) lnu = ll->lnumax;
+    
+    x = (log(nu)-ll->lnumin)/dnux;
+    *jj = (int)(x);
+    *z = x-(double)(*jj);
+    
+    // edge case
+    if(*jj == ll->nnu)
+    {
+        *jj -= 1;
+        *z = x-(double)(*jj);
+    }
+    
+    return k;
+}
+
+static double llook_sparse_value(lorentzianParams *restrict ll, int ii, int jj, double y, double z, double A, int i)
+{
+    return A*exp((1.0-z)*((1.0-y)*ll->ltemplate[ii][jj][i]+y*ll->ltemplate[ii+1][jj][i])+z*((1.0-y)*ll->ltemplate[ii][jj+1][i]+y*ll->ltemplate[ii+1][jj+1][i]));
+}
+
 // returns interpolated windowed Lorentzian and the bin index
 // lt needs to have size ll->wdth
 int llook(lorentzianParams *restrict ll, double f0, double nu, double A, double Tobs)
@@ -4022,12 +4049,8 @@ int llook(lorentzianParams *restrict ll, double f0, double nu, double A, double 
 }
 double Lpeak(lorentzianParams *restrict ll, double *PG, double *SM, int N, int spread, double f0, double nu, double *A, double Tobs)
 {
-    int i, j, k;
-    double x, y, z, logL, peak;
-    int is, ie;
-    double *lt;
-    
-    lt = double_vector(ll->wdth);
+    int i, j, k, ii, jj, ilo, ihi, idx;
+    double x, y, z, logL, peak, lt;
     
     k = (int)(rint(f0*Tobs));
     
@@ -4058,25 +4081,97 @@ double Lpeak(lorentzianParams *restrict ll, double *PG, double *SM, int N, int s
     if(peak < 0.0) peak = 0.0;  // shouldn't happen
     *A = peak;
     
-    k = llook(ll, f0, nu, peak, Tobs);
+    k = llook_sparse_setup(ll, f0, nu, Tobs, &ii, &jj, &y, &z);
     
     logL = 0.0;
     
     j = k-ll->wdth/2;
+    ilo = ll->wdth/2-spread;
+    ihi = ll->wdth/2+spread;
+    if(ilo < 0) ilo = 0;
+    if(ihi >= ll->wdth) ihi = ll->wdth-1;
     
     // compute likelihood difference with/without line
-    for (i = ll->wdth/2-spread; i <= ll->wdth/2+spread; ++i)
+    for (i = ilo; i <= ihi; ++i)
     {
-        if(i+j > 0 && i+j < N/2)
+        idx = i+j;
+        if(idx > 0 && idx < N/2)
         {
-            logL += -log(SM[i+j]+ll->lt[i]) - PG[i+j]/(SM[i+j]+ll->lt[i]);
+            lt = llook_sparse_value(ll, ii, jj, y, z, peak, i);
+            logL += -log(SM[idx]+lt) - PG[idx]/(SM[idx]+lt);
             // subtract likelihood with no line contribution
-            logL += log(SM[i+j]) + PG[i+j]/SM[i+j];
+            logL += log(SM[idx]) + PG[idx]/SM[idx];
         }
         
     }
-    
-    free(lt);
-    
+
     return logL;
 }
+
+void Qscan(double *dataf, double *psd, double Q, double fmin, double fmax, double dt, int N)
+{
+    
+    // Prepare to make spectogram
+    
+    int i, j, k;
+    int subscale, octaves, Nf;
+    double dx, f, t, x, Tobs;
+    double *freqs, *sqf;
+    double **tfDR, **tfDI;
+    double **tfD;
+    
+    FILE *out;
+    
+    Tobs = dt*(double)(N);
+    
+    // logarithmic frequency spacing
+    subscale = 40;  // number of semi-tones per octave
+    octaves = (int)(rint(log(fmax/fmin)/log(2.0))); // number of octaves
+    Nf = subscale*octaves+1;
+    freqs = (double*)malloc(sizeof(double)* (Nf));   // frequencies used in the analysis
+    sqf = (double*)malloc(sizeof(double)* (Nf));
+    dx = log(2.0)/(double)(subscale);
+    x = log(fmin);
+    for(i=0; i< Nf; i++)
+    {
+      freqs[i] = exp(x);
+      sqf[i] = sqrt(freqs[i]);
+      x += dx;
+    }
+ 
+      tfDR = double_matrix(Nf,N);
+      tfDI = double_matrix(Nf,N);
+      tfD = double_matrix(Nf,N);
+    
+    // whiten data
+    whiten(dataf, psd, N);
+    
+    // Wavelet transform
+    TransformC(dataf, freqs, tfD, tfDR, tfDI, Q, Tobs, N, Nf);
+      
+    x = 0.0;
+    k =0;
+    out = fopen("Qtransform.dat","w");
+    for(j = 0; j < Nf; j++)
+    {
+        f = freqs[j];
+        
+        for(i = 0; i < N; i++)
+        {
+            t = (double)(i)*dt;
+            if(t > 1.0 && t < Tobs-1.0)
+            {
+                fprintf(out,"%e %e %e\n", t-Tobs+4.0, f, tfD[j][i]);
+                x += tfD[j][i];
+                k++;
+            }
+        }
+        
+        fprintf(out,"\n");
+    }
+    fclose(out);
+    
+    printf("mean Q power %f\n", x/(double)(k));
+    
+}
+

@@ -46,10 +46,11 @@ Main outputs:
     ADplot.pdf
         Main diagnostic plot. Top panel shows band variance with 1, 2, and 3
         sigma bands; variance outliers outside the plot range are shown as
-        stars at +/-4 sigma. Bottom panel shows AD p-values.
+        stars at +/-4 sigma. Bottom panel shows AD p-values. Frequency bands
+        dominated by loud spectral lines are shaded gray.
 
     Spectra.pdf
-        Spectrum view with PSD-line bins marked.
+        Spectrum view with PSD-line bands shaded gray.
 
 P-value modes:
 
@@ -361,8 +362,11 @@ def run_tests(
     ad_statistics = []
     line_rows = []
     outlier_freqs = []
+    outlier_bands = []
     for j in range(bands):
         freq = fmin + (j + 0.5) * bandwidth
+        band_start = fmin + j * bandwidth
+        band_stop = band_start + bandwidth
         psd_start = (nmin + j * band_ntest) // 2
         psd_stop = psd_start + band_ntest // 2
         log_psd = np.log(psd[psd_start:psd_stop, 1])
@@ -376,6 +380,7 @@ def run_tests(
         # segments with strong lines.
         if pvar - pav * pav > 0.3:
             outlier_freqs.append(freq)
+            outlier_bands.append((band_start, band_stop))
             line_rows.append((freq, vlow, 0.00005, 1.0e-50))
             line_rows.append((freq, vhigh, 1.0, 1.0e-40))
             line_rows.append((freq, vlow, 0.00005, 1.0e-50))
@@ -412,6 +417,7 @@ def run_tests(
         "adtest": np.array(ad_rows, dtype=float),
         "lines": np.array(line_rows, dtype=float),
         "outlier_freqs": np.array(outlier_freqs, dtype=float),
+        "outlier_bands": np.array(outlier_bands, dtype=float).reshape(-1, 2),
         "df": df,
         "t_obs": t_obs,
         "fmin": fmin,
@@ -511,7 +517,7 @@ def write_summary(path: Path, summary: str) -> None:
 
 def save_adplot_pdf(
     adtest: np.ndarray,
-    outlier_freqs: np.ndarray,
+    outlier_bands: np.ndarray,
     fmin: float,
     bandwidth: float,
     bands: int,
@@ -520,7 +526,7 @@ def save_adplot_pdf(
     vlow: float,
     vhigh: float,
 ) -> None:
-    xmax = fmin + (bands - 1) * bandwidth
+    xmax = fmin + bands * bandwidth
 
     fig = plt.figure(figsize=(7.0, 7.0))
     top = fig.add_axes((0.12, 0.53, 0.84, 0.40))
@@ -529,6 +535,8 @@ def save_adplot_pdf(
     top.fill_between(adtest[:, 0], 1.0 - 3.0 * uv, 1.0 + 3.0 * uv, color="red", alpha=0.2)
     top.fill_between(adtest[:, 0], 1.0 - 2.0 * uv, 1.0 + 2.0 * uv, color="red", alpha=0.4)
     top.fill_between(adtest[:, 0], 1.0 - uv, 1.0 + uv, color="red", alpha=0.6)
+    for start, stop in outlier_bands:
+        top.axvspan(start, stop, color="0.75", alpha=0.45, linewidth=0)
     variance = adtest[:, 2]
     in_range = (variance >= vlow) & (variance <= vhigh)
     high_outliers = variance > vhigh
@@ -548,16 +556,14 @@ def save_adplot_pdf(
         marker="*",
         color="blue",
     )
-    for freq in outlier_freqs:
-        top.plot([freq, freq, freq], [vlow, vhigh, vlow], color="black", linewidth=0.8)
     top.set_xlim(fmin, xmax)
     top.set_ylim(vlow, vhigh)
     top.set_ylabel("Variance")
     top.tick_params(labelbottom=False)
 
+    for start, stop in outlier_bands:
+        bottom.axvspan(start, stop, color="0.75", alpha=0.45, linewidth=0)
     bottom.scatter(adtest[:, 0], adtest[:, 1], s=3, color="blue")
-    for freq in outlier_freqs:
-        bottom.plot([freq, freq, freq], [0.00005, 1.0, 0.00005], color="black", linewidth=0.8)
     bottom.axhline(1.0 / bands, color="red", linewidth=1.0)
     bottom.set_xlim(fmin, xmax)
     bottom.set_ylim(0.00005, 1.0)
@@ -572,19 +578,24 @@ def save_adplot_pdf(
 def save_spectra_pdf(
     psd: np.ndarray,
     data: np.ndarray,
-    outlier_freqs: np.ndarray,
+    outlier_bands: np.ndarray,
     t_obs: float,
     xlim: tuple[float, float],
 ) -> None:
     fig, ax = plt.subplots(figsize=(7.0, 5.0))
-    for freq in outlier_freqs:
-        ax.plot([freq, freq, freq], [1.0e-50, 1.0e-40, 1.0e-50], color="black", linewidth=0.8)
-    ax.plot(data[:, 0], 2.0 * (data[:, 1] ** 2 + data[:, 2] ** 2) / t_obs, color="0.55", linewidth=0.8)
+    for start, stop in outlier_bands:
+        ax.axvspan(start, stop, color="0.75", alpha=0.45, linewidth=0)
+    # Use the same normalization as the AD whitening convention:
+    # Re/sqrt(2*PSD), Im/sqrt(2*PSD). This makes periodogram/PSD a chi^2_2
+    # variate with mean 2 when the PSD normalization is correct.
+    periodogram = 0.5 * (data[:, 1] ** 2 + data[:, 2] ** 2)
+    ax.plot(data[:, 0], periodogram, color="0.55", linewidth=0.8)
     ax.plot(psd[:, 0], psd[:, 1], color="blue", linewidth=0.8)
     ax.set_yscale("log")
     ax.set_ylim(1.0e-50, 1.0e-40)
     ax.set_xlim(*xlim)
     ax.set_xlabel("f (Hz)")
+    ax.set_ylabel("Power")
     fig.tight_layout()
     fig.savefig("Spectra.pdf")
     plt.close(fig)
@@ -614,6 +625,8 @@ Output files:
 
 Notes:
   Each frequency bin supplies two samples, Re/sqrt(2*PSD) and Im/sqrt(2*PSD).
+  Spectra.pdf plots 0.5*(Re^2 + Im^2), so periodogram/PSD has expected mean 2
+  when the same whitening convention is satisfied.
   Use --known-parameters when the whitened samples should be tested directly
   against a fully specified normal distribution. Without it, the code fits
   mean and variance in each band and uses the fitted-normal AD calibration.
@@ -667,6 +680,7 @@ def main() -> int:
     adtest = results["adtest"]
     lines = results["lines"]
     outlier_freqs = results["outlier_freqs"]
+    outlier_bands = results["outlier_bands"]
     (
         summary,
         low_variance,
@@ -687,7 +701,7 @@ def main() -> int:
     write_summary(args.summary_file, summary)
     save_adplot_pdf(
         adtest,
-        outlier_freqs,
+        outlier_bands,
         float(results["fmin"]),
         float(results["bandwidth"]),
         int(results["bands"]),
@@ -696,11 +710,10 @@ def main() -> int:
         float(results["vlow"]),
         float(results["vhigh"]),
     )
-    xmax = float(results["fmin"]) + (int(results["bands"]) - 1) * float(results["bandwidth"])
     save_spectra_pdf(
         psd,
         data,
-        outlier_freqs,
+        outlier_bands,
         float(results["t_obs"]),
         (float(results["fmin"]), float(results["fmax"])),
     )
@@ -723,7 +736,7 @@ def main() -> int:
     print(
         "frequency range covered by test "
         f"{float(results['fmin']):f} "
-        f"{float(results['fmin']) + (int(results['bands']) - 1) * float(results['bandwidth']):f}"
+        f"{float(results['fmin']) + int(results['bands']) * float(results['bandwidth']):f}"
     )
     print(f"frequency range covered by spectrum plot {float(results['fmin']):f} {float(results['fmax']):f}")
     print(

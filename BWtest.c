@@ -18,7 +18,7 @@ int main(int argc,char **argv)
     int ND, N, i, j, k, kk, imin, dec;
     double Tobs;
     double alpha, x, y, z, hr, hi, fac;
-    double *data, *dataf, *fdata, *times;
+    double *data, *dataf, *fdata, *times, *dcopy;
     double *psd, *invpsd, *splinePSD, *fprop;
     double *timeX, *dataX;
     double fmin, fmax, dt, fny;
@@ -78,7 +78,8 @@ int main(int argc,char **argv)
     if(dec > 1)
     {
         
-        fmn = 1.0/Tobs;
+       // fmn = 1.0/Tobs;
+        fmn = fmin/2.0;
         fmx = fmax;
         
         // apply 8th order zero phase bandpass filter
@@ -89,6 +90,7 @@ int main(int argc,char **argv)
     
     times = (double*)malloc(sizeof(double)* (N));
     data = (double*)malloc(sizeof(double)* (N));
+    dcopy = (double*)malloc(sizeof(double)* (N));
     dataf = (double*)malloc(sizeof(double)* (N));
     fdata = (double*)malloc(sizeof(double)* (N));
     
@@ -102,7 +104,6 @@ int main(int argc,char **argv)
     free(timeX);
     free(dataX);
     
-
     alpha = (2.0*t_rise/Tobs);
     
     tukey(data, alpha, N);
@@ -110,6 +111,9 @@ int main(int argc,char **argv)
     for(i=0; i< N; i++) dataf[i] = data[i];
     
     gsl_fft_real_radix2_transform(dataf, 1, N);
+    
+    // keep a copy of the raw FFTed data
+    for(i=0; i< N; i++) dcopy[i] = dataf[i];
     
     dt = Tobs/(double)(N);
     
@@ -128,7 +132,7 @@ int main(int argc,char **argv)
     splinePSD = malloc((N/2)*sizeof(double));
     fprop = malloc((N/2)*sizeof(double));
     
-    bptr->maxBLLines = 5000;
+    bptr->maxBLLines = 1000;
     
     BayesLineSetup(bptr, fdata, fmin, fmax, dt, Tobs);
     
@@ -159,7 +163,7 @@ int main(int argc,char **argv)
     fprintf(out,"%e %e\n", 0.0, psd[1]/2.0);
     for (i = 1; i < N/2; ++i)
     {
-        fprintf(out,"%e %e\n", (double)(i)/Tobs, psd[i]);
+        fprintf(out,"%e %e\n", (double)(i)/Tobs, psd[i]/2.0);
     }
     fclose(out);
     
@@ -180,10 +184,11 @@ int main(int argc,char **argv)
     fclose(out);
     
     out = fopen("frequency_data.dat","w");
+    x = sqrt(2.0);
     fprintf(out,"%e %e %e\n", 0.0, 0.0, 0.0);
     for (i = 1; i < N/2; ++i)
     {
-        fprintf(out,"%e %e %e\n", (double)(i)/Tobs, fdata[2*i], fdata[2*i+1]);
+        fprintf(out,"%e %e %e\n", (double)(i)/Tobs, fdata[2*i]*x, fdata[2*i+1]*x);
     }
     fclose(out);
     
@@ -256,7 +261,27 @@ int main(int argc,char **argv)
     }
     fclose(white);
     
+    // make a Qscan of the data
+    // switch back to GSL storage format
+    dataf[0] = 0.0;
+    dataf[N/2] = 0.0;
+    for (i = 1; i < N/2; ++i)
+    {
+        dataf[i] = fdata[2*i];
+        dataf[N-i] = fdata[2*i+1];
+    }
     
+    Qscan(dataf, psd, 16.0, fmin, fmax, dt, N);
+    system("gnuplot Qscan.gnu");
+    system("mv Qscan.png Qscan_clean.png");
+
+    fac = dt/sqrt(2.0);
+    for(i=1; i< N; i++) dcopy[i] *= fac;
+    Qscan(dcopy, psd, 16.0, fmin, fmax, dt, N);
+    system("gnuplot Qscan.gnu");
+    system("mv Qscan.png Qscan_raw.png");
+    
+    system("magick -delay 100 Qscan_raw.png Qscan_clean.png -loop 0 blink.gif");
     
     return 0;
 }
@@ -357,3 +382,4 @@ void bwbpf(double *in, double *out, int fwrv, int M, int n, double s, double f1,
     
     return;
 }
+

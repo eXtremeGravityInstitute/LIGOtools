@@ -902,7 +902,7 @@ def clean_once(D: np.ndarray, Draw: np.ndarray, sqf: np.ndarray, freqs: np.ndarr
     return Draw - recolored / math.sqrt(2.0 * n), snr
 
 
-def bayesline_clean_time(data: np.ndarray, dt: float, fmin: float) -> np.ndarray:
+def bayesline_clean_time(data: np.ndarray, dt: float) -> np.ndarray:
     """Repeat wavelet cleaning until the C stopping criterion is satisfied."""
 
     n = data.size
@@ -911,9 +911,13 @@ def bayesline_clean_time(data: np.ndarray, dt: float, fmin: float) -> np.ndarray
     imin = int(2.0 * T_RISE / dt)
     imax = n - imin
     subscale = 40
-    octaves = int(np.rint(math.log(fny / fmin) / math.log(2.0)))
+    # Clean below the BayesLine analysis band so low-frequency excess power
+    # cannot leak upward into the PSD region. The PSD/line model still starts
+    # from the analysis fmin in blstart.
+    clean_fmin = 1.0 / t_obs
+    octaves = int(np.rint(math.log(fny / clean_fmin) / math.log(2.0)))
     Nf = subscale * octaves + 1
-    freqs = np.exp(math.log(fmin) + np.arange(Nf, dtype=np.float64) * math.log(2.0) / subscale)
+    freqs = np.exp(math.log(clean_fmin) + np.arange(Nf, dtype=np.float64) * math.log(2.0) / subscale)
     sqf = np.sqrt(freqs)
     scale = getscale(freqs, Q_S, t_obs, fny, n)
 
@@ -1761,7 +1765,7 @@ def blstart(line: LorentzianParams, data: np.ndarray, residual: np.ndarray, n: i
 
     freqs = np.fft.rfftfreq(n, dt)
     rng = np.random.default_rng(1234)
-    cleaned_time = bayesline_clean_time(data, dt, fmin)
+    cleaned_time = bayesline_clean_time(data, dt)
     fft = np.fft.rfft(cleaned_time)
     # C blstart writes BayesWave-scaled residual Fourier coefficients back to
     # freqData: residual = FFT(cleaned_data) * sqrt(Tobs^2 / (2*N^2)).

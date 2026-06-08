@@ -143,7 +143,6 @@ struct BayesLineParams
 
   double *Snf;
   double *Sna;
-  double *Sns;
   double *fa;
   double *freq;
   double *power;
@@ -225,3 +224,5 @@ void setup_lorentzian_lookup(lorentzianParams *lines, int N, double Tobs, int im
 void add_windowed_lorentzian(double *Slines, double Tobs, lorentzianParams *lines, int ii, int imin, int imax);
 int llook(lorentzianParams *restrict ll, double f0, double nu, double A, double Tobs);
 double Lpeak(lorentzianParams *restrict ll, double *PG, double *SM, int N, int spread, double f0, double nu, double *A, double Tobs);
+void Qscan(double *dataf, double *psd, double Q, double fmin, double fmax, double dt, int N);
+
