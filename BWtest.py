@@ -223,6 +223,25 @@ def tukey_inplace(data: np.ndarray, alpha: float) -> None:
         data[i] *= filt
 
 
+def tukey_power_correction(n: int, alpha: float) -> float:
+    """Return the power correction N/sum(w^2) for the C-style Tukey taper."""
+
+    imin = int(alpha * (n - 1.0) / 2.0)
+    imax = int((n - 1.0) * (1.0 - alpha / 2.0))
+    nwin = n - imax
+    sum_w2 = 0.0
+    for i in range(n):
+        filt = 1.0
+        if imin > 0 and i < imin:
+            filt = 0.5 * (1.0 + math.cos(math.pi * (i / imin - 1.0)))
+        if nwin > 0 and i > imax:
+            filt = 0.5 * (1.0 + math.cos(math.pi * ((i - imax) / nwin)))
+        sum_w2 += filt * filt
+    if sum_w2 <= 0.0:
+        raise ValueError("Tukey window has zero power")
+    return float(n) / sum_w2
+
+
 @njit(cache=True)
 def bwbpf_numba(inp: np.ndarray, fwrv: int, order: int, sample_rate: float, f1: float, f2: float) -> np.ndarray:
     """Butterworth bandpass filter ported from BWtest.c's bwbpf routine."""
@@ -2475,6 +2494,7 @@ def main(argv: list[str]) -> int:
     del times
 
     alpha = 2.0 * T_RISE / Tobs
+    window_power_correction = tukey_power_correction(N, alpha)
     tukey_inplace(data, alpha)
 
     dataf_c = np.fft.rfft(data)
@@ -2517,15 +2537,15 @@ def main(argv: list[str]) -> int:
     bw_freq = np.arange(N // 2, dtype=np.float64) / Tobs
     freq_out = np.zeros((N // 2, 3), dtype=np.float64)
     freq_out[:, 0] = bw_freq
-    freq_scale = math.sqrt(2.0)
+    freq_scale = math.sqrt(2.0 * window_power_correction)
     freq_out[1:, 1] = freq_scale * fdata[2:N:2]
     freq_out[1:, 2] = freq_scale * fdata[3:N + 1:2]
 
-    psd_out = 0.5 * psd.copy()
+    psd_out = 0.5 * window_power_correction * psd.copy()
     if psd_out.size > 1:
         psd_out[0] = psd_out[1]
     np.savetxt("BWpsd.dat", np.column_stack((bw_freq, psd_out)))
-    smooth_out = 0.5 * splinePSD.copy()
+    smooth_out = 0.5 * window_power_correction * splinePSD.copy()
     line_out = psd_out - smooth_out
     np.savetxt("BWpsd_components.dat", np.column_stack((bw_freq, psd_out, smooth_out, line_out)))
     np.savetxt("frequency_data.dat", freq_out)

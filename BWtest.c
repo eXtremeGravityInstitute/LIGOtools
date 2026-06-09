@@ -11,13 +11,14 @@
 // gcc  -I/opt/homebrew/include -L/opt/homebrew/lib -I/opt/homebrew/opt/libomp/include -L/opt/homebrew/opt/libomp/lib -Xclang -fopenmp -lomp -o BWtest BWtest.c BayesLine.c -lm -lgslcblas -lgsl
 
 static void tukey(double *data, double alpha, int N);
+static double tukey_power_correction(double alpha, int N);
 void bwbpf(double *in, double *out, int fwrv, int M, int n, double s, double f1, double f2);
 
 int main(int argc,char **argv)
 {
     int ND, N, i, j, k, kk, imin, dec;
     double Tobs;
-    double alpha, x, y, z, hr, hi, fac;
+    double alpha, x, y, z, hr, hi, fac, window_power_correction;
     double *data, *dataf, *fdata, *times, *dcopy;
     double *psd, *invpsd, *splinePSD, *fprop;
     double *timeX, *dataX;
@@ -159,11 +160,13 @@ int main(int argc,char **argv)
     // standalone test output keeps the earlier BWtest normalization here.
     
     
+    window_power_correction = tukey_power_correction(alpha, N);
+    
     out = fopen("psd.dat","w");
-    fprintf(out,"%e %e\n", 0.0, psd[1]/2.0);
+    fprintf(out,"%e %e\n", 0.0, psd[1]*window_power_correction/2.0);
     for (i = 1; i < N/2; ++i)
     {
-        fprintf(out,"%e %e\n", (double)(i)/Tobs, psd[i]/2.0);
+        fprintf(out,"%e %e\n", (double)(i)/Tobs, psd[i]*window_power_correction/2.0);
     }
     fclose(out);
     
@@ -184,7 +187,7 @@ int main(int argc,char **argv)
     fclose(out);
     
     out = fopen("frequency_data.dat","w");
-    x = sqrt(2.0);
+    x = sqrt(2.0*window_power_correction);
     fprintf(out,"%e %e %e\n", 0.0, 0.0, 0.0);
     for (i = 1; i < N/2; ++i)
     {
@@ -306,6 +309,29 @@ static void tukey(double *data, double alpha, int N)
   
 }
 
+static double tukey_power_correction(double alpha, int N)
+{
+  int i, imin, imax;
+  double filter;
+  double sumw2;
+  
+  imin = (int)(alpha*(double)(N-1)/2.0);
+  imax = (int)((double)(N-1)*(1.0-alpha/2.0));
+  
+  int Nwin = N-imax;
+  
+  sumw2 = 0.0;
+  for(i=0; i< N; i++)
+  {
+    filter = 1.0;
+    if(i<imin) filter = 0.5*(1.0+cos(M_PI*( (double)(i)/(double)(imin)-1.0 )));
+    if(i>imax) filter = 0.5*(1.0+cos(M_PI*( (double)(i-imax)/(double)(Nwin))));
+    sumw2 += filter*filter;
+  }
+  
+  return (double)(N)/sumw2;
+}
+
 void bwbpf(double *in, double *out, int fwrv, int M, int n, double s, double f1, double f2)
 {
     /* Butterworth bandpass filter
@@ -382,4 +408,3 @@ void bwbpf(double *in, double *out, int fwrv, int M, int n, double s, double f1,
     
     return;
 }
-
