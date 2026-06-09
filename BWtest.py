@@ -42,6 +42,10 @@ Important output files:
     BWpsd_components.dat
         Final total, smooth, and line PSD components.
 
+    whitelsf.dat and whitelsf_noglitch.dat
+        Optional with --writewhite: line-subtracted, smooth-PSD-whitened
+        Fourier data before and after wavelet glitch cleaning.
+
 To run the functional whitening check used during development:
 
     /opt/anaconda3/bin/python ADtest.py BWpsd.dat frequency_data.dat 8 \
@@ -1283,6 +1287,97 @@ def subtract_lines_lmcmc_numba(data_fft: np.ndarray, smooth: np.ndarray,
     return cleaned
 
 
+@njit(cache=True)
+def whiten_line_subtracted_numba(real_data: np.ndarray, imag_data: np.ndarray,
+                                 sbase: np.ndarray, sline: np.ndarray,
+                                 snf: np.ndarray, imin: int, imax: int,
+                                 t_obs: float, seed: int) -> np.ndarray:
+    """Build C BWtest whitelsf output from scaled Fourier data."""
+
+    np.random.seed(seed)
+    n_half = real_data.size - 1
+    white = np.zeros((n_half - 1, 3), dtype=np.float64)
+    gaussian_sigma = math.sqrt(0.5)
+    tiny = np.finfo(np.float64).tiny
+    for i in range(1, n_half):
+        white[i - 1, 0] = i / t_obs
+        if i < imin or i >= imax:
+            white[i - 1, 1] = gaussian_sigma * np.random.normal()
+            white[i - 1, 2] = gaussian_sigma * np.random.normal()
+            continue
+
+        j = i - imin
+        dr = real_data[i]
+        di = imag_data[i]
+        hrx = 0.0
+        hix = 0.0
+        frac = sline[j] / max(snf[j], tiny)
+        if frac > 1.0e-2:
+            SM = 2.0 * sbase[j]
+            SL = 2.0 * sline[j]
+            total = SM + SL
+            hrx = frac * dr
+            hix = frac * di
+            sigma2 = 0.25 * SM * SL / max(total, tiny)
+            sigma = math.sqrt(max(sigma2, 0.0))
+            x = dr - hrx
+            y = di - hix
+            logLx = -2.0 * (x * x + y * y) / max(SM, tiny)
+            for _ in range(1, 1000):
+                hry = hrx + sigma * np.random.normal()
+                hiy = hix + sigma * np.random.normal()
+                x = dr - hry
+                y = di - hiy
+                logLy = -2.0 * (x * x + y * y) / max(SM, tiny)
+                alpha = math.log(max(np.random.random(), tiny))
+                if alpha < logLy - logLx:
+                    logLx = logLy
+                    hrx = hry
+                    hix = hiy
+
+        scale = math.sqrt(max(sbase[j], tiny))
+        white[i - 1, 1] = (dr - hrx) / scale
+        white[i - 1, 2] = (di - hix) / scale
+    return white
+
+
+def write_whitened_line_subtracted_files(bayesline: BayesLineParams,
+                                         original_fft: np.ndarray,
+                                         cleaned_freq_data: np.ndarray,
+                                         dt: float,
+                                         rng: np.random.Generator) -> None:
+    """Write the optional C-style whitelsf diagnostic files."""
+
+    assert bayesline.data is not None
+    assert bayesline.Sbase is not None and bayesline.Sline is not None and bayesline.Snf is not None
+    data = bayesline.data
+    n = data.n
+    n_half = n // 2
+
+    cleaned_real = np.zeros(n_half + 1, dtype=np.float64)
+    cleaned_imag = np.zeros(n_half + 1, dtype=np.float64)
+    cleaned_real[1:n_half] = cleaned_freq_data[2:n:2]
+    cleaned_imag[1:n_half] = cleaned_freq_data[3:n + 1:2]
+
+    original_scaled = original_fft * (dt / math.sqrt(2.0))
+    original_real = original_scaled.real.astype(np.float64, copy=True)
+    original_imag = original_scaled.imag.astype(np.float64, copy=True)
+
+    seed_noglitch = int(rng.integers(1, 2**31 - 1))
+    white_noglitch = whiten_line_subtracted_numba(
+        cleaned_real, cleaned_imag, bayesline.Sbase, bayesline.Sline, bayesline.Snf,
+        data.imin, data.imax, data.t_obs, seed_noglitch
+    )
+    np.savetxt("whitelsf_noglitch.dat", white_noglitch)
+
+    seed_raw = int(rng.integers(1, 2**31 - 1))
+    white_raw = whiten_line_subtracted_numba(
+        original_real, original_imag, bayesline.Sbase, bayesline.Sline, bayesline.Snf,
+        data.imin, data.imax, data.t_obs, seed_raw
+    )
+    np.savetxt("whitelsf.dat", white_raw)
+
+
 def lineget_candidates(power: np.ndarray, smooth: np.ndarray, freqs: np.ndarray,
                        istart: int, iend: int, max_lines: int) -> np.ndarray:
     """Find local periodogram peaks above LINEMUL, preserving C scan order."""
@@ -2019,17 +2114,17 @@ def BayesLineLorentzSplineMCMC(bayesline: BayesLineParams, heat: float, steps: i
                     spline_changed_index = ii
                 else:
                     if 0 < ii < spline.n - 1:
-                        prop_points[ii] = flow + (fhigh - flow) * rng.random()
-                    newfreq = float(prop_points[ii])
-                    ji = min(max(int((prop_points[ii] - flow) * t_obs), 0), ncut - 1)
-                    lower = max(priors.lower[ji], np.finfo(float).tiny) if priors.lower is not None else max(sbase[ji] / 10.0, np.finfo(float).tiny)
-                    prop_sdata[ii] = math.log(lower) + math.log(100.0) * rng.random()
-                    order = np.argsort(prop_points)
-                    prop_points = prop_points[order]
-                    prop_sdata = prop_sdata[order]
-                    spline_changed_index = int(np.searchsorted(prop_points, newfreq, side="left"))
-                    if spline_changed_index >= prop_points.size:
-                        spline_changed_index = prop_points.size - 1
+                        newfreq = flow + (fhigh - flow) * rng.random()
+                        if newfreq <= prop_points[ii - 1] or newfreq >= prop_points[ii + 1]:
+                            check = True
+                        else:
+                            prop_points[ii] = newfreq
+                    if not check:
+                        newfreq = float(prop_points[ii])
+                        ji = min(max(int((prop_points[ii] - flow) * t_obs), 0), ncut - 1)
+                        lower = max(priors.lower[ji], np.finfo(float).tiny) if priors.lower is not None else max(sbase[ji] / 10.0, np.finfo(float).tiny)
+                        prop_sdata[ii] = math.log(lower) + math.log(100.0) * rng.random()
+                        spline_changed_index = ii
 
             if not check:
                 if np.any(np.diff(prop_points) < 2.0):
@@ -2234,13 +2329,20 @@ def BayesLineLorentzSplineMCMC(bayesline: BayesLineParams, heat: float, steps: i
             rates = [ac[i] / cc[i] for i in range(6)]
             print(f"{mc} {lines.n} {spline.n} {logLx:.6e} " + " ".join(f"{r:.6f}" for r in rates))
 
-    bayesline.Sbase = sbase.copy()
-    bayesline.Sline = sline.copy()
-    bayesline.Snf = snx.copy()
     bayesline.spline_x = SplineParams(points=spline.points.copy(), data=spline.data.copy())
     if bayesline.spline is not None:
         bayesline.spline = SplineParams(points=spline.points.copy(), data=spline.data.copy())
-    ratio = power / np.maximum(snx, np.finfo(float).tiny)
+    # Rebuild the final PSD from the accepted parameters, matching the C
+    # end-of-chain Akima interpolation/full line-model refresh.
+    final_sbase = np.exp(spline_eval_array(spline.points, spline.data, freq, SplineFlag))
+    final_sline = sline_from_lookup(ncut, data.imin, t_obs, lines.nf, lines.nnu, lines.wdth,
+                                    lines.lnumin, lines.lnumax, lines.ltemplate,
+                                    lines.f, lines.a, lines.nu, lines.n)
+    final_snf = final_sbase + final_sline
+    bayesline.Sbase = final_sbase
+    bayesline.Sline = final_sline
+    bayesline.Snf = final_snf
+    ratio = power / np.maximum(final_snf, np.finfo(float).tiny)
     dan[0] = float(np.max(ratio))
 
 
@@ -2384,6 +2486,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--write-bl-start",
         action="store_true",
         help=f"write BayesLine startup diagnostic to {BL_START_FILENAME}",
+    )
+    parser.add_argument(
+        "--writewhite",
+        "--write-white",
+        action="store_true",
+        help="write C-style whitelsf.dat and whitelsf_noglitch.dat diagnostics",
     )
     parser.add_argument(
         "--timing",
@@ -2549,6 +2657,8 @@ def main(argv: list[str]) -> int:
     line_out = psd_out - smooth_out
     np.savetxt("BWpsd_components.dat", np.column_stack((bw_freq, psd_out, smooth_out, line_out)))
     np.savetxt("frequency_data.dat", freq_out)
+    if args.writewhite:
+        write_whitened_line_subtracted_files(bptr, dataf_c, fdata, dt, bptr.rng)
     timing_mark("write_outputs")
 
     if args.timing:
