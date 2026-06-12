@@ -18,7 +18,7 @@ int main(int argc,char **argv)
 {
     int ND, N, i, j, k, kk, imin, dec;
     double Tobs;
-    double alpha, x, y, z, hr, hi, fac, window_power_correction;
+    double alpha, x, y, z, hr, hi, fac, window_power_correction, psd_scale;
     double *data, *dataf, *fdata, *times, *dcopy;
     double *psd, *invpsd, *splinePSD, *fprop;
     double *timeX, *dataX;
@@ -152,28 +152,27 @@ int main(int argc,char **argv)
     
     BayesLineRJMCMC(bptr, fdata, psd, invpsd, splinePSD, N, 100000, 1.0, 1, fprop, 1);
     
-    // The scalings of the glitch cleaned frequency domain data and
-    // the psd have been set to match the BayesWave output files
-    // glitch_median_PSD_forLIxxx and fourier_domain_glitch_median_residualxxx
-    //
-    // BayesLineRJMCMC returns the PSD in the BayesWave convention. The
-    // standalone test output keeps the earlier BWtest normalization here.
+    // BayesLineRJMCMC returns the PSD in BayesWave internal units. With the
+    // dt/sqrt(2)-scaled Fourier coefficients used by BayesLine, those units are
+    // Tobs/4 times the physical one-sided PSD. Convert only the standalone
+    // driver outputs back to duration-independent PSD units.
     
     
     window_power_correction = tukey_power_correction(alpha, N);
+    psd_scale = 4.0*window_power_correction/Tobs;
     
     out = fopen("psd.dat","w");
-    fprintf(out,"%e %e\n", 0.0, psd[1]*window_power_correction/2.0);
+    fprintf(out,"%e %e\n", 0.0, psd[1]*psd_scale);
     for (i = 1; i < N/2; ++i)
     {
-        fprintf(out,"%e %e\n", (double)(i)/Tobs, psd[i]*window_power_correction/2.0);
+        fprintf(out,"%e %e\n", (double)(i)/Tobs, psd[i]*psd_scale);
     }
     fclose(out);
     
     out = fopen("psd_components.dat","w");
     for (i = bptr->data->imin; i < N/2; ++i)
     {
-        fprintf(out,"%e %e %e\n", (double)(i)/Tobs, bptr->Sbase[i-bptr->data->imin], bptr->Sline[i-bptr->data->imin]);
+        fprintf(out,"%e %e %e\n", (double)(i)/Tobs, bptr->Sbase[i-bptr->data->imin]*psd_scale, bptr->Sline[i-bptr->data->imin]*psd_scale);
     }
     fclose(out);
     
@@ -182,12 +181,12 @@ int main(int argc,char **argv)
     out = fopen("periodogram.dat","w");
     for (i = 1; i < N/2; ++i)
     {
-        fprintf(out,"%e %e\n", (double)(i)/Tobs, 2.0*(fdata[2*i]*fdata[2*i]+fdata[2*i+1]*fdata[2*i+1]));
+        fprintf(out,"%e %e\n", (double)(i)/Tobs, psd_scale*2.0*(fdata[2*i]*fdata[2*i]+fdata[2*i+1]*fdata[2*i+1]));
     }
     fclose(out);
     
     out = fopen("frequency_data.dat","w");
-    x = sqrt(2.0*window_power_correction);
+    x = sqrt(16.0*window_power_correction/Tobs);
     fprintf(out,"%e %e %e\n", 0.0, 0.0, 0.0);
     for (i = 1; i < N/2; ++i)
     {
@@ -234,7 +233,7 @@ int main(int argc,char **argv)
     out = fopen("periodogram_raw.dat","w");
     for (i = 1; i < N/2; ++i)
     {
-        fprintf(out,"%e %e\n", (double)(i)/Tobs, 2.0*(dataf[i]*dataf[i]+dataf[N-i]*dataf[N-i]));
+        fprintf(out,"%e %e\n", (double)(i)/Tobs, 2.0*window_power_correction/Tobs*2.0*(dataf[i]*dataf[i]+dataf[N-i]*dataf[N-i]));
     }
     fclose(out);
     

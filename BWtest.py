@@ -31,7 +31,8 @@ Usage examples:
 Important output files:
 
     BWpsd.dat
-        Final one-sided PSD, scaled for ADtest.py.
+        Final duration-independent one-sided PSD, scaled consistently with
+        frequency_data.dat for ADtest.py.
 
     frequency_data.dat
         Final cleaned complex frequency-domain data, scaled for ADtest.py.
@@ -2608,7 +2609,7 @@ def main(argv: list[str]) -> int:
     dataf_c = np.fft.rfft(data)
     dt = Tobs / N
     raw_freq = np.arange(1, N // 2, dtype=np.float64) / Tobs
-    raw_power = 2.0 * dt * dt * np.abs(dataf_c[1:N // 2]) ** 2
+    raw_power = 2.0 * dt * dt * window_power_correction * np.abs(dataf_c[1:N // 2]) ** 2 / Tobs
     np.savetxt("periodogram_raw.dat", np.column_stack((raw_freq, raw_power)))
 
     fdata = np.zeros(N, dtype=np.float64)
@@ -2629,11 +2630,14 @@ def main(argv: list[str]) -> int:
 
     assert bptr.data is not None and bptr.Sbase is not None and bptr.Snf is not None
     imin = int(bptr.data.fmin * Tobs)
+    output_psd_scale = 4.0 * window_power_correction / Tobs
     p_freq = np.arange(imin, N // 2, dtype=np.float64) / Tobs
-    p_pow = 2.0 * (fdata[2 * imin:N:2] ** 2 + fdata[2 * imin + 1:N + 1:2] ** 2)
+    p_pow = output_psd_scale * 2.0 * (fdata[2 * imin:N:2] ** 2 +
+                                      fdata[2 * imin + 1:N + 1:2] ** 2)
     model_len = p_freq.size
     np.savetxt("periodogram.dat", np.column_stack((p_freq, p_pow[:model_len],
-                                                   bptr.Sbase[:model_len], bptr.Snf[:model_len])))
+                                                   output_psd_scale * bptr.Sbase[:model_len],
+                                                   output_psd_scale * bptr.Snf[:model_len])))
     fprop_freq = np.arange(bptr.data.imin, N // 2, dtype=np.float64) / Tobs
     np.savetxt("fprop.dat", np.column_stack((fprop_freq, fprop[:fprop_freq.size])))
     timing_mark("startup_diagnostics")
@@ -2645,15 +2649,21 @@ def main(argv: list[str]) -> int:
     bw_freq = np.arange(N // 2, dtype=np.float64) / Tobs
     freq_out = np.zeros((N // 2, 3), dtype=np.float64)
     freq_out[:, 0] = bw_freq
-    freq_scale = math.sqrt(2.0 * window_power_correction)
+    # BayesLine samples the PSD in BayesWave internal units.  With the
+    # dt/sqrt(2)-scaled Fourier coefficients used in the sampler, the internal
+    # PSD is Tobs/4 times the physical one-sided PSD.  Convert the final
+    # user-facing files back to duration-independent PSD units while scaling the
+    # frequency-domain data consistently for ADtest.py's Re/sqrt(2*PSD) check.
+    psd_scale = output_psd_scale
+    freq_scale = math.sqrt(16.0 * window_power_correction / Tobs)
     freq_out[1:, 1] = freq_scale * fdata[2:N:2]
     freq_out[1:, 2] = freq_scale * fdata[3:N + 1:2]
 
-    psd_out = 0.5 * window_power_correction * psd.copy()
+    psd_out = psd_scale * psd.copy()
     if psd_out.size > 1:
         psd_out[0] = psd_out[1]
     np.savetxt("BWpsd.dat", np.column_stack((bw_freq, psd_out)))
-    smooth_out = 0.5 * window_power_correction * splinePSD.copy()
+    smooth_out = psd_scale * splinePSD.copy()
     line_out = psd_out - smooth_out
     np.savetxt("BWpsd_components.dat", np.column_stack((bw_freq, psd_out, smooth_out, line_out)))
     np.savetxt("frequency_data.dat", freq_out)
