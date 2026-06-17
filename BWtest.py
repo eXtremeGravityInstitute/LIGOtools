@@ -21,6 +21,7 @@ Usage examples:
     File provided
     python BWtest.py frame.dat
     python BWtest.py --file frame.dat
+    python BWtest.py frame.dat --psd-samples 500
     
     Running on a LVK machine
     python BWtest.py 1126259462.4 8 --channel H1:GDS-CALIB_STRAIN --nyquist 1024
@@ -28,11 +29,22 @@ Usage examples:
     Running anywhere and getting the data from GWOSC 
     python BWtest.py 1126259462.4 8 --source open --ifo L1 --nyquist 1024
 
+    Frame/GWOSC inputs are fetched with padding, resampled with GWPy's FIR
+    resampler to 2*Nyquist, and cropped to the requested segment before the
+    BayesLine preprocessing starts.  The old Butterworth decimation path is
+    reserved for existing two-column files whose sample rate is above the
+    requested Nyquist.
+
 Important output files:
 
     BWpsd.dat
-        Final duration-independent one-sided PSD, scaled consistently with
-        frequency_data.dat for ADtest.py.
+        Median duration-independent one-sided PSD from RJMCMC samples, scaled
+        consistently with frequency_data.dat for ADtest.py.
+        By default the median uses 200 PSD states sampled evenly from the second
+        half of the RJMCMC. Change this with --psd-samples N.
+
+    BWfairdrawpsd.dat
+        Final fair-draw one-sided PSD from the last RJMCMC state.
 
     frequency_data.dat
         Final cleaned complex frequency-domain data, scaled for ADtest.py.
@@ -41,7 +53,10 @@ Important output files:
         Optional startup diagnostic: frequency, periodogram, smooth PSD, line PSD.
 
     BWpsd_components.dat
-        Final total, smooth, and line PSD components.
+        Median total, smooth, and line PSD components.
+
+    BWfairdrawpsd_components.dat
+        Final fair-draw total, smooth, and line PSD components.
 
     whitelsf.dat and whitelsf_noglitch.dat
         Optional with --writewhite: line-subtracted, smooth-PSD-whitened
@@ -140,6 +155,14 @@ class LorentzianParams:
         self.q = np.zeros(self.size, dtype=np.float64)
         self.a = np.zeros(self.size, dtype=np.float64)
         self.nu = np.zeros(self.size, dtype=np.float64)
+
+
+@dataclass
+class InputSpec:
+    """Resolved input file plus whether it came from direct GWPy frame fetching."""
+
+    filename: str
+    fetched_from_frame: bool = False
 
 
 @dataclass
@@ -1962,7 +1985,9 @@ def BayesLineBurnin(bayesline: BayesLineParams, timeData: np.ndarray, freqData: 
 
 def BayesLineLorentzSplineMCMC(bayesline: BayesLineParams, heat: float, steps: int,
                                priorFlag: int, dan: list[float], fprop: np.ndarray,
-                               SplineFlag: int) -> None:
+                               SplineFlag: int,
+                               psd_samples: Optional[np.ndarray] = None,
+                               spline_samples: Optional[np.ndarray] = None) -> int:
     """Main reversible-jump sampler for spline knots and Lorentzian lines."""
 
     assert bayesline.data is not None
@@ -2011,6 +2036,11 @@ def BayesLineLorentzSplineMCMC(bayesline: BayesLineParams, heat: float, steps: i
         fweights[:] = 1.0
     fprop[:ncut] = fweights / np.sum(fweights)
     shiftval = max(1.0 / t_obs, min(2.0, 2.0 * rng.random()))
+    sample_count = 0
+    sample_target = 0 if psd_samples is None else int(psd_samples.shape[0])
+    sample_start = steps // 2
+    post_burnin_steps = max(1, steps - sample_start)
+    sample_stride = max(1, post_burnin_steps // sample_target) if sample_target > 0 else 1
 
     for mc in range(steps):
         logpx = logpy = logqx = logqy = 0.0
@@ -2326,6 +2356,12 @@ def BayesLineLorentzSplineMCMC(bayesline: BayesLineParams, heat: float, steps: i
                     lines.nu[:prop_nlines] = prop_nu
                     lines.q[:prop_nlines] = lines.f[:prop_nlines] / np.maximum(lines.nu[:prop_nlines], np.finfo(float).tiny)
 
+        if sample_count < sample_target and mc >= sample_start and (mc - sample_start) % sample_stride == 0:
+            psd_samples[sample_count, :] = snx
+            if spline_samples is not None:
+                spline_samples[sample_count, :] = sbase
+            sample_count += 1
+
         if mc % 1000 == 0:
             rates = [ac[i] / cc[i] for i in range(6)]
             print(f"{mc} {lines.n} {spline.n} {logLx:.6e} " + " ".join(f"{r:.6f}" for r in rates))
@@ -2345,16 +2381,22 @@ def BayesLineLorentzSplineMCMC(bayesline: BayesLineParams, heat: float, steps: i
     bayesline.Snf = final_snf
     ratio = power / np.maximum(final_snf, np.finfo(float).tiny)
     dan[0] = float(np.max(ratio))
+    return sample_count
 
 
 def BayesLineRJMCMC(bayesline: BayesLineParams, freqData: np.ndarray, psd: np.ndarray,
                     invpsd: np.ndarray, splinePSD: np.ndarray, N: int, cycle: int,
-                    beta: float, priorFlag: int, fprop: np.ndarray, SplineFlag: int) -> None:
+                    beta: float, priorFlag: int, fprop: np.ndarray, SplineFlag: int,
+                    psd_samples: Optional[np.ndarray] = None,
+                    spline_samples: Optional[np.ndarray] = None) -> int:
     """Public C-style RJMCMC wrapper that returns full-band PSD arrays."""
 
     del freqData
     dan = [0.0]
-    BayesLineLorentzSplineMCMC(bayesline, beta, cycle, priorFlag, dan, fprop, SplineFlag)
+    collected = BayesLineLorentzSplineMCMC(
+        bayesline, beta, cycle, priorFlag, dan, fprop, SplineFlag,
+        psd_samples=psd_samples, spline_samples=spline_samples
+    )
     assert bayesline.data is not None and bayesline.Snf is not None and bayesline.Sbase is not None
     data = bayesline.data
     psd.fill(0.0)
@@ -2366,6 +2408,7 @@ def BayesLineRJMCMC(bayesline: BayesLineParams, freqData: np.ndarray, psd: np.nd
     psd[data.imax:N // 2] = 1.0
     splinePSD[data.imax:N // 2] = 1.0
     invpsd[:] = 1.0 / np.maximum(psd, np.finfo(float).tiny)
+    return collected
 
 
 def _require_power_of_two(n: int) -> None:
@@ -2389,35 +2432,47 @@ def segment_bounds(trigger_time: float, duration: float) -> Tuple[float, float]:
 
 
 def fetch_ligo_data(trigger_time: float, duration: float, ifo: str, source: str,
-                    channel: Optional[str], output_file: Optional[str]) -> str:
-    """Fetch strain data using the same trigger-time convention as Denoise.py."""
+                    channel: Optional[str], output_file: Optional[str],
+                    target_rate: float, padding: float) -> str:
+    """Fetch, GWPy-resample, crop, and save strain data for BWtest."""
 
     start, end = segment_bounds(trigger_time, duration)
     outfile = output_file if output_file is not None else f"{ifo}.txt"
+    fetch_start = start - padding
+    fetch_end = end + padding
 
-    print(f"Fetching {ifo} data from {start:.6f} to {end:.6f}")
+    print(f"Fetching {ifo} data from {fetch_start:.6f} to {fetch_end:.6f}")
     print(f"Trigger time {trigger_time:.6f} is {TRIGGER_OFFSET_FROM_END:.1f} seconds before segment end")
+    print(f"Target sample rate after GWPy resampling = {target_rate:g} Hz")
 
     try:
         if source == "open":
             from gwosc.timeline import get_segments
             from gwpy.timeseries import TimeSeries
 
-            segments = get_segments(f"{ifo}_DATA", int(math.floor(start)), int(math.ceil(end)))
+            segments = get_segments(f"{ifo}_DATA", int(math.floor(fetch_start)), int(math.ceil(fetch_end)))
             if len(segments) == 0:
                 raise RuntimeError(f"no {ifo} open-data segment covers the requested time")
-            series = TimeSeries.fetch_open_data(ifo, start, end)
+            series = TimeSeries.fetch_open_data(ifo, fetch_start, fetch_end)
         else:
             from gwpy.timeseries import TimeSeries
 
             channel_name = channel if channel is not None else f"{ifo}:GDS-CALIB_STRAIN"
             print(f"Using frame channel {channel_name}")
-            series = TimeSeries.get(channel_name, start, end)
+            series = TimeSeries.get(channel_name, fetch_start, fetch_end)
     except ImportError as exc:
         raise RuntimeError("gwpy/gwosc are required for trigger-time fetching") from exc
 
-    times = np.asarray(series.times.value, dtype=np.float64)
-    strain = np.asarray(series.value, dtype=np.float64)
+    print(f"Original sample rate: {series.sample_rate}")
+    resampled = series.resample(target_rate)
+    print(f"Resampled sample rate: {resampled.sample_rate}")
+    cropped = resampled.crop(start, end)
+    print(f"Cropped span: {cropped.span}")
+
+    times = np.asarray(cropped.times.value, dtype=np.float64)
+    strain = np.asarray(cropped.value, dtype=np.float64)
+    if times.size != strain.size:
+        raise RuntimeError("GWPy returned mismatched time and strain arrays")
     np.savetxt(outfile, np.column_stack((times, strain)), fmt="%.18e")
     print(f"Fetched data written to {outfile}")
     return outfile
@@ -2433,6 +2488,26 @@ def read_frame(filename: str) -> Tuple[np.ndarray, np.ndarray]:
     strain = arr[:, 1].copy()
     _require_power_of_two(strain.size)
     return time, strain
+
+
+def decimation_factor_for_nyquist(data_nyquist: float, requested_nyquist: float) -> int:
+    """Return the legacy integer downsampling factor for an existing file."""
+
+    if math.isclose(data_nyquist, requested_nyquist, rel_tol=1.0e-6, abs_tol=1.0e-6):
+        return 1
+
+    ratio = data_nyquist / requested_nyquist
+    nearest = int(round(ratio))
+    if nearest >= 1 and math.isclose(ratio, float(nearest), rel_tol=1.0e-5, abs_tol=1.0e-6):
+        dec = nearest
+    else:
+        dec = int(ratio)
+
+    if dec > 8:
+        dec = 8
+    if dec < 1:
+        dec = 1
+    return dec
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
@@ -2483,6 +2558,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="optional fetched strain text file name, default <IFO>.txt",
     )
     parser.add_argument(
+        "--padding",
+        type=float,
+        default=2.0,
+        help="seconds fetched on each side before GWPy resampling, then cropped away; frame/GWOSC inputs only, default %(default)g",
+    )
+    parser.add_argument(
         "--write_bl_start",
         "--write-bl-start",
         action="store_true",
@@ -2495,6 +2576,14 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="write C-style whitelsf.dat and whitelsf_noglitch.dat diagnostics",
     )
     parser.add_argument(
+        "--psd_samples",
+        "--psd-samples",
+        "--median-psd-samples",
+        type=int,
+        default=200,
+        help="number of second-half RJMCMC PSD states to store for the median PSD, default %(default)d",
+    )
+    parser.add_argument(
         "--timing",
         action="store_true",
         help="print wall-clock timing for the main BWtest phases",
@@ -2502,11 +2591,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     return parser.parse_args(argv[1:])
 
 
-def resolve_input_file(args: argparse.Namespace) -> str:
+def resolve_input_file(args: argparse.Namespace, nyquist: int) -> InputSpec:
     if args.input_file is not None:
         if args.inputs:
             print("warning: --file was supplied, so positional inputs are ignored")
-        return args.input_file
+        return InputSpec(args.input_file, fetched_from_frame=False)
 
     if len(args.inputs) == 1:
         try:
@@ -2516,7 +2605,7 @@ def resolve_input_file(args: argparse.Namespace) -> str:
         else:
             if not Path(args.inputs[0]).exists():
                 raise ValueError("provide both trigger_time and duration, or use --file INPUT")
-        return args.inputs[0]
+        return InputSpec(args.inputs[0], fetched_from_frame=False)
 
     if len(args.inputs) == 2:
         try:
@@ -2526,7 +2615,14 @@ def resolve_input_file(args: argparse.Namespace) -> str:
             raise ValueError("positional inputs must be either one file name or trigger_time duration") from exc
         if duration <= 0.0:
             raise ValueError("segment duration must be positive")
-        return fetch_ligo_data(trigger_time, duration, args.ifo, args.source, args.channel, args.output)
+        if args.padding < 0.0:
+            raise ValueError("padding must be non-negative")
+        target_rate = 2.0 * float(nyquist)
+        filename = fetch_ligo_data(
+            trigger_time, duration, args.ifo, args.source, args.channel,
+            args.output, target_rate, args.padding
+        )
+        return InputSpec(filename, fetched_from_frame=True)
 
     raise ValueError("provide a frame file, --file INPUT, or trigger_time duration")
 
@@ -2554,12 +2650,15 @@ def main(argv: list[str]) -> int:
     if not math.isfinite(args.fmin) or args.fmin <= 0.0 or args.fmin >= float(nyquist):
         print(f"warning: requested fmin {args.fmin:g} Hz must be finite and below Nyquist {nyquist:g} Hz")
         return 1
+    if args.psd_samples < 1:
+        print("warning: --psd-samples must be at least 1")
+        return 1
 
     fmin = float(args.fmin)
     fmax = float(nyquist)
     try:
-        input_file = resolve_input_file(args)
-        timeX, dataX = read_frame(input_file)
+        input_spec = resolve_input_file(args, nyquist)
+        timeX, dataX = read_frame(input_spec.filename)
     except (OSError, RuntimeError, ValueError) as exc:
         print(f"warning: {exc}")
         return 1
@@ -2573,16 +2672,24 @@ def main(argv: list[str]) -> int:
     dt = Tobs / ND
     fny = 1.0 / (2.0 * dt)
     print(f"{Tobs:f} {dt:e} {fny:f} {fmax:f}")
+    sample_rate_matches_request = math.isclose(fny, fmax, rel_tol=1.0e-6, abs_tol=1.0e-6)
+    if sample_rate_matches_request:
+        fny = fmax
     if fmax > fny:
         print(f"warning: requested Nyquist {fmax:g} Hz exceeds data Nyquist {fny:g} Hz")
         return 1
 
-    dec = int(fny / fmax)
-    if dec > 8:
-        dec = 8
-    if dec < 1:
-        dec = 1
+    dec = decimation_factor_for_nyquist(fny, fmax)
     print(f"Down sample = {dec}")
+
+    if input_spec.fetched_from_frame and dec > 1:
+        expected_rate = 2.0 * fmax
+        actual_rate = 2.0 * fny
+        print(
+            f"warning: fetched frame data should have been GWPy-resampled to {expected_rate:g} Hz, "
+            f"but the saved data imply {actual_rate:g} Hz"
+        )
+        return 1
 
     N = ND // dec
     try:
@@ -2592,7 +2699,14 @@ def main(argv: list[str]) -> int:
         return 1
     print(f"Number of points used in analysis = {N}")
 
-    if dec > 1:
+    if input_spec.fetched_from_frame:
+        print("Skipping Butterworth decimation for GWPy-resampled frame input")
+    elif dec == 1:
+        if sample_rate_matches_request:
+            print("Sample rate already matches requested Nyquist; skipping Butterworth decimation")
+        else:
+            print("Skipping Butterworth decimation; legacy integer downsampling factor is 1")
+    else:
         fmn = 1.0 / Tobs
         fmx = fmax
         dataX = bwbpf_numba(dataX, 1, 8, 1.0 / dt, fmx, fmn)
@@ -2643,7 +2757,12 @@ def main(argv: list[str]) -> int:
     timing_mark("startup_diagnostics")
 
     rjmcmc_steps = 100000
-    BayesLineRJMCMC(bptr, fdata, psd, invpsd, splinePSD, N, rjmcmc_steps, 1.0, 1, fprop, 1)
+    psd_samples = np.empty((args.psd_samples, bptr.data.ncut), dtype=np.float64)
+    spline_samples = np.empty_like(psd_samples)
+    collected_psd_samples = BayesLineRJMCMC(
+        bptr, fdata, psd, invpsd, splinePSD, N, rjmcmc_steps, 1.0, 1, fprop, 1,
+        psd_samples=psd_samples, spline_samples=spline_samples
+    )
     timing_mark("BayesLineRJMCMC")
 
     bw_freq = np.arange(N // 2, dtype=np.float64) / Tobs
@@ -2659,13 +2778,32 @@ def main(argv: list[str]) -> int:
     freq_out[1:, 1] = freq_scale * fdata[2:N:2]
     freq_out[1:, 2] = freq_scale * fdata[3:N + 1:2]
 
-    psd_out = psd_scale * psd.copy()
-    if psd_out.size > 1:
-        psd_out[0] = psd_out[1]
-    np.savetxt("BWpsd.dat", np.column_stack((bw_freq, psd_out)))
-    smooth_out = psd_scale * splinePSD.copy()
-    line_out = psd_out - smooth_out
-    np.savetxt("BWpsd_components.dat", np.column_stack((bw_freq, psd_out, smooth_out, line_out)))
+    fairdraw_psd_out = psd_scale * psd.copy()
+    if fairdraw_psd_out.size > 1:
+        fairdraw_psd_out[0] = fairdraw_psd_out[1]
+    fairdraw_smooth_out = psd_scale * splinePSD.copy()
+    fairdraw_line_out = fairdraw_psd_out - fairdraw_smooth_out
+    np.savetxt("BWfairdrawpsd.dat", np.column_stack((bw_freq, fairdraw_psd_out)))
+    np.savetxt("BWfairdrawpsd_components.dat",
+               np.column_stack((bw_freq, fairdraw_psd_out, fairdraw_smooth_out, fairdraw_line_out)))
+
+    median_psd = psd.copy()
+    median_spline = splinePSD.copy()
+    if collected_psd_samples > 0:
+        median_psd.fill(1.0)
+        median_spline.fill(1.0)
+        median_psd[bptr.data.imin:bptr.data.imax] = np.median(psd_samples[:collected_psd_samples], axis=0)
+        median_spline[bptr.data.imin:bptr.data.imax] = np.median(spline_samples[:collected_psd_samples], axis=0)
+        if collected_psd_samples != args.psd_samples:
+            print(f"warning: collected {collected_psd_samples} PSD samples, requested {args.psd_samples}")
+
+    median_psd_out = psd_scale * median_psd
+    if median_psd_out.size > 1:
+        median_psd_out[0] = median_psd_out[1]
+    median_smooth_out = psd_scale * median_spline
+    median_line_out = median_psd_out - median_smooth_out
+    np.savetxt("BWpsd.dat", np.column_stack((bw_freq, median_psd_out)))
+    np.savetxt("BWpsd_components.dat", np.column_stack((bw_freq, median_psd_out, median_smooth_out, median_line_out)))
     np.savetxt("frequency_data.dat", freq_out)
     if args.writewhite:
         write_whitened_line_subtracted_files(bptr, dataf_c, fdata, dt, bptr.rng)
