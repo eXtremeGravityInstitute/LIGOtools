@@ -29,9 +29,11 @@ Usage examples:
     Running anywhere and getting the data from GWOSC 
     python BWtest.py 1126259462.4 8 --source open --ifo L1 --nyquist 1024
 
-    Frame/GWOSC inputs are fetched with padding, resampled with GWPy's FIR
-    resampler to 2*Nyquist, and cropped to the requested segment before the
-    BayesLine preprocessing starts.  The old Butterworth decimation path is
+    Frame/GWOSC inputs are fetched with padding, resampled to 2*Nyquist, and
+    cropped to the requested segment before the BayesLine preprocessing starts.
+    By default, frame/GWOSC inputs use LALSuite's Kaiser-windowed sinc
+    resampler via lal.ResampleREAL8TimeSeries.  Use --resampler gwpy to use
+    GWPy's resampling path instead.  The old Butterworth decimation path is
     reserved for existing two-column files whose sample rate is above the
     requested Nyquist.
 
@@ -159,7 +161,7 @@ class LorentzianParams:
 
 @dataclass
 class InputSpec:
-    """Resolved input file plus whether it came from direct GWPy frame fetching."""
+    """Resolved input file plus whether it came from direct frame fetching."""
 
     filename: str
     fetched_from_frame: bool = False
@@ -2431,10 +2433,88 @@ def segment_bounds(trigger_time: float, duration: float) -> Tuple[float, float]:
     return start, end
 
 
+def gwpy_sample_rate_hz(series) -> float:
+    """Return a GWPy sample rate as a plain floating-point Hz value."""
+
+    sample_rate = series.sample_rate
+    if hasattr(sample_rate, "to_value"):
+        return float(sample_rate.to_value("Hz"))
+    if hasattr(sample_rate, "value"):
+        return float(sample_rate.value)
+    return float(sample_rate)
+
+
+def lal_epoch_to_float(epoch) -> float:
+    """Convert a LAL LIGOTimeGPS-like object into floating GPS seconds."""
+
+    if hasattr(epoch, "gpsSeconds") and hasattr(epoch, "gpsNanoSeconds"):
+        return float(epoch.gpsSeconds) + 1.0e-9 * float(epoch.gpsNanoSeconds)
+    return float(epoch)
+
+
+def crop_regular_arrays(times: np.ndarray, strain: np.ndarray, start: float,
+                        end: float, sample_rate: float) -> Tuple[np.ndarray, np.ndarray]:
+    """Crop regularly sampled arrays by nearest sample index."""
+
+    dt = 1.0 / sample_rate
+    start_index = int(round((start - times[0]) / dt))
+    sample_count = int(round((end - start) * sample_rate))
+    end_index = start_index + sample_count
+    if sample_count <= 0:
+        raise RuntimeError("requested crop has no samples")
+    if start_index < 0 or end_index > strain.size:
+        raise RuntimeError("resampled data do not cover the requested cropped interval")
+    return times[start_index:end_index].copy(), strain[start_index:end_index].copy()
+
+
+def lal_resample_and_crop(series, target_rate: float, start: float,
+                          end: float) -> Tuple[np.ndarray, np.ndarray]:
+    """Use LALSuite XLALResampleREAL8TimeSeries, then crop padded samples."""
+
+    try:
+        import lal
+    except ImportError as exc:
+        raise RuntimeError("LAL resampling requires LALSuite Python bindings: import lal failed") from exc
+
+    resample = getattr(lal, "ResampleREAL8TimeSeries", None)
+    if resample is None:
+        raise RuntimeError("this LALSuite Python module does not expose ResampleREAL8TimeSeries")
+
+    times = np.asarray(series.times.value, dtype=np.float64)
+    strain = np.asarray(series.value, dtype=np.float64)
+    if times.size < 2:
+        raise RuntimeError("not enough samples to resample")
+    if times.size != strain.size:
+        raise RuntimeError("GWPy returned mismatched time and strain arrays")
+
+    input_rate = gwpy_sample_rate_hz(series)
+    input_dt = 1.0 / input_rate
+    target_dt = 1.0 / target_rate
+    unit = getattr(lal, "StrainUnit", getattr(lal, "DimensionlessUnit", None))
+    if unit is None:
+        raise RuntimeError("LALSuite Python module does not expose a usable strain unit")
+
+    lal_series = lal.CreateREAL8TimeSeries(
+        "strain", lal.LIGOTimeGPS(float(times[0])), 0.0, input_dt, unit, strain.size
+    )
+    lal_series.data.data[:] = strain
+
+    maybe_series = resample(lal_series, target_dt)
+    if hasattr(maybe_series, "data"):
+        lal_series = maybe_series
+
+    output = np.asarray(lal_series.data.data, dtype=np.float64).copy()
+    output_dt = float(lal_series.deltaT)
+    output_rate = 1.0 / output_dt
+    output_start = lal_epoch_to_float(lal_series.epoch)
+    output_times = output_start + output_dt * np.arange(output.size, dtype=np.float64)
+    return crop_regular_arrays(output_times, output, start, end, output_rate)
+
+
 def fetch_ligo_data(trigger_time: float, duration: float, ifo: str, source: str,
                     channel: Optional[str], output_file: Optional[str],
-                    target_rate: float, padding: float) -> str:
-    """Fetch, GWPy-resample, crop, and save strain data for BWtest."""
+                    target_rate: float, padding: float, resampler: str) -> str:
+    """Fetch, resample, crop, and save strain data for BWtest."""
 
     start, end = segment_bounds(trigger_time, duration)
     outfile = output_file if output_file is not None else f"{ifo}.txt"
@@ -2443,7 +2523,7 @@ def fetch_ligo_data(trigger_time: float, duration: float, ifo: str, source: str,
 
     print(f"Fetching {ifo} data from {fetch_start:.6f} to {fetch_end:.6f}")
     print(f"Trigger time {trigger_time:.6f} is {TRIGGER_OFFSET_FROM_END:.1f} seconds before segment end")
-    print(f"Target sample rate after GWPy resampling = {target_rate:g} Hz")
+    print(f"Target sample rate after {resampler} resampling = {target_rate:g} Hz")
 
     try:
         if source == "open":
@@ -2464,15 +2544,32 @@ def fetch_ligo_data(trigger_time: float, duration: float, ifo: str, source: str,
         raise RuntimeError("gwpy/gwosc are required for trigger-time fetching") from exc
 
     print(f"Original sample rate: {series.sample_rate}")
-    resampled = series.resample(target_rate)
-    print(f"Resampled sample rate: {resampled.sample_rate}")
-    cropped = resampled.crop(start, end)
-    print(f"Cropped span: {cropped.span}")
+    original_rate = gwpy_sample_rate_hz(series)
+    if math.isclose(original_rate, target_rate, rel_tol=1.0e-6, abs_tol=1.0e-6):
+        print("Sample rate already matches target; skipping resampling")
+        cropped = series.crop(start, end)
+        print(f"Cropped span: {cropped.span}")
+        times = np.asarray(cropped.times.value, dtype=np.float64)
+        strain = np.asarray(cropped.value, dtype=np.float64)
+        if times.size != strain.size:
+            raise RuntimeError("GWPy returned mismatched time and strain arrays")
+    elif resampler == "lal":
+        print("Resampling with LALSuite ResampleREAL8TimeSeries")
+        times, strain = lal_resample_and_crop(series, target_rate, start, end)
+    elif resampler == "gwpy":
+        print("Resampling with GWPy")
+        resampled = series.resample(target_rate)
+        print(f"Resampled sample rate: {resampled.sample_rate}")
+        cropped = resampled.crop(start, end)
+        print(f"Cropped span: {cropped.span}")
+        times = np.asarray(cropped.times.value, dtype=np.float64)
+        strain = np.asarray(cropped.value, dtype=np.float64)
+        if times.size != strain.size:
+            raise RuntimeError("GWPy returned mismatched time and strain arrays")
+    else:
+        raise RuntimeError(f"unknown resampler {resampler!r}")
 
-    times = np.asarray(cropped.times.value, dtype=np.float64)
-    strain = np.asarray(cropped.value, dtype=np.float64)
-    if times.size != strain.size:
-        raise RuntimeError("GWPy returned mismatched time and strain arrays")
+    print(f"Output samples: {strain.size}")
     np.savetxt(outfile, np.column_stack((times, strain)), fmt="%.18e")
     print(f"Fetched data written to {outfile}")
     return outfile
@@ -2561,7 +2658,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--padding",
         type=float,
         default=2.0,
-        help="seconds fetched on each side before GWPy resampling, then cropped away; frame/GWOSC inputs only, default %(default)g",
+        help="seconds fetched on each side before resampling, then cropped away; frame/GWOSC inputs only, default %(default)g",
+    )
+    parser.add_argument(
+        "--resampler",
+        choices=("lal", "gwpy"),
+        default="lal",
+        help="frame/GWOSC resampler; default lal uses LALSuite's Kaiser-windowed sinc routine",
     )
     parser.add_argument(
         "--write_bl_start",
@@ -2620,7 +2723,7 @@ def resolve_input_file(args: argparse.Namespace, nyquist: int) -> InputSpec:
         target_rate = 2.0 * float(nyquist)
         filename = fetch_ligo_data(
             trigger_time, duration, args.ifo, args.source, args.channel,
-            args.output, target_rate, args.padding
+            args.output, target_rate, args.padding, args.resampler
         )
         return InputSpec(filename, fetched_from_frame=True)
 
@@ -2686,7 +2789,7 @@ def main(argv: list[str]) -> int:
         expected_rate = 2.0 * fmax
         actual_rate = 2.0 * fny
         print(
-            f"warning: fetched frame data should have been GWPy-resampled to {expected_rate:g} Hz, "
+            f"warning: fetched frame data should have been resampled to {expected_rate:g} Hz, "
             f"but the saved data imply {actual_rate:g} Hz"
         )
         return 1
@@ -2700,7 +2803,7 @@ def main(argv: list[str]) -> int:
     print(f"Number of points used in analysis = {N}")
 
     if input_spec.fetched_from_frame:
-        print("Skipping Butterworth decimation for GWPy-resampled frame input")
+        print("Skipping Butterworth decimation for externally resampled frame input")
     elif dec == 1:
         if sample_rate_matches_request:
             print("Sample rate already matches requested Nyquist; skipping Butterworth decimation")
