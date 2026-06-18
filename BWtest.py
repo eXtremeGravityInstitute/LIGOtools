@@ -130,6 +130,7 @@ DEFAULT_ANALYSIS_FMIN = 20.0
 DEFAULT_ANALYSIS_FMAX = 1024.0
 TRIGGER_OFFSET_FROM_END = 4.0
 BL_START_FILENAME = "BL_start.dat"
+LINE_ARRAY_SCALE = 500.0
 
 
 @dataclass
@@ -216,7 +217,7 @@ class BayesLinePriors:
 class BayesLineParams:
     """Top-level BayesLine state shared by burn-in and RJMCMC."""
 
-    maxBLLines: int = 1000
+    maxBLLines: int = 0
     data: Optional[DataParams] = None
     spline: Optional[SplineParams] = None
     spline_x: Optional[SplineParams] = None
@@ -234,6 +235,14 @@ class BayesLineParams:
     rng: np.random.Generator = field(default_factory=lambda: np.random.default_rng(1234))
     constantLogLFlag: int = 0
     flatPriorFlag: int = 0
+
+
+def line_array_size_for_duration(t_obs: float) -> int:
+    """Capacity for the Lorentzian line arrays, scaling with segment duration."""
+
+    if not math.isfinite(t_obs) or t_obs <= 0.0:
+        raise ValueError("Tobs must be positive and finite")
+    return max(1, int(math.ceil(LINE_ARRAY_SCALE * math.sqrt(t_obs))))
 
 
 @njit(cache=True)
@@ -1858,6 +1867,7 @@ def line_proposal_log_density(f: float, fprop: np.ndarray, data: DataParams) -> 
 def BayesLineSetup(bptr: BayesLineParams, freqData: np.ndarray, fmin: float, fmax: float, deltaT: float, Tobs: float) -> None:
     """Allocate BayesLine state and attach the duration-specific line lookup."""
 
+    bptr.maxBLLines = line_array_size_for_duration(Tobs)
     n = freqData.size
     freq = np.arange(n // 2, dtype=np.float64) / Tobs
     power = np.zeros(n // 2, dtype=np.float64)
@@ -2839,8 +2849,9 @@ def main(argv: list[str]) -> int:
     splinePSD = np.zeros(N // 2, dtype=np.float64)
     fprop = np.zeros(N // 2, dtype=np.float64)
 
-    bptr = BayesLineParams(maxBLLines=1000)
+    bptr = BayesLineParams()
     BayesLineSetup(bptr, fdata, fmin, fmax, dt, Tobs)
+    print(f"BayesLine line array size = {bptr.maxBLLines}")
     timing_mark("BayesLineSetup")
     BayesLineBurnin(bptr, data, fdata, "H1", fprop, 1, write_start=args.write_bl_start)
     timing_mark("BayesLineBurnin")
