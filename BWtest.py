@@ -29,6 +29,9 @@ Usage examples:
     Running anywhere and getting the data from GWOSC 
     python BWtest.py 1126259462.4 8 --source open --ifo L1 --nyquist 1024
 
+    Re-processing a BWtest time-domain diagnostic that is already Tukey-tapered
+    python BWtest.py line_subtracted_time.dat --no-tukey
+
     Frame/GWOSC inputs are fetched with padding, resampled to 2*Nyquist, and
     cropped to the requested segment before the BayesLine preprocessing starts.
     By default, frame/GWOSC inputs use LALSuite's Kaiser-windowed sinc
@@ -36,6 +39,16 @@ Usage examples:
     GWPy's resampling path instead.  The old Butterworth decimation path is
     reserved for existing two-column files whose sample rate is above the
     requested Nyquist.
+
+    WARNING for --no-tukey / --input-already-tukeyed:
+        This option only skips multiplying the input data by a new Tukey window.
+        The line model still uses BWtest's standard Tukey-windowed Lorentzian
+        lookup table, and the output PSD/frequency-data scaling still applies
+        the usual one-window Tukey power correction. It is intended for files
+        that already contain the same BWtest Tukey roll-off, such as
+        line_subtracted_time.dat. If the input is untapered or was made with a
+        different window, the line model and normalization may be inconsistent.
+
 
 Important output files:
 
@@ -63,6 +76,17 @@ Important output files:
     whitelsf.dat and whitelsf_noglitch.dat
         Optional with --writewhite: line-subtracted, smooth-PSD-whitened
         Fourier data before and after wavelet glitch cleaning.
+
+    line_subtracted_time.dat and line_subtracted_noglitch_time.dat
+        Optional with --write-line-subtracted-time: unwhitened time-domain
+        line-subtracted data before and after wavelet glitch cleaning. These
+        retain the Tukey roll-off used before the FFT.
+
+        WARNING: the Tukey window roll-off is not undone in these files. The
+        endpoints are still tapered. This is intentional because dividing by
+        the small window values in the roll-off would amplify noise and edge
+        transients. Treat these files as tapered, analysis-segment time-domain
+        diagnostics rather than a reconstruction of the untapered frame data.
 
 To run the functional whitening check used during development:
 
@@ -1376,6 +1400,70 @@ def whiten_line_subtracted_numba(real_data: np.ndarray, imag_data: np.ndarray,
     return white
 
 
+@njit(cache=True)
+def line_subtracted_scaled_numba(real_data: np.ndarray, imag_data: np.ndarray,
+                                 sbase: np.ndarray, sline: np.ndarray,
+                                 snf: np.ndarray, imin: int, imax: int,
+                                 seed: int) -> Tuple[np.ndarray, np.ndarray]:
+    """Subtract the sampled line contribution in BayesWave-scaled FFT units."""
+
+    np.random.seed(seed)
+    n_half = real_data.size - 1
+    out_real = real_data.copy()
+    out_imag = imag_data.copy()
+    tiny = np.finfo(np.float64).tiny
+    for i in range(1, n_half):
+        if i < imin or i >= imax:
+            continue
+
+        j = i - imin
+        dr = real_data[i]
+        di = imag_data[i]
+        hrx = 0.0
+        hix = 0.0
+        frac = sline[j] / max(snf[j], tiny)
+        if frac > 1.0e-2:
+            SM = 2.0 * sbase[j]
+            SL = 2.0 * sline[j]
+            total = SM + SL
+            hrx = frac * dr
+            hix = frac * di
+            sigma2 = 0.25 * SM * SL / max(total, tiny)
+            sigma = math.sqrt(max(sigma2, 0.0))
+            x = dr - hrx
+            y = di - hix
+            logLx = -2.0 * (x * x + y * y) / max(SM, tiny)
+            for _ in range(1, 1000):
+                hry = hrx + sigma * np.random.normal()
+                hiy = hix + sigma * np.random.normal()
+                x = dr - hry
+                y = di - hiy
+                logLy = -2.0 * (x * x + y * y) / max(SM, tiny)
+                alpha = math.log(max(np.random.random(), tiny))
+                if alpha < logLy - logLx:
+                    logLx = logLy
+                    hrx = hry
+                    hix = hiy
+
+        out_real[i] = dr - hrx
+        out_imag[i] = di - hix
+    return out_real, out_imag
+
+
+def scaled_rfft_to_time(real_data: np.ndarray, imag_data: np.ndarray,
+                        dt: float, n: int) -> np.ndarray:
+    """Convert BayesWave-scaled rFFT coefficients back to tapered time-domain strain.
+
+    The returned time series is in strain units, but it is still the data that
+    went through BWtest's Tukey window before the FFT.  We intentionally do not
+    divide by the window on the way back because that would make the roll-off
+    endpoints numerically fragile.
+    """
+
+    scaled_fft = real_data + 1j * imag_data
+    return np.fft.irfft(scaled_fft * (math.sqrt(2.0) / dt), n=n)
+
+
 def write_whitened_line_subtracted_files(bayesline: BayesLineParams,
                                          original_fft: np.ndarray,
                                          cleaned_freq_data: np.ndarray,
@@ -1411,6 +1499,59 @@ def write_whitened_line_subtracted_files(bayesline: BayesLineParams,
         data.imin, data.imax, data.t_obs, seed_raw
     )
     np.savetxt("whitelsf.dat", white_raw)
+
+
+def write_time_domain_line_subtracted_files(bayesline: BayesLineParams,
+                                            times: np.ndarray,
+                                            original_fft: np.ndarray,
+                                            cleaned_freq_data: np.ndarray,
+                                            dt: float,
+                                            rng: np.random.Generator) -> None:
+    """Write unwhitened time-domain line-subtracted diagnostic files.
+
+    The two outputs are time-domain counterparts to the optional whitelsf files:
+
+    * line_subtracted_time.dat is built from the original tapered FFT data with
+      the sampled BayesLine line model subtracted.
+    * line_subtracted_noglitch_time.dat is built from the wavelet-cleaned FFT
+      data used for PSD estimation, again with the line model subtracted.
+
+    These files are not whitened. They are also not de-windowed: the Tukey
+    roll-off applied before the FFT remains present at both ends of the segment.
+    """
+
+    assert bayesline.data is not None
+    assert bayesline.Sbase is not None and bayesline.Sline is not None and bayesline.Snf is not None
+    data = bayesline.data
+    n = data.n
+    n_half = n // 2
+
+    cleaned_real = np.zeros(n_half + 1, dtype=np.float64)
+    cleaned_imag = np.zeros(n_half + 1, dtype=np.float64)
+    cleaned_real[1:n_half] = cleaned_freq_data[2:n:2]
+    cleaned_imag[1:n_half] = cleaned_freq_data[3:n + 1:2]
+
+    original_scaled = original_fft * (dt / math.sqrt(2.0))
+    original_real = original_scaled.real.astype(np.float64, copy=True)
+    original_imag = original_scaled.imag.astype(np.float64, copy=True)
+
+    seed_raw = int(rng.integers(1, 2**31 - 1))
+    raw_real, raw_imag = line_subtracted_scaled_numba(
+        original_real, original_imag, bayesline.Sbase, bayesline.Sline, bayesline.Snf,
+        data.imin, data.imax, seed_raw
+    )
+    raw_time = scaled_rfft_to_time(raw_real, raw_imag, dt, n)
+    np.savetxt("line_subtracted_time.dat", np.column_stack((times, raw_time)))
+    print("Wrote line_subtracted_time.dat; WARNING: Tukey roll-off remains in the time-domain data")
+
+    seed_noglitch = int(rng.integers(1, 2**31 - 1))
+    noglitch_real, noglitch_imag = line_subtracted_scaled_numba(
+        cleaned_real, cleaned_imag, bayesline.Sbase, bayesline.Sline, bayesline.Snf,
+        data.imin, data.imax, seed_noglitch
+    )
+    noglitch_time = scaled_rfft_to_time(noglitch_real, noglitch_imag, dt, n)
+    np.savetxt("line_subtracted_noglitch_time.dat", np.column_stack((times, noglitch_time)))
+    print("Wrote line_subtracted_noglitch_time.dat; WARNING: Tukey roll-off remains in the time-domain data")
 
 
 def lineget_candidates(power: np.ndarray, smooth: np.ndarray, freqs: np.ndarray,
@@ -2677,6 +2818,17 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="frame/GWOSC resampler; default lal uses LALSuite's Kaiser-windowed sinc routine",
     )
     parser.add_argument(
+        "--no-tukey",
+        "--no_tukey",
+        "--input-already-tukeyed",
+        action="store_true",
+        help=(
+            "skip applying a new Tukey window to the input; intended for data "
+            "already tapered with BWtest's Tukey roll-off. The line model and "
+            "output scaling still assume one standard Tukey window."
+        ),
+    )
+    parser.add_argument(
         "--write_bl_start",
         "--write-bl-start",
         action="store_true",
@@ -2687,6 +2839,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--write-white",
         action="store_true",
         help="write C-style whitelsf.dat and whitelsf_noglitch.dat diagnostics",
+    )
+    parser.add_argument(
+        "--write_line_subtracted_time",
+        "--write-line-subtracted-time",
+        "--writelinesubtime",
+        action="store_true",
+        help="write unwhitened time-domain line-subtracted diagnostics before and after glitch cleaning",
     )
     parser.add_argument(
         "--psd_samples",
@@ -2827,11 +2986,15 @@ def main(argv: list[str]) -> int:
 
     times = timeX[::dec][:N].copy()
     data = dataX[::dec][:N].copy()
-    del times
 
     alpha = 2.0 * T_RISE / Tobs
     window_power_correction = tukey_power_correction(N, alpha)
-    tukey_inplace(data, alpha)
+    if args.no_tukey:
+        print("WARNING: --no-tukey set; BWtest will not apply a new Tukey window to the input data")
+        print("WARNING: line model still uses the standard Tukey-windowed Lorentzian lookup")
+        print("WARNING: output scaling still applies the usual one-window Tukey power correction")
+    else:
+        tukey_inplace(data, alpha)
 
     dataf_c = np.fft.rfft(data)
     dt = Tobs / N
@@ -2921,6 +3084,8 @@ def main(argv: list[str]) -> int:
     np.savetxt("frequency_data.dat", freq_out)
     if args.writewhite:
         write_whitened_line_subtracted_files(bptr, dataf_c, fdata, dt, bptr.rng)
+    if args.write_line_subtracted_time:
+        write_time_domain_line_subtracted_files(bptr, times, dataf_c, fdata, dt, bptr.rng)
     timing_mark("write_outputs")
 
     if args.timing:
