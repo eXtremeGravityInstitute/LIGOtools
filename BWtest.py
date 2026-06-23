@@ -58,11 +58,17 @@ Important output files:
         By default the median uses 200 PSD states sampled evenly from the second
         half of the RJMCMC. Change this with --psd-samples N.
 
+        For trigger-time data fetched from the LVK grid or GWOSC, this main
+        PSD file is tagged with detector and rounded trigger GPS, e.g.
+        BWpsd_H1_1126259462.dat. Existing input-file runs keep BWpsd.dat.
+
     BWfairdrawpsd.dat
         Final fair-draw one-sided PSD from the last RJMCMC state.
 
     frequency_data.dat
         Final cleaned complex frequency-domain data, scaled for ADtest.py.
+        For fetched trigger-time data this is tagged in the same way as BWpsd,
+        e.g. frequency_data_H1_1126259462.dat.
 
     BL_start.dat
         Optional startup diagnostic: frequency, periodogram, smooth PSD, line PSD.
@@ -190,6 +196,7 @@ class InputSpec:
 
     filename: str
     fetched_from_frame: bool = False
+    output_tag: Optional[str] = None
 
 
 @dataclass
@@ -2758,6 +2765,25 @@ def decimation_factor_for_nyquist(data_nyquist: float, requested_nyquist: float)
     return dec
 
 
+def detector_label_from_args(args: argparse.Namespace) -> str:
+    """Return the detector label used to tag fetched-data output files."""
+
+    if args.channel is not None and ":" in args.channel:
+        detector = args.channel.split(":", 1)[0]
+    else:
+        detector = args.ifo
+    return detector.strip().upper()
+
+
+def tagged_output_name(base_name: str, input_spec: InputSpec) -> str:
+    """Decorate main output filenames for fetched trigger-time data."""
+
+    if not input_spec.output_tag:
+        return base_name
+    stem, suffix = base_name.rsplit(".", 1)
+    return f"{stem}_{input_spec.output_tag}.{suffix}"
+
+
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog=Path(argv[0]).name,
@@ -2894,7 +2920,9 @@ def resolve_input_file(args: argparse.Namespace, nyquist: int) -> InputSpec:
             trigger_time, duration, args.ifo, args.source, args.channel,
             args.output, target_rate, args.padding, args.resampler
         )
-        return InputSpec(filename, fetched_from_frame=True)
+        trigger_label = int(math.floor(trigger_time + 0.5))
+        output_tag = f"{detector_label_from_args(args)}_{trigger_label}"
+        return InputSpec(filename, fetched_from_frame=True, output_tag=output_tag)
 
     raise ValueError("provide a frame file, --file INPUT, or trigger_time duration")
 
@@ -3079,9 +3107,13 @@ def main(argv: list[str]) -> int:
         median_psd_out[0] = median_psd_out[1]
     median_smooth_out = psd_scale * median_spline
     median_line_out = median_psd_out - median_smooth_out
-    np.savetxt("BWpsd.dat", np.column_stack((bw_freq, median_psd_out)))
+    bwpsd_filename = tagged_output_name("BWpsd.dat", input_spec)
+    frequency_data_filename = tagged_output_name("frequency_data.dat", input_spec)
+    if input_spec.output_tag:
+        print(f"Writing tagged main outputs: {bwpsd_filename}, {frequency_data_filename}")
+    np.savetxt(bwpsd_filename, np.column_stack((bw_freq, median_psd_out)))
     np.savetxt("BWpsd_components.dat", np.column_stack((bw_freq, median_psd_out, median_smooth_out, median_line_out)))
-    np.savetxt("frequency_data.dat", freq_out)
+    np.savetxt(frequency_data_filename, freq_out)
     if args.writewhite:
         write_whitened_line_subtracted_files(bptr, dataf_c, fdata, dt, bptr.rng)
     if args.write_line_subtracted_time:
