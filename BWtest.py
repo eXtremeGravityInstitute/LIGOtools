@@ -94,6 +94,19 @@ Important output files:
         transients. Treat these files as tapered, analysis-segment time-domain
         diagnostics rather than a reconstruction of the untapered frame data.
 
+    glitch_time.dat and whitened_glitch_time.dat
+        Optional with --write-glitch: time-domain wavelet excess subtracted
+        during BayesLine's initial cleaning stage, and the same excess whitened
+        using the final median BWpsd. The glitch is defined as the tapered raw
+        analysis data minus the wavelet-cleaned data used for PSD estimation,
+        so it inherits the same Tukey/window status as the analyzed data.
+
+    whitened_feature_time.dat
+        Optional with --feature: the whitened part of the glitch that survives
+        Denoise.py-style time-frequency clustering and the cluster SNR cut.
+        The feature SNR is computed from Denoise-normalized Fourier
+        coefficients, not by FFTing whitened_glitch_time.dat again.
+
 To run the functional whitening check used during development:
 
     /opt/anaconda3/bin/python ADtest.py BWpsd.dat frequency_data.dat 8 \
@@ -156,6 +169,9 @@ FSTEP = 10.0
 Q_S = 8.0
 STHRESH = 9.0
 WARM = 6.0
+FEATURE_WARM = 5.0
+FEATURE_SNR_THRESH = 4.0
+FEATURE_QSCAN_SUBSCALE = 40
 DEFAULT_ANALYSIS_FMIN = 20.0
 DEFAULT_ANALYSIS_FMAX = 1024.0
 TRIGGER_OFFSET_FROM_END = 4.0
@@ -1471,6 +1487,306 @@ def scaled_rfft_to_time(real_data: np.ndarray, imag_data: np.ndarray,
     return np.fft.irfft(scaled_fft * (math.sqrt(2.0) / dt), n=n)
 
 
+def cleaned_time_from_scaled_freq(cleaned_freq_data: np.ndarray, dt: float, n: int) -> np.ndarray:
+    """Reconstruct the wavelet-cleaned time series written into BWtest's fdata."""
+
+    n_half = n // 2
+    cleaned_real = np.zeros(n_half + 1, dtype=np.float64)
+    cleaned_imag = np.zeros(n_half + 1, dtype=np.float64)
+    cleaned_real[1:n_half] = cleaned_freq_data[2:n:2]
+    cleaned_imag[1:n_half] = cleaned_freq_data[3:n + 1:2]
+    return scaled_rfft_to_time(cleaned_real, cleaned_imag, dt, n)
+
+
+def _psd_for_rfft(psd_one_sided: np.ndarray, n: int) -> np.ndarray:
+    """Return a PSD array with explicit DC and Nyquist slots for an rfft."""
+
+    n_half = n // 2
+    if psd_one_sided.size < n_half:
+        raise ValueError("PSD array is too short for the time series")
+    psd = np.empty(n_half + 1, dtype=np.float64)
+    psd[:n_half] = psd_one_sided[:n_half]
+    psd[n_half] = psd_one_sided[n_half - 1] if n_half > 0 else psd_one_sided[0]
+    return np.maximum(psd, np.finfo(float).tiny)
+
+
+def whitened_rfft_with_psd(data: np.ndarray, psd_one_sided: np.ndarray,
+                           dt: float, window_power_correction: float) -> np.ndarray:
+    """Return Denoise.py-normalized whitened Fourier coefficients.
+
+    Denoise.py performs the Q-scan on half-complex FFT coefficients divided by
+    the square root of the raw spectral estimate. In BWtest units this is
+    equivalent to using the BayesWave-scaled FFT and dividing by
+    ``sqrt(2*PSD_internal)``. Since ``BWpsd = (4*W/T)*PSD_internal``, the raw
+    NumPy FFT is scaled by ``dt*sqrt(W/(T*BWpsd))``. The corresponding display
+    time series is obtained by inverse transforming these coefficients and
+    multiplying by ``sqrt(2*N)``.
+    """
+
+    n = data.size
+    n_half = n // 2
+    t_obs = n * dt
+    psd = _psd_for_rfft(psd_one_sided, n)
+    white_fft = np.fft.rfft(data)
+    white_fft[0] = 0.0
+    white_fft[n_half] = 0.0
+    white_fft[1:n_half] *= dt * math.sqrt(window_power_correction / t_obs) / np.sqrt(psd[1:n_half])
+    return white_fft
+
+
+def whiten_time_series_with_psd(data: np.ndarray, psd_one_sided: np.ndarray,
+                                dt: float, window_power_correction: float) -> np.ndarray:
+    """Whiten a time series with the final physical one-sided PSD.
+
+    The returned time series follows the Denoise.py display convention:
+    inverse-transform the Denoise-normalized Fourier coefficients and multiply
+    by ``sqrt(2*N)``. For stationary Gaussian data, the interior samples have
+    approximately unit variance up to edge tapering.
+    """
+
+    n = data.size
+    white_fft = whitened_rfft_with_psd(data, psd_one_sided, dt, window_power_correction)
+    return np.fft.irfft(white_fft, n=n) * math.sqrt(2.0 * n)
+
+
+def compute_glitch_time_products(raw_time_data: np.ndarray, cleaned_freq_data: np.ndarray,
+                                 final_psd: np.ndarray, dt: float,
+                                 window_power_correction: float) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return the wavelet-cleaning glitch, whitened time series, and whitened FFT."""
+
+    cleaned_time = cleaned_time_from_scaled_freq(cleaned_freq_data, dt, raw_time_data.size)
+    glitch_time = raw_time_data - cleaned_time
+    whitened_glitch_fft = whitened_rfft_with_psd(glitch_time, final_psd, dt, window_power_correction)
+    whitened_glitch = np.fft.irfft(whitened_glitch_fft, n=raw_time_data.size) * math.sqrt(2.0 * raw_time_data.size)
+    return glitch_time, whitened_glitch, whitened_glitch_fft
+
+
+@njit(cache=True)
+def feature_flood_fill(img: np.ndarray, x: int, y: int, new_clr: int) -> None:
+    """Connected-component fill used by Denoise.py's feature clustering."""
+
+    m, n = img.shape
+    prev = img[x, y]
+    if prev == new_clr:
+        return
+    size = m * n
+    qx = np.empty(size, dtype=np.int64)
+    qy = np.empty(size, dtype=np.int64)
+    front = 0
+    rear = 0
+    qx[rear] = x
+    qy[rear] = y
+    rear += 1
+    img[x, y] = new_clr
+    while front < rear:
+        x = qx[front]
+        y = qy[front]
+        front += 1
+        for dx in range(-1, 2):
+            for dy in range(-1, 2):
+                if dx == 0 and dy == 0:
+                    continue
+                xx = x + dx
+                yy = y + dy
+                if 0 <= xx < m and 0 <= yy < n and img[xx, yy] == prev:
+                    img[xx, yy] = new_clr
+                    qx[rear] = xx
+                    qy[rear] = yy
+                    rear += 1
+
+
+@njit(cache=True)
+def feature_cluster_core(freqs: np.ndarray, tfD: np.ndarray, tfR: np.ndarray,
+                         scale: float, t_obs: float, snr_thresh: float) -> Tuple[
+                             np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray,
+                             int, float, int, float, float, float, float, float
+                         ]:
+    """Denoise.py clustering and cluster-SNR cut for whitened Q-transform pixels."""
+
+    nf, nt = tfD.shape
+    live = np.empty((nf, nt), dtype=np.int64)
+    live2 = np.empty((nf, nt), dtype=np.int64)
+    hot0 = 0
+    for j in range(nf):
+        for i in range(nt):
+            live[j, i] = -1
+            if tfD[j, i] > STHRESH:
+                live[j, i] = 1
+                hot0 += 1
+            live2[j, i] = live[j, i]
+
+    for j in range(1, nf - 1):
+        for i in range(1, nt - 1):
+            flag = 0
+            for jj in range(-1, 2):
+                for ii in range(-1, 2):
+                    if live[j + jj, i + ii] == 1:
+                        flag = 1
+            if flag == 1 and tfD[j, i] > FEATURE_WARM:
+                live2[j, i] = 1
+
+    hot = 0
+    for j in range(nf):
+        for i in range(nt):
+            if live2[j, i] == 1:
+                hot += 1
+
+    new_clr = 1
+    size = nf * nt
+    while True:
+        flag = 0
+        cnt = 0
+        xpix = 0
+        ypix = 0
+        while flag == 0 and cnt < size:
+            xpix = cnt % nf
+            ypix = cnt // nf
+            if live2[xpix, ypix] == 1:
+                flag = 1
+            cnt += 1
+        if flag == 0:
+            break
+        new_clr += 1
+        feature_flood_fill(live2, xpix, ypix, new_clr)
+
+    cf = new_clr - 1
+    total_sig = np.zeros(nt, dtype=np.float64)
+    if cf <= 0:
+        empty = np.zeros(0, dtype=np.float64)
+        return total_sig, empty, empty, empty, empty, hot0, float(hot), -1, 0.0, 0.0, 0.0, 0.0, 0.0
+
+    DT = np.zeros((cf, nt), dtype=np.float64)
+    dt = t_obs / float(nt)
+    imin = int(T_RISE / t_obs * float(nt))
+    imax = int((t_obs - T_RISE) / t_obs * float(nt))
+    for j in range(nf):
+        sqf = scale * math.sqrt(freqs[j])
+        for i in range(imin, imax):
+            if live2[j, i] > 0:
+                jj = live2[j, i] - 2
+                DT[jj, i] += sqf * tfR[j, i]
+
+    csnr = np.zeros(cf, dtype=np.float64)
+    smax = 0.0
+    jmax = 0
+    for j in range(cf):
+        s = 0.0
+        for i in range(imin, imax):
+            s += DT[j, i] * DT[j, i]
+        csnr[j] = math.sqrt(s)
+        if csnr[j] > smax:
+            smax = csnr[j]
+            jmax = j
+
+    itmin = nt
+    itmax = 0
+    ifmin = nf
+    ifmax = 0
+    fmin = 0.0
+    fmax = 0.0
+    tmin = 0.0
+    tmax = 0.0
+    peak_t = np.zeros(cf, dtype=np.float64)
+    peak_f = np.zeros(cf, dtype=np.float64)
+    peak_amp = np.empty(cf, dtype=np.float64)
+    for j in range(cf):
+        peak_amp[j] = -1.0e300
+
+    for j in range(nf):
+        for i in range(nt):
+            if live2[j, i] > 1:
+                jj = live2[j, i] - 2
+                amp = tfD[j, i]
+                if amp > peak_amp[jj]:
+                    peak_amp[jj] = amp
+                    peak_t[jj] = dt * float(i)
+                    peak_f[jj] = freqs[j]
+
+    for j in range(nf):
+        for i in range(imin, imax):
+            if live2[j, i] > 1:
+                jj = live2[j, i] - 2
+                if jj == jmax:
+                    if j < ifmin:
+                        ifmin = j
+                        fmin = freqs[j]
+                    if j > ifmax:
+                        ifmax = j
+                        fmax = freqs[j]
+                    if i < itmin:
+                        itmin = i
+                        tmin = dt * float(i)
+                    if i > itmax:
+                        itmax = i
+                        tmax = dt * float(i)
+
+    for j in range(cf):
+        if csnr[j] > snr_thresh:
+            for i in range(nt):
+                total_sig[i] += DT[j, i]
+
+    return (
+        total_sig, csnr, peak_t, peak_f, peak_amp, hot0, float(hot), jmax,
+        smax, tmin, tmax, fmin if ifmin < nf else 0.0, fmax if ifmax > 0 else 0.0
+    )
+
+
+def feature_q_frequencies(t_obs: float, fmax: float) -> np.ndarray:
+    """Frequency layers for the Denoise.py-style Q-scan feature clustering."""
+
+    fmin = 1.0 / t_obs
+    if fmax <= fmin:
+        return np.array([fmin], dtype=np.float64)
+    octaves = max(1, int(np.rint(math.log(fmax / fmin) / math.log(2.0))))
+    nf = FEATURE_QSCAN_SUBSCALE * octaves + 1
+    dx = math.log(2.0) / float(FEATURE_QSCAN_SUBSCALE)
+    return np.exp(math.log(fmin) + np.arange(nf, dtype=np.float64) * dx)
+
+
+def extract_whitened_feature(whitened_glitch_fft: np.ndarray, t_obs: float,
+                             snr_thresh: float) -> np.ndarray:
+    """Cluster the whitened glitch and return the significant whitened feature.
+
+    ``whitened_glitch_fft`` must be the Denoise-normalized rfft coefficients.
+    It is smaller than ``np.fft.rfft(whitened_glitch_time)`` by ``sqrt(2*N)``;
+    using the display time series here would inflate the cluster SNR.
+    """
+
+    n = 2 * (whitened_glitch_fft.size - 1)
+    n_half = n // 2
+    fmax = (n // 2 - 1) / t_obs
+    freqs = feature_q_frequencies(t_obs, fmax)
+    print(f"feature frequency layers = {freqs.size:d} fmin {freqs[0]:e} fmax {freqs[-1]:e}")
+
+    whitened_fft = whitened_glitch_fft.copy()
+    whitened_fft[0] = 0.0
+    whitened_fft[n_half] = 0.0
+    if n_half > 1:
+        white_var = float(np.mean(2.0 * (whitened_fft[1:n_half].real ** 2 +
+                                         whitened_fft[1:n_half].imag ** 2)))
+        print(f"feature white variance {white_var:e}")
+    tfD, tfR = transform_c(whitened_fft, freqs, Q_S, t_obs, n)
+    scale = getscale(freqs, Q_S, t_obs, fmax, n)
+    total_sig, csnr, peak_t, peak_f, _peak_amp, hot0, hot, jmax, smax, tmin, tmax, fmin, fmax_found = feature_cluster_core(
+        freqs, tfD, tfR, scale, t_obs, snr_thresh
+    )
+
+    print(f"{hot0:d} initial hot pixels")
+    print(f"{int(hot):d} hot pixels")
+    print(f"{csnr.shape[0]:d} clusters")
+    for j in range(csnr.shape[0]):
+        print(f"SNR of cluster {j:d} = {csnr[j]:f} ({peak_t[j]:.2f}, {peak_f[j]:.2f})")
+    if jmax >= 0:
+        print(f"Loudest cluster is #{jmax:d} SNR = {smax:f}")
+    else:
+        print("No clusters found")
+    print(f"tmin {tmin:f} tmax {tmax:f} fmin {fmin:f} fmax {fmax_found:f}")
+    significant = int(np.sum(csnr > snr_thresh))
+    print(f"{significant:d} significant cluster(s)")
+    print(f"Feature SNR = {math.sqrt(float(np.dot(total_sig, total_sig))):f}")
+    return total_sig
+
+
 def write_whitened_line_subtracted_files(bayesline: BayesLineParams,
                                          original_fft: np.ndarray,
                                          cleaned_freq_data: np.ndarray,
@@ -1559,6 +1875,40 @@ def write_time_domain_line_subtracted_files(bayesline: BayesLineParams,
     noglitch_time = scaled_rfft_to_time(noglitch_real, noglitch_imag, dt, n)
     np.savetxt("line_subtracted_noglitch_time.dat", np.column_stack((times, noglitch_time)))
     print("Wrote line_subtracted_noglitch_time.dat; WARNING: Tukey roll-off remains in the time-domain data")
+
+
+def write_glitch_time_domain_files(times: np.ndarray, raw_time_data: np.ndarray,
+                                   cleaned_freq_data: np.ndarray, final_psd: np.ndarray,
+                                   dt: float, window_power_correction: float) -> None:
+    """Write the wavelet-cleaning excess and the same excess whitened by BWpsd.
+
+    ``raw_time_data`` is the time series after BWtest's preprocessing window
+    choice, and ``cleaned_freq_data`` is the BayesWave-scaled FFT of the
+    wavelet-cleaned data produced during BayesLine burn-in. Their difference is
+    the time-domain excess removed by the wavelet denoiser.
+    """
+
+    glitch_time, whitened_glitch, _whitened_glitch_fft = compute_glitch_time_products(
+        raw_time_data, cleaned_freq_data, final_psd, dt, window_power_correction
+    )
+
+    np.savetxt("glitch_time.dat", np.column_stack((times, glitch_time)))
+    np.savetxt("whitened_glitch_time.dat", np.column_stack((times, whitened_glitch)))
+    print("Wrote glitch_time.dat and whitened_glitch_time.dat")
+
+
+def write_whitened_feature_file(times: np.ndarray, raw_time_data: np.ndarray,
+                                cleaned_freq_data: np.ndarray, final_psd: np.ndarray,
+                                dt: float, window_power_correction: float,
+                                snr_thresh: float) -> None:
+    """Write the clustered, SNR-thresholded whitened glitch feature."""
+
+    _glitch_time, _whitened_glitch, whitened_glitch_fft = compute_glitch_time_products(
+        raw_time_data, cleaned_freq_data, final_psd, dt, window_power_correction
+    )
+    feature = extract_whitened_feature(whitened_glitch_fft, raw_time_data.size * dt, snr_thresh)
+    np.savetxt("whitened_feature_time.dat", np.column_stack((times, feature)))
+    print("Wrote whitened_feature_time.dat")
 
 
 def lineget_candidates(power: np.ndarray, smooth: np.ndarray, freqs: np.ndarray,
@@ -2874,6 +3224,25 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="write unwhitened time-domain line-subtracted diagnostics before and after glitch cleaning",
     )
     parser.add_argument(
+        "--write_glitch",
+        "--write-glitch",
+        "--writeglitch",
+        action="store_true",
+        help="write the time-domain wavelet-cleaning glitch and the same glitch whitened by the final BWpsd",
+    )
+    parser.add_argument(
+        "--feature",
+        action="store_true",
+        help="cluster the whitened glitch with the Denoise.py SNR cut and write whitened_feature_time.dat",
+    )
+    parser.add_argument(
+        "--feature-snr-thresh",
+        "--feature_snr_thresh",
+        type=float,
+        default=FEATURE_SNR_THRESH,
+        help="cluster SNR threshold used with --feature, default %(default)g",
+    )
+    parser.add_argument(
         "--psd_samples",
         "--psd-samples",
         "--median-psd-samples",
@@ -2952,6 +3321,9 @@ def main(argv: list[str]) -> int:
         return 1
     if args.psd_samples < 1:
         print("warning: --psd-samples must be at least 1")
+        return 1
+    if not math.isfinite(args.feature_snr_thresh) or args.feature_snr_thresh < 0.0:
+        print("warning: --feature-snr-thresh must be finite and non-negative")
         return 1
 
     fmin = float(args.fmin)
@@ -3114,6 +3486,13 @@ def main(argv: list[str]) -> int:
     np.savetxt(bwpsd_filename, np.column_stack((bw_freq, median_psd_out)))
     np.savetxt("BWpsd_components.dat", np.column_stack((bw_freq, median_psd_out, median_smooth_out, median_line_out)))
     np.savetxt(frequency_data_filename, freq_out)
+    if args.write_glitch:
+        write_glitch_time_domain_files(times, data, fdata, median_psd_out, dt, window_power_correction)
+    if args.feature:
+        write_whitened_feature_file(
+            times, data, fdata, median_psd_out, dt, window_power_correction,
+            args.feature_snr_thresh
+        )
     if args.writewhite:
         write_whitened_line_subtracted_files(bptr, dataf_c, fdata, dt, bptr.rng)
     if args.write_line_subtracted_time:
