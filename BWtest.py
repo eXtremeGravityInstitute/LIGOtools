@@ -11,7 +11,8 @@ This file mirrors the functional algorithm in BWtest.c and BayesLine.c:
    - build the initial smooth PSD with Akima splines,
    - find spectral lines with a four-pass windowed-Lorentzian startup,
    - optionally write BL_start.dat with frequency, cleaned periodogram, smooth PSD, line PSD.
-4. Run the Lorentzian+spline RJMCMC refinement.
+4. Run the Lorentzian+spline RJMCMC refinement, optionally adding broad
+   Gaussian PSD bumps when --gaussian-bumps is requested.
 5. Write output files using the same normalization convention expected by
    ADtest.py.
 
@@ -25,8 +26,21 @@ Usage examples:
     
     Running on a LVK machine
     python BWtest.py 1126259462.4 8 --channel H1:GDS-CALIB_STRAIN --nyquist 1024
+
+    LVK frame read with expanded PSD estimation
+    python BWtest.py 1126259462.4 8 --channel H1:GDS-CALIB_STRAIN \
+        --nyquist 1024 --expand 4
+
+        Here the requested analysis duration is 8 seconds and the PSD duration
+        is 4*8 = 32 seconds.  The analysis segment is still the usual
+        [1126259458.4, 1126259466.4], ending 4 seconds after the trigger.  It
+        is used for frequency_data.dat, whitening, glitch/feature output, and
+        line-subtracted diagnostics.  The PSD-estimation segment is centered
+        on the trigger, [1126259446.4, 1126259478.4], and is used for BayesLine
+        burn-in/RJMCMC.  The final PSD model from that 32-second fit is rebuilt
+        on the 8-second analysis grid before writing BWpsd.dat.
     
-    Running anywhere and getting the data from GWOSC 
+    Running anywhere and getting the data from GWOSC
     python BWtest.py 1126259462.4 8 --source open --ifo L1 --nyquist 1024
 
     Re-processing a BWtest time-domain diagnostic that is already Tukey-tapered
@@ -34,11 +48,53 @@ Usage examples:
 
     Frame/GWOSC inputs are fetched with padding, resampled to 2*Nyquist, and
     cropped to the requested segment before the BayesLine preprocessing starts.
-    By default, frame/GWOSC inputs use LALSuite's Kaiser-windowed sinc
-    resampler via lal.ResampleREAL8TimeSeries.  Use --resampler gwpy to use
-    GWPy's resampling path instead.  The old Butterworth decimation path is
-    reserved for existing two-column files whose sample rate is above the
-    requested Nyquist.
+    By default, LVK cluster frame inputs use LALSuite's Kaiser-windowed sinc
+    resampler via lal.ResampleREAL8TimeSeries, while --source open/GWOSC inputs
+    use GWPy's resampling path.  Use --resampler lal or --resampler gwpy to
+    override this source-dependent default.  The old Butterworth decimation
+    path is reserved for existing two-column files whose sample rate is above
+    the requested Nyquist.
+    
+    Use python BWtest.py --help to see the many additional options. Some of these are
+    --expand N Uses N times the requested analysis duration for PSD estimation,
+        then projects the PSD model back to the requested analysis grid. N must
+        be a power of two. The default is 1, which keeps the original path.
+
+        When N > 1, BWtest uses two segments:
+        * the requested analysis segment still ends 4 seconds after the trigger
+          and is used for frequency_data.dat, whitening, glitch/feature output,
+          and line-subtracted diagnostics;
+        * the longer PSD segment is centered on the trigger and is used only for
+          BayesLine burn-in/RJMCMC, including startup line finding and lmcmc
+          line subtraction during PSD initialization.
+
+        The final PSD model is then rebuilt on the requested analysis grid.
+        The spline and Gaussian components are evaluated on that grid; the
+        Lorentzian line component is rebuilt with the requested-duration Tukey
+        lookup table.
+
+        For user-supplied files, providing a duration, e.g.
+        ``python BWtest.py frame_32.dat 8``, means BWtest assumes the trigger
+        is at the center of the file and crops the usual trigger+4 analysis
+        segment.  With --expand 1 this cropped segment is also the PSD segment.
+        With --expand > 1 the file must contain the full centered PSD segment.
+    --linetrim Turns on the prior that exponentially supresses the number of lines
+    --prior-recovery Runs the RJMCMC with a constant likelihood and writes
+        prior_recovery_counts.dat with iteration, number of lines, and number
+        of spline knots for reversible-jump balance checks. With
+        --gaussian-bumps, the Gaussian bump count is included too.
+        It also writes prior_recovery_histograms.pdf plus histogram data files
+        using the second half of the trace by default; with --gaussian-bumps,
+        this includes prior_recovery_gaussian_histogram.dat.
+    --rjmcmc-steps N Sets the number of RJMCMC iterations, default 100000.
+    --gaussian-bumps Turns on an additional reversible-jump model component
+        for broad Gaussian PSD excesses. The model starts with zero bumps; the
+        sampler can add/delete/update bumps only in the RJMCMC stage.
+
+    After the startup line fit and spline trimming, the RJMCMC dimension caps are
+    reset adaptively to twice the initialized number of lines and spline knots.
+    The larger duration-based line allocation is only used during startup, where
+    the candidate list can be much larger than the final initialized model.
 
     WARNING for --no-tukey / --input-already-tukeyed:
         This option only skips multiplying the input data by a new Tukey window.
@@ -74,18 +130,35 @@ Important output files:
         Optional startup diagnostic: frequency, periodogram, smooth PSD, line PSD.
 
     BWpsd_components.dat
-        Median total, smooth, and line PSD components.
+        Median total, smooth, and line PSD components. With --gaussian-bumps,
+        a fifth column gives the broad-Gaussian component.
+
+    psd_range.dat
+        Optional with --psd-range: frequency, MCMC-sample mean PSD, and
+        MCMC-sample standard deviation at each frequency. The scaling matches
+        BWpsd.dat, while BWpsd.dat itself stays two columns for compatibility.
+
+    BW_likelihood_summand.dat
+        Frequency and Whittle log-likelihood summand for the arithmetic mean
+        PSD model. Summing the second column gives the printed average-PSD
+        model log likelihood.
 
     BWfairdrawpsd_components.dat
-        Final fair-draw total, smooth, and line PSD components.
+        Final fair-draw total, smooth, and line PSD components. With
+        --gaussian-bumps, a fifth column gives the broad-Gaussian component.
 
     whitelsf.dat and whitelsf_noglitch.dat
-        Optional with --writewhite: line-subtracted, smooth-PSD-whitened
-        Fourier data before and after wavelet glitch cleaning.
+        Optional with --writewhite: line-subtracted, broadband-background-PSD
+        whitened Fourier data before and after wavelet glitch cleaning. The
+        broadband background is the Akima spline component plus any optional
+        Gaussian bumps, but excludes the coherent Lorentzian lines.
 
-    line_subtracted_time.dat and line_subtracted_noglitch_time.dat
-        Optional with --write-line-subtracted-time: unwhitened time-domain
-        line-subtracted data before and after wavelet glitch cleaning. These
+    freq_nolines.dat, line_subtracted_time.dat, and line_subtracted_noglitch_time.dat
+        Optional with --write-line-subtracted-time: unwhitened line-subtracted
+        data. freq_nolines.dat and line_subtracted_time.dat are built from the
+        original Tukey-windowed FFT with the final fair-draw Lorentzian line
+        contribution subtracted; line_subtracted_noglitch_time.dat starts from
+        the wavelet-cleaned FFT used for PSD estimation. The time-domain files
         retain the Tukey roll-off used before the FFT.
 
         WARNING: the Tukey window roll-off is not undone in these files. The
@@ -106,6 +179,33 @@ Important output files:
         Denoise.py-style time-frequency clustering and the cluster SNR cut.
         The feature SNR is computed from Denoise-normalized Fourier
         coefficients, not by FFTing whitened_glitch_time.dat again.
+
+    sinefit.dat
+        Optional with --sinefit: for each final Lorentzian line, compare the
+        reconstructed windowed-Lorentzian power profile to a Tukey-windowed
+        pure sinusoid power profile. The sinusoid frequency is scanned over
+        f_line +/- 0.5*nu, where nu is the line width in Hz. Inner products
+        are weighted by the final broadband non-line PSD.
+        The columns are line frequency, line width nu in Hz, best-fit sinusoid
+        frequency, line SNR sqrt((a|a)), predicted residual SNR, and mismatch
+        1-match.
+
+    freq_nosine.dat
+        Optional with --sinefit: Tukey-windowed original frequency-domain data
+        with a best-fit pure sinusoid subtracted for each final line. The
+        sinusoid frequency, amplitude, and phase are fitted against the local
+        Fourier data with the final broadband non-line PSD as the noise
+        weighting. Columns
+        match freq_nolines.dat: frequency, real part, imaginary part, in
+        BayesWave's internal scaled Fourier convention.
+
+    freq_nolines.dat
+        Optional with --write-line-subtracted-time: Tukey-windowed original
+        frequency-domain data with a final-state
+        fair-draw Lorentzian line contribution subtracted. This uses the
+        original analyzed data, not the wavelet-cleaned data used for PSD
+        estimation, and is written in BayesWave's internal scaled Fourier
+        convention.
 
 To run the functional whitening check used during development:
 
@@ -165,13 +265,19 @@ TPI = 2.0 * math.pi
 LN2 = math.log(2.0)
 LINEMUL = 9.0
 T_RISE = 1.0
-FSTEP = 10.0
+FSTEP = 4.0
+DFMIN = 0.5
 Q_S = 8.0
 STHRESH = 9.0
 WARM = 6.0
 FEATURE_WARM = 5.0
 FEATURE_SNR_THRESH = 4.0
 FEATURE_QSCAN_SUBSCALE = 40
+SINEFIT_SCAN_POINTS = 41
+LINE_COUNT_PRIOR_ZETA = 0.5
+GAUSSIAN_BUMP_ARRAY_SCALE = 10.0
+GAUSSIAN_BUMP_SIGMA_MIN = 0.2
+GAUSSIAN_BUMP_SIGMA_MAX = 5.0
 DEFAULT_ANALYSIS_FMIN = 20.0
 DEFAULT_ANALYSIS_FMAX = 1024.0
 TRIGGER_OFFSET_FROM_END = 4.0
@@ -198,6 +304,7 @@ class LorentzianParams:
     lnumin: float = math.log(1.0e-4)
     lnumax: float = math.log(1.0e-1)
     ltemplate: Optional[np.ndarray] = None
+    peak_template: Optional[np.ndarray] = None
 
     def __post_init__(self) -> None:
         self.f = np.zeros(self.size, dtype=np.float64)
@@ -207,12 +314,30 @@ class LorentzianParams:
 
 
 @dataclass
+class GaussianBumpParams:
+    """Broad Gaussian PSD bumps added during the RJMCMC."""
+
+    size: int
+    n: int = 0
+    f: np.ndarray = field(init=False)
+    a: np.ndarray = field(init=False)
+    sigma: np.ndarray = field(init=False)
+
+    def __post_init__(self) -> None:
+        self.f = np.zeros(self.size, dtype=np.float64)
+        self.a = np.zeros(self.size, dtype=np.float64)
+        self.sigma = np.zeros(self.size, dtype=np.float64)
+
+
+@dataclass
 class InputSpec:
     """Resolved input file plus whether it came from direct frame fetching."""
 
     filename: str
     fetched_from_frame: bool = False
     output_tag: Optional[str] = None
+    trigger_time: Optional[float] = None
+    analysis_duration: Optional[float] = None
 
 
 @dataclass
@@ -265,10 +390,13 @@ class BayesLineParams:
     """Top-level BayesLine state shared by burn-in and RJMCMC."""
 
     maxBLLines: int = 0
+    maxBLBumps: int = 0
+    maxSplineKnots: int = 0
     data: Optional[DataParams] = None
     spline: Optional[SplineParams] = None
     spline_x: Optional[SplineParams] = None
     lines_x: Optional[LorentzianParams] = None
+    bumps_x: Optional[GaussianBumpParams] = None
     priors: BayesLinePriors = field(default_factory=BayesLinePriors)
     Snf: Optional[np.ndarray] = None
     Sna: Optional[np.ndarray] = None
@@ -279,6 +407,9 @@ class BayesLineParams:
     sfreq: Optional[np.ndarray] = None
     Sbase: Optional[np.ndarray] = None
     Sline: Optional[np.ndarray] = None
+    Sgauss: Optional[np.ndarray] = None
+    gaussianSigmaMin: float = GAUSSIAN_BUMP_SIGMA_MIN
+    gaussianSigmaMax: float = GAUSSIAN_BUMP_SIGMA_MAX
     rng: np.random.Generator = field(default_factory=lambda: np.random.default_rng(1234))
     constantLogLFlag: int = 0
     flatPriorFlag: int = 0
@@ -290,6 +421,14 @@ def line_array_size_for_duration(t_obs: float) -> int:
     if not math.isfinite(t_obs) or t_obs <= 0.0:
         raise ValueError("Tobs must be positive and finite")
     return max(1, int(math.ceil(LINE_ARRAY_SCALE * math.sqrt(t_obs))))
+
+
+def gaussian_bump_array_size_for_duration(t_obs: float) -> int:
+    """Capacity for broad Gaussian PSD bumps."""
+
+    if not math.isfinite(t_obs) or t_obs <= 0.0:
+        raise ValueError("Tobs must be positive and finite")
+    return max(4, int(math.ceil(GAUSSIAN_BUMP_ARRAY_SCALE * math.sqrt(t_obs))))
 
 
 @njit(cache=True)
@@ -590,6 +729,18 @@ def lorentzian_lookup_value(ltemplate: np.ndarray, ii: int, jj: int,
 
 
 @njit(cache=True)
+def lorentzian_peak_response_value(peak_template: np.ndarray, t_obs: float,
+                                   nf: int, nnu: int, lnumin: float, lnumax: float,
+                                   f0: float, nu: float) -> float:
+    """Interpolate the raw-unit peak of a windowed Lorentzian."""
+
+    _, ii, jj, y, z = lorentzian_lookup_params(t_obs, nf, nnu, lnumin, lnumax, f0, nu)
+    logv = (1.0 - z) * ((1.0 - y) * peak_template[ii, jj] + y * peak_template[ii + 1, jj])
+    logv += z * ((1.0 - y) * peak_template[ii, jj + 1] + y * peak_template[ii + 1, jj + 1])
+    return math.exp(logv)
+
+
+@njit(cache=True)
 def local_lorentzian_template(t_obs: float, nf: int, nnu: int, wdth: int,
                               lnumin: float, lnumax: float, ltemplate: np.ndarray,
                               f0: float, amp: float, nu: float) -> Tuple[int, np.ndarray]:
@@ -673,6 +824,33 @@ def sline_from_lookup(ncut: int, data_imin: int, t_obs: float,
     for k in range(nlines):
         add_lookup_line_band_inplace(out, data_imin, t_obs, nf, nnu, wdth, lnumin, lnumax,
                                      ltemplate, lf[k], la[k], lnu[k], 1.0)
+    return out
+
+
+def add_gaussian_bump_band_inplace(model: np.ndarray, freq: np.ndarray, f0: float,
+                                   amp: float, sigma: float, sign: float,
+                                   nsigma: float = 5.0) -> Tuple[int, int]:
+    """Add/subtract one broad Gaussian bump over its local frequency support."""
+
+    if sigma <= 0.0 or amp <= 0.0 or freq.size == 0:
+        return 0, 0
+    lo = int(np.searchsorted(freq, f0 - nsigma * sigma, side="left"))
+    hi = int(np.searchsorted(freq, f0 + nsigma * sigma, side="right"))
+    lo = max(0, min(lo, model.size))
+    hi = max(lo, min(hi, model.size))
+    if hi <= lo:
+        return 0, 0
+    x = (freq[lo:hi] - f0) / sigma
+    model[lo:hi] += sign * amp * np.exp(-0.5 * x * x)
+    return lo, hi
+
+
+def gaussian_bumps_from_params(freq: np.ndarray, bumps: GaussianBumpParams) -> np.ndarray:
+    """Assemble the full broad-Gaussian PSD component over the active band."""
+
+    out = np.zeros(freq.size, dtype=np.float64)
+    for k in range(bumps.n):
+        add_gaussian_bump_band_inplace(out, freq, bumps.f[k], bumps.a[k], bumps.sigma[k], 1.0)
     return out
 
 
@@ -1150,12 +1328,17 @@ def splinestart_akima(N: int, istart: int, iend: int, fstep: float, SM: np.ndarr
 # duration and Tukey rolloff, so BayesLineSetup loads lookup_<Tobs>_<rise>.dat
 # when present or generates the same table otherwise.
 def lorentzraw_grid(f0: float, nu: float, amp: float, freqs: np.ndarray) -> np.ndarray:
-    """Evaluate the unwindowed raw Lorentzian power profile."""
+    """Evaluate the unwindowed raw Lorentzian power profile.
+
+    ``nu`` is the line width in Hz.  The oscillator denominator is written in
+    angular frequency, so the width is converted to radians/sec here.
+    """
 
     om0 = TPI * f0
     om = TPI * freqs
+    nu_ang = TPI * nu
     x = om0 * om0 - om * om
-    return amp / (x * x + nu * nu * om * om)
+    return amp / (x * x + nu_ang * nu_ang * om * om)
 
 
 def windowed_lorentzian_template(f0: float, nu: float, amp: float, jwidth: int, n: int,
@@ -1232,6 +1415,40 @@ def generate_lorentzian_lookup(t_obs: float, tukey_rise: float = T_RISE, nf: int
     return nf, nnu, wdth, numin, numax, ltemplate
 
 
+def generate_lorentzian_peak_lookup(t_obs: float, tukey_rise: float, nf: int,
+                                    nnu: int, wdth: int, numin: float, numax: float,
+                                    n_samples: int, oversample: int = 128) -> np.ndarray:
+    """Generate log peak response before lookup-table unit-peak normalization."""
+
+    alpha = 2.0 * tukey_rise / t_obs
+    nx = oversample * n_samples
+    jwidth = wdth * oversample // 2
+
+    tuk = np.full(n_samples, 1.0 / n_samples, dtype=np.float64)
+    tukey_inplace(tuk, alpha)
+    tuk_long = np.zeros(nx, dtype=np.float64)
+    start = nx // 2
+    tuk_long[start:start + n_samples] = tuk
+    tuk_fft = np.fft.rfft(tuk_long)
+    twl = np.abs(tuk_fft[:jwidth]) ** 2
+
+    peak_template = np.zeros((nf + 1, nnu + 1), dtype=np.float64)
+    lnumin = math.log(numin)
+    lnumax = math.log(numax)
+    m = int(40.0 * t_obs)
+    tiny = np.finfo(float).tiny
+
+    for ii in range(nf + 1):
+        f0 = 40.0 + (2.0 * ii - nf) / nf * 0.5 / t_obs
+        for jj in range(nnu + 1):
+            nu = math.exp(lnumin + (lnumax - lnumin) * jj / nnu)
+            line = windowed_lorentzian_template(f0, nu, 1.0, jwidth, n_samples, t_obs, oversample, twl)
+            lo = max(0, m - 4)
+            hi = min(line.size, m + 5)
+            peak_template[ii, jj] = math.log(max(float(np.max(line[lo:hi])), tiny))
+    return peak_template
+
+
 def write_lorentzian_lookup(filename: Path, nf: int, nnu: int, wdth: int,
                             numin: float, numax: float, ltemplate: np.ndarray) -> None:
     """Write a lookup table in the same flat text format as BayesLine.c."""
@@ -1272,6 +1489,45 @@ def load_lorentzian_lookup(t_obs: float, tukey_rise: float = T_RISE,
     return nf, nnu, wdth, numin, numax, values.reshape((nf + 1, nnu + 1, wdth))
 
 
+def load_lorentzian_peak_lookup(t_obs: float, nf: int, nnu: int, wdth: int,
+                                numin: float, numax: float,
+                                tukey_rise: float = T_RISE,
+                                n_samples: Optional[int] = None) -> np.ndarray:
+    """Load or compute the duration-dependent line peak-response table."""
+
+    if n_samples is None:
+        n_samples = int(round(2.0 * t_obs * 1024.0))
+    filename = Path(f"lookup_peak_{int(round(t_obs))}_{tukey_rise:.2f}.dat")
+    if not filename.exists():
+        print(f"{filename} not found; generating windowed Lorentzian peak-response table")
+        if not SCIPY_AVAILABLE:
+            print("warning: scipy is not available; falling back to slow np.convolve peak generation")
+        peak_template = generate_lorentzian_peak_lookup(
+            t_obs, tukey_rise, nf, nnu, wdth, numin, numax, n_samples
+        )
+        with filename.open("w", encoding="utf-8") as handle:
+            handle.write(f"{nf} {nnu} {wdth} {numin:e} {numax:e}\n")
+            for value in peak_template.reshape(-1):
+                handle.write(f"{value:.16e}\n")
+        return peak_template
+
+    with filename.open("r", encoding="utf-8") as handle:
+        header = handle.readline().split()
+    file_nf = int(header[0])
+    file_nnu = int(header[1])
+    file_wdth = int(header[2])
+    file_numin = float(header[3])
+    file_numax = float(header[4])
+    if (file_nf != nf or file_nnu != nnu or file_wdth != wdth
+            or not math.isclose(file_numin, numin) or not math.isclose(file_numax, numax)):
+        raise ValueError(f"{filename} metadata do not match the Lorentzian lookup table")
+    values = np.loadtxt(filename, dtype=np.float64, skiprows=1)
+    expected = (nf + 1) * (nnu + 1)
+    if values.size != expected:
+        raise ValueError(f"{filename} has {values.size} peak values; expected {expected}")
+    return values.reshape((nf + 1, nnu + 1))
+
+
 def attach_lorentzian_lookup(lines: LorentzianParams, data: DataParams) -> None:
     """Attach the lookup metadata and table to the active line model."""
 
@@ -1285,6 +1541,17 @@ def attach_lorentzian_lookup(lines: LorentzianParams, data: DataParams) -> None:
     lines.lnumin = math.log(numin)
     lines.lnumax = math.log(numax)
     lines.ltemplate = ltemplate
+
+
+def attach_lorentzian_peak_lookup(lines: LorentzianParams, data: DataParams) -> None:
+    """Attach the raw-to-windowed peak response used for duration projection."""
+
+    if lines.peak_template is not None:
+        return
+    lines.peak_template = load_lorentzian_peak_lookup(
+        data.t_obs, lines.nf, lines.nnu, lines.wdth,
+        lines.numin, lines.numax, n_samples=data.n
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1799,6 +2066,7 @@ def write_whitened_line_subtracted_files(bayesline: BayesLineParams,
     data = bayesline.data
     n = data.n
     n_half = n // 2
+    background = bayesline_background_psd(bayesline)
 
     cleaned_real = np.zeros(n_half + 1, dtype=np.float64)
     cleaned_imag = np.zeros(n_half + 1, dtype=np.float64)
@@ -1811,14 +2079,14 @@ def write_whitened_line_subtracted_files(bayesline: BayesLineParams,
 
     seed_noglitch = int(rng.integers(1, 2**31 - 1))
     white_noglitch = whiten_line_subtracted_numba(
-        cleaned_real, cleaned_imag, bayesline.Sbase, bayesline.Sline, bayesline.Snf,
+        cleaned_real, cleaned_imag, background, bayesline.Sline, bayesline.Snf,
         data.imin, data.imax, data.t_obs, seed_noglitch
     )
     np.savetxt("whitelsf_noglitch.dat", white_noglitch)
 
     seed_raw = int(rng.integers(1, 2**31 - 1))
     white_raw = whiten_line_subtracted_numba(
-        original_real, original_imag, bayesline.Sbase, bayesline.Sline, bayesline.Snf,
+        original_real, original_imag, background, bayesline.Sline, bayesline.Snf,
         data.imin, data.imax, data.t_obs, seed_raw
     )
     np.savetxt("whitelsf.dat", white_raw)
@@ -1848,6 +2116,7 @@ def write_time_domain_line_subtracted_files(bayesline: BayesLineParams,
     data = bayesline.data
     n = data.n
     n_half = n // 2
+    background = bayesline_background_psd(bayesline)
 
     cleaned_real = np.zeros(n_half + 1, dtype=np.float64)
     cleaned_imag = np.zeros(n_half + 1, dtype=np.float64)
@@ -1860,7 +2129,7 @@ def write_time_domain_line_subtracted_files(bayesline: BayesLineParams,
 
     seed_raw = int(rng.integers(1, 2**31 - 1))
     raw_real, raw_imag = line_subtracted_scaled_numba(
-        original_real, original_imag, bayesline.Sbase, bayesline.Sline, bayesline.Snf,
+        original_real, original_imag, background, bayesline.Sline, bayesline.Snf,
         data.imin, data.imax, seed_raw
     )
     raw_time = scaled_rfft_to_time(raw_real, raw_imag, dt, n)
@@ -1869,12 +2138,41 @@ def write_time_domain_line_subtracted_files(bayesline: BayesLineParams,
 
     seed_noglitch = int(rng.integers(1, 2**31 - 1))
     noglitch_real, noglitch_imag = line_subtracted_scaled_numba(
-        cleaned_real, cleaned_imag, bayesline.Sbase, bayesline.Sline, bayesline.Snf,
+        cleaned_real, cleaned_imag, background, bayesline.Sline, bayesline.Snf,
         data.imin, data.imax, seed_noglitch
     )
     noglitch_time = scaled_rfft_to_time(noglitch_real, noglitch_imag, dt, n)
     np.savetxt("line_subtracted_noglitch_time.dat", np.column_stack((times, noglitch_time)))
     print("Wrote line_subtracted_noglitch_time.dat; WARNING: Tukey roll-off remains in the time-domain data")
+
+
+def write_line_subtracted_frequency_file(bayesline: BayesLineParams,
+                                         original_fft: np.ndarray,
+                                         dt: float,
+                                         rng: np.random.Generator,
+                                         output_file: str = "freq_nolines.dat") -> None:
+    """Write original tapered FFT data after final fair-draw Lorentzian subtraction."""
+
+    assert bayesline.data is not None
+    assert bayesline.Sbase is not None and bayesline.Sline is not None and bayesline.Snf is not None
+    data = bayesline.data
+    n = data.n
+    n_half = n // 2
+    background = bayesline_background_psd(bayesline)
+
+    original_scaled = original_fft * (dt / math.sqrt(2.0))
+    original_real = original_scaled.real.astype(np.float64, copy=True)
+    original_imag = original_scaled.imag.astype(np.float64, copy=True)
+
+    seed = int(rng.integers(1, 2**31 - 1))
+    out_real, out_imag = line_subtracted_scaled_numba(
+        original_real, original_imag, background, bayesline.Sline, bayesline.Snf,
+        data.imin, data.imax, seed
+    )
+
+    freqs = np.arange(1, n_half, dtype=np.float64) / data.t_obs
+    np.savetxt(output_file, np.column_stack((freqs, out_real[1:n_half], out_imag[1:n_half])))
+    print(f"Wrote {output_file} from original tapered data with final Lorentzian lines subtracted")
 
 
 def write_glitch_time_domain_files(times: np.ndarray, raw_time_data: np.ndarray,
@@ -1909,6 +2207,299 @@ def write_whitened_feature_file(times: np.ndarray, raw_time_data: np.ndarray,
     feature = extract_whitened_feature(whitened_glitch_fft, raw_time_data.size * dt, snr_thresh)
     np.savetxt("whitened_feature_time.dat", np.column_stack((times, feature)))
     print("Wrote whitened_feature_time.dat")
+
+
+def complex_geometric_sum(theta: np.ndarray, start: int, count: int) -> np.ndarray:
+    """Sum exp(i*theta*n) for n=start...start+count-1, vectorized in theta."""
+
+    theta = np.asarray(theta, dtype=np.float64)
+    out = np.zeros(theta.shape, dtype=np.complex128)
+    if count <= 0:
+        return out
+    center = start + 0.5 * (count - 1)
+    half_theta = 0.5 * theta
+    denom = np.sin(half_theta)
+    near = np.abs(denom) < 1.0e-12
+    if np.any(near):
+        out[near] = count * np.exp(1j * theta[near] * center)
+    if np.any(~near):
+        far = ~near
+        out[far] = (
+            np.exp(1j * theta[far] * center)
+            * np.sin(0.5 * count * theta[far])
+            / denom[far]
+        )
+    return out
+
+
+def tukey_window_dft_offsets(offsets: np.ndarray, n: int, alpha: float) -> np.ndarray:
+    """Exact DFT of BWtest's Tukey window at fractional bin offsets.
+
+    For a complex sinusoid at frequency ``f0``, the rfft coefficient at bin
+    ``k`` after applying the Tukey window is this function evaluated at
+    ``offset = f0*Tobs - k``. This avoids doing a full FFT for every trial
+    sinusoid in the line-by-line sinefit diagnostic.
+    """
+
+    offsets = np.asarray(offsets, dtype=np.float64)
+    theta = TPI * offsets / float(n)
+    imin = int(alpha * (n - 1.0) / 2.0)
+    imax = int((n - 1.0) * (1.0 - alpha / 2.0))
+    nwin = n - imax
+
+    if imin <= 0 or nwin <= 0:
+        return complex_geometric_sum(theta, 0, n)
+
+    total = np.zeros(offsets.shape, dtype=np.complex128)
+
+    # Leading roll-off: 0.5*(1 - cos(pi*n/imin)).
+    beta = math.pi / float(imin)
+    total += 0.5 * complex_geometric_sum(theta, 0, imin)
+    total -= 0.25 * complex_geometric_sum(theta + beta, 0, imin)
+    total -= 0.25 * complex_geometric_sum(theta - beta, 0, imin)
+
+    # Flat section, including the samples at imin and imax, matching tukey_inplace.
+    mid_start = imin
+    mid_count = max(0, imax - imin + 1)
+    total += complex_geometric_sum(theta, mid_start, mid_count)
+
+    # Trailing roll-off: 0.5*(1 + cos(pi*(n-imax)/nwin)).
+    tail_start = imax + 1
+    tail_count = max(0, n - tail_start)
+    if tail_count > 0:
+        beta = math.pi / float(nwin)
+        phase = -beta * imax
+        total += 0.5 * complex_geometric_sum(theta, tail_start, tail_count)
+        total += 0.25 * np.exp(1j * phase) * complex_geometric_sum(theta + beta, tail_start, tail_count)
+        total += 0.25 * np.exp(-1j * phase) * complex_geometric_sum(theta - beta, tail_start, tail_count)
+
+    return total
+
+
+def sinefit(bayesline: BayesLineParams, n: int, alpha: float,
+            output_file: str = "sinefit.dat",
+            scan_points: int = SINEFIT_SCAN_POINTS) -> np.ndarray:
+    """Match each reconstructed Lorentzian line to a Tukey-windowed sinusoid.
+
+    The comparison is intentionally model-only for this first pass: the
+    reconstructed line is the same local windowed-Lorentzian power profile used
+    in the BayesLine line model, and the sinusoid is represented by the power
+    profile of a Tukey-windowed pure tone. Inner products use the final
+    broadband non-line PSD as the local noise model.
+    """
+
+    if bayesline.data is None or bayesline.lines_x is None:
+        raise RuntimeError("BayesLine state is not initialized")
+    lines = bayesline.lines_x
+    if bayesline.Sbase is None:
+        raise RuntimeError("Smooth PSD is not available for sinefit weighting")
+    if lines.ltemplate is None:
+        raise RuntimeError("Lorentzian lookup table has not been loaded")
+    if scan_points < 1:
+        raise ValueError("scan_points must be positive")
+
+    nlines = int(lines.n)
+    rows = np.zeros((nlines, 6), dtype=np.float64)
+    if nlines == 0:
+        np.savetxt(
+            output_file,
+            rows,
+            header="line_frequency line_width sinusoid_frequency line_SNR residual_SNR mismatch",
+        )
+        print(f"Wrote {output_file} with 0 sinefit matches")
+        return rows
+
+    data = bayesline.data
+    t_obs = data.t_obs
+    n_half = n // 2
+    smooth = np.maximum(bayesline_background_psd(bayesline), np.finfo(float).tiny)
+    order = np.argsort(lines.f[:nlines])
+    scan_axis = np.array([0.0], dtype=np.float64)
+    if scan_points > 1:
+        scan_axis = np.linspace(-1.0, 1.0, scan_points, dtype=np.float64)
+
+    out_row = 0
+    for idx in order:
+        f_line = float(lines.f[idx])
+        nu = float(lines.nu[idx])
+        amp = float(lines.a[idx])
+        if not (math.isfinite(f_line) and math.isfinite(nu)) or f_line <= 0.0 or nu <= 0.0:
+            rows[out_row] = (f_line, nu, f_line, 0.0, 0.0, 1.0)
+            out_row += 1
+            continue
+
+        k_center, lorentz_power = local_lorentzian_template(
+            t_obs, lines.nf, lines.nnu, lines.wdth, lines.lnumin, lines.lnumax,
+            lines.ltemplate, f_line, amp, nu
+        )
+        start = k_center - lines.wdth // 2
+        bins_all = start + np.arange(lines.wdth, dtype=np.int64)
+        valid = (
+            (bins_all > 0) & (bins_all < n_half)
+            & (bins_all >= data.imin) & (bins_all < data.imax)
+        )
+        if not np.any(valid):
+            rows[out_row] = (f_line, nu, f_line, 0.0, 0.0, 1.0)
+            out_row += 1
+            continue
+
+        bins_int = bins_all[valid]
+        bins = bins_int.astype(np.float64)
+        lorentz = np.maximum(lorentz_power[valid], 0.0)
+        weight = 1.0 / (smooth[bins_int - data.imin] * smooth[bins_int - data.imin])
+        lorentz_norm = float(np.dot(weight * lorentz, lorentz))
+        line_snr = math.sqrt(max(lorentz_norm, 0.0))
+        if lorentz_norm <= 0.0:
+            rows[out_row] = (f_line, nu, f_line, 0.0, 0.0, 1.0)
+            out_row += 1
+            continue
+
+        best_freq = f_line
+        best_match = 0.0
+        half_scan = 0.5 * nu
+        for fs in f_line + half_scan * scan_axis:
+            if fs <= 0.0 or fs >= n_half / t_obs:
+                continue
+            offsets = fs * t_obs - bins
+            sine_power = np.abs(tukey_window_dft_offsets(offsets, n, alpha)) ** 2
+            sine_norm = float(np.dot(weight * sine_power, sine_power))
+            if sine_norm <= 0.0:
+                continue
+            match = float(np.dot(weight * lorentz, sine_power) / math.sqrt(lorentz_norm * sine_norm))
+            if match > best_match:
+                best_match = min(match, 1.0)
+                best_freq = float(fs)
+
+        residual_snr = line_snr * math.sqrt(max(0.0, 1.0 - best_match * best_match))
+        rows[out_row] = (
+            f_line, nu, best_freq, line_snr, residual_snr,
+            max(0.0, 1.0 - best_match)
+        )
+        out_row += 1
+
+    np.savetxt(
+        output_file,
+        rows,
+        header="line_frequency line_width sinusoid_frequency line_SNR residual_SNR mismatch",
+    )
+    print(f"Wrote {output_file} with {nlines:d} sinefit matches")
+    return rows
+
+
+def tukeyed_real_sinusoid_scaled_templates(frequency: float, bins: np.ndarray,
+                                           n: int, t_obs: float,
+                                           alpha: float) -> Tuple[np.ndarray, np.ndarray]:
+    """Return scaled rfft templates for unit cosine and sine at one frequency."""
+
+    offsets_plus = frequency * t_obs - bins
+    offsets_minus = -frequency * t_obs - bins
+    wplus = tukey_window_dft_offsets(offsets_plus, n, alpha)
+    wminus = tukey_window_dft_offsets(offsets_minus, n, alpha)
+    scale = (t_obs / float(n)) / math.sqrt(2.0)
+    cos_template = 0.5 * (wplus + wminus) * scale
+    sin_template = (wplus - wminus) / (2.0j) * scale
+    return cos_template, sin_template
+
+
+def fit_tukeyed_sinusoid_to_band(data_band: np.ndarray, weight: np.ndarray,
+                                 frequency: float, bins: np.ndarray,
+                                 n: int, t_obs: float, alpha: float) -> Tuple[float, float, np.ndarray, float]:
+    """Fit cosine/sine coefficients for a Tukey-windowed sinusoid in one band."""
+
+    cos_template, sin_template = tukeyed_real_sinusoid_scaled_templates(
+        frequency, bins, n, t_obs, alpha
+    )
+    cc = float(np.real(np.sum(weight * np.conj(cos_template) * cos_template)))
+    ss = float(np.real(np.sum(weight * np.conj(sin_template) * sin_template)))
+    cs = float(np.real(np.sum(weight * np.conj(cos_template) * sin_template)))
+    rc = float(np.real(np.sum(weight * np.conj(cos_template) * data_band)))
+    rs = float(np.real(np.sum(weight * np.conj(sin_template) * data_band)))
+
+    det = cc * ss - cs * cs
+    if det <= np.finfo(float).tiny:
+        empty = np.zeros_like(data_band)
+        return 0.0, 0.0, empty, 0.0
+
+    ccoef = (rc * ss - rs * cs) / det
+    scoef = (cc * rs - cs * rc) / det
+    model = ccoef * cos_template + scoef * sin_template
+    snr2 = max(float(np.real(np.sum(weight * np.conj(model) * model))), 0.0)
+    return ccoef, scoef, model, snr2
+
+
+def write_sine_subtracted_frequency_file(bayesline: BayesLineParams,
+                                         original_fft: np.ndarray,
+                                         dt: float,
+                                         n: int, alpha: float,
+                                         output_file: str = "freq_nosine.dat",
+                                         scan_points: int = SINEFIT_SCAN_POINTS) -> None:
+    """Write original tapered FFT data with best-fit Tukeyed sinusoids subtracted."""
+
+    if bayesline.data is None or bayesline.lines_x is None:
+        raise RuntimeError("BayesLine state is not initialized")
+    if bayesline.Sbase is None:
+        raise RuntimeError("Smooth PSD is not available for sinusoid subtraction")
+    lines = bayesline.lines_x
+    if lines.ltemplate is None:
+        raise RuntimeError("Lorentzian lookup table has not been loaded")
+
+    data = bayesline.data
+    t_obs = data.t_obs
+    n_half = n // 2
+    original_scaled = original_fft * (dt / math.sqrt(2.0))
+    residual = np.zeros(n_half + 1, dtype=np.complex128)
+    residual[1:n_half] = original_scaled[1:n_half]
+    smooth = np.maximum(bayesline_background_psd(bayesline), np.finfo(float).tiny)
+    scan_axis = np.array([0.0], dtype=np.float64)
+    if scan_points > 1:
+        scan_axis = np.linspace(-1.0, 1.0, scan_points, dtype=np.float64)
+
+    nfit = 0
+    order = np.argsort(lines.f[:lines.n])
+    for idx in order:
+        f_line = float(lines.f[idx])
+        nu = float(lines.nu[idx])
+        if not (math.isfinite(f_line) and math.isfinite(nu)) or f_line <= 0.0 or nu <= 0.0:
+            continue
+
+        k_center, _line_shape = local_lorentzian_template(
+            t_obs, lines.nf, lines.nnu, lines.wdth, lines.lnumin, lines.lnumax,
+            lines.ltemplate, f_line, 1.0, nu
+        )
+        start = k_center - lines.wdth // 2
+        bins_all = start + np.arange(lines.wdth, dtype=np.int64)
+        valid = (
+            (bins_all > 0) & (bins_all < n_half)
+            & (bins_all >= data.imin) & (bins_all < data.imax)
+        )
+        if not np.any(valid):
+            continue
+
+        bins_int = bins_all[valid]
+        bins = bins_int.astype(np.float64)
+        weight = 1.0 / smooth[bins_int - data.imin]
+        data_band = residual[bins_int]
+        best_model = np.zeros_like(data_band)
+        best_snr2 = -1.0
+        half_scan = 0.5 * nu
+
+        for fs in f_line + half_scan * scan_axis:
+            if fs <= 0.0 or fs >= n_half / t_obs:
+                continue
+            _ccoef, _scoef, model, snr2 = fit_tukeyed_sinusoid_to_band(
+                data_band, weight, float(fs), bins, n, t_obs, alpha
+            )
+            if snr2 > best_snr2:
+                best_snr2 = snr2
+                best_model = model
+
+        if best_snr2 > 0.0:
+            residual[bins_int] -= best_model
+            nfit += 1
+
+    freqs = np.arange(1, n_half, dtype=np.float64) / t_obs
+    np.savetxt(output_file, np.column_stack((freqs, residual[1:n_half].real, residual[1:n_half].imag)))
+    print(f"Wrote {output_file} after subtracting {nfit:d} fitted Tukeyed sinusoids")
 
 
 def lineget_candidates(power: np.ndarray, smooth: np.ndarray, freqs: np.ndarray,
@@ -2257,9 +2848,10 @@ def spline_eval_one(points: np.ndarray, values: np.ndarray, xq: float, spline_fl
 
 def spline_proposal_update(prop_points: np.ndarray, prop_sdata: np.ndarray,
                            freq: np.ndarray, data: DataParams,
-                           sbase: np.ndarray, sline: np.ndarray, snx: np.ndarray,
+                           sbase: np.ndarray, fixed_psd: np.ndarray, snx: np.ndarray,
                            power: np.ndarray, logLx: float, spline_flag: int,
-                           changed_index: int) -> Tuple[np.ndarray, np.ndarray, Optional[float], int, int]:
+                           changed_index: int,
+                           compute_loglike: bool = True) -> Tuple[np.ndarray, np.ndarray, Optional[float], int, int]:
     """Build a proposed PSD after a spline move, using local Akima updates.
 
     The Akima branch mirrors BayesLine.c: changing one spline knot only affects
@@ -2269,7 +2861,7 @@ def spline_proposal_update(prop_points: np.ndarray, prop_sdata: np.ndarray,
 
     if spline_flag != 1 or changed_index < 0:
         sbase_prop = np.exp(spline_eval_array(prop_points, prop_sdata, freq, spline_flag))
-        return sbase_prop, sbase_prop + sline, None, 0, freq.size
+        return sbase_prop, sbase_prop + fixed_psd, None, 0, freq.size
 
     imin, imax = getrangeakima_numba(changed_index, prop_points.size, prop_points,
                                      data.t_obs, data.ncut)
@@ -2279,8 +2871,10 @@ def spline_proposal_update(prop_points: np.ndarray, prop_sdata: np.ndarray,
         sbase_prop[imin:imax] = np.exp(
             akima_eval_array(prop_points, prop_sdata, prop_points.size, freq[imin:imax])
         )
-        sn_prop[imin:imax] = sbase_prop[imin:imax] + sline[imin:imax]
-    logLy_local = logLx + delta_loglike_range(power, sn_prop, snx, imin, imax)
+        sn_prop[imin:imax] = sbase_prop[imin:imax] + fixed_psd[imin:imax]
+    logLy_local = None
+    if compute_loglike:
+        logLy_local = logLx + delta_loglike_range(power, sn_prop, snx, imin, imax)
     return sbase_prop, sn_prop, logLy_local, imin, imax
 
 
@@ -2300,6 +2894,12 @@ def create_lorentzianParams(size: int) -> LorentzianParams:
     """Allocate a Lorentzian line container."""
 
     return LorentzianParams(size=size)
+
+
+def create_gaussianBumpParams(size: int) -> GaussianBumpParams:
+    """Allocate a broad Gaussian bump container."""
+
+    return GaussianBumpParams(size=size)
 
 
 def full_spectrum_spline(Sline: np.ndarray, data: DataParams, lines: LorentzianParams) -> None:
@@ -2341,6 +2941,30 @@ def rjden(model: float, ref: float, sp: float, prange: float) -> float:
     return math.log(0.4 / prange + 0.6 / (sp * math.sqrt(TPI)) * math.exp(-0.5 * u * u))
 
 
+def spline_spacing_birth_log_factor(current_n: int, flow: float, fhigh: float, dfmin: float) -> float:
+    """RJ factor for the normalized ordered-knot prior with minimum spacing.
+
+    Birth proposes a new knot uniformly over the full frequency interval and
+    rejects configurations that violate dfmin.  The normalized prior volume of
+    K ordered knots with fixed endpoints and gap dfmin is proportional to
+    (L - (K - 1) dfmin)^(K - 2)/(K - 2)!, so birth/death moves need the volume
+    ratio below.  It is unity when dfmin is zero.
+    """
+
+    if dfmin <= 0.0:
+        return 0.0
+    span = fhigh - flow
+    if current_n < 2 or span <= 0.0:
+        return -math.inf
+    old_free = span - float(current_n - 1) * dfmin
+    new_free = span - float(current_n) * dfmin
+    if old_free <= 0.0 or new_free <= 0.0:
+        return -math.inf
+    return (math.log(span)
+            + float(current_n - 2) * math.log(old_free)
+            - float(current_n - 1) * math.log(new_free))
+
+
 def draw_line_frequency(fprop: np.ndarray, data: DataParams, rng: np.random.Generator) -> float:
     """Draw a line frequency from the burn-in line proposal histogram."""
 
@@ -2362,10 +2986,47 @@ def line_proposal_log_density(f: float, fprop: np.ndarray, data: DataParams) -> 
     return math.log(p)
 
 
+def gaussian_bump_amplitude_bounds(priors: BayesLinePriors, sbase: np.ndarray,
+                                   flow: float, t_obs: float, ncut: int,
+                                   f0: float) -> Tuple[float, float]:
+    """Return the local log-uniform amplitude bounds for a Gaussian bump."""
+
+    ji = min(max(int((f0 - flow) * t_obs), 0), ncut - 1)
+    if priors.lower is not None:
+        lower = max(float(priors.lower[ji]), np.finfo(float).tiny)
+    else:
+        lower = max(float(sbase[ji]) / 10.0, np.finfo(float).tiny)
+    return lower, lower * 100.0
+
+
+def draw_gaussian_bump_from_prior(priors: BayesLinePriors, sbase: np.ndarray,
+                                  flow: float, fhigh: float, t_obs: float,
+                                  ncut: int, sigma_min: float, sigma_max: float,
+                                  rng: np.random.Generator) -> Tuple[float, float, float]:
+    """Draw one broad Gaussian bump from the RJ prior."""
+
+    f0 = flow + (fhigh - flow) * rng.random()
+    amin, amax = gaussian_bump_amplitude_bounds(priors, sbase, flow, t_obs, ncut, f0)
+    amp = math.exp(math.log(amin) + math.log(amax / amin) * rng.random())
+    sigma = math.exp(math.log(sigma_min) + math.log(sigma_max / sigma_min) * rng.random())
+    return f0, amp, sigma
+
+
+def bayesline_background_psd(bayesline: BayesLineParams) -> np.ndarray:
+    """Return the non-line PSD background: spline plus optional Gaussian bumps."""
+
+    if bayesline.Sbase is None:
+        raise RuntimeError("Smooth PSD is not available")
+    if bayesline.Sgauss is None:
+        return bayesline.Sbase
+    return bayesline.Sbase + bayesline.Sgauss
+
+
 def BayesLineSetup(bptr: BayesLineParams, freqData: np.ndarray, fmin: float, fmax: float, deltaT: float, Tobs: float) -> None:
     """Allocate BayesLine state and attach the duration-specific line lookup."""
 
     bptr.maxBLLines = line_array_size_for_duration(Tobs)
+    bptr.maxBLBumps = gaussian_bump_array_size_for_duration(Tobs)
     n = freqData.size
     freq = np.arange(n // 2, dtype=np.float64) / Tobs
     power = np.zeros(n // 2, dtype=np.float64)
@@ -2380,25 +3041,53 @@ def BayesLineSetup(bptr: BayesLineParams, freqData: np.ndarray, fmin: float, fma
     bptr.sfreq = bptr.freq.copy()
     bptr.Sbase = robust_smooth(bptr.power)
     bptr.Sline = np.zeros_like(bptr.Sbase)
-    bptr.Snf = bptr.Sbase.copy()
+    bptr.Sgauss = np.zeros_like(bptr.Sbase)
+    bptr.Snf = bptr.Sbase + bptr.Sline + bptr.Sgauss
     bptr.Sna = bptr.Snf.copy()
     bptr.fa = bptr.freq.copy()
     bptr.lines_x = create_lorentzianParams(bptr.maxBLLines)
+    bptr.bumps_x = create_gaussianBumpParams(bptr.maxBLBumps)
     attach_lorentzian_lookup(bptr.lines_x, data)
-    knot_step = max(1, int(round(FSTEP * Tobs)))
+    knot_step = max(1, int(round(data.fgrid * Tobs)))
     knot_idx = np.arange(0, data.ncut, knot_step, dtype=np.int64)
     if knot_idx.size == 0 or knot_idx[-1] != data.ncut - 1:
         knot_idx = np.append(knot_idx, data.ncut - 1)
     bptr.spline = SplineParams(points=bptr.freq[knot_idx], data=np.log(np.maximum(bptr.Sbase[knot_idx], np.finfo(float).tiny)))
     bptr.spline_x = SplineParams(points=bptr.spline.points.copy(), data=bptr.spline.data.copy())
+    bptr.maxSplineKnots = bptr.spline.n
     _ = deltaT
+
+
+def adapt_post_startup_model_caps(bayesline: BayesLineParams) -> None:
+    """Set RJMCMC line/knot caps from the initialized model dimensions."""
+
+    assert bayesline.lines_x is not None
+    assert bayesline.spline_x is not None
+
+    initialized_lines = int(bayesline.lines_x.n)
+    initialized_knots = int(bayesline.spline_x.n)
+    line_cap = 2 * initialized_lines
+    spline_cap = 2 * initialized_knots
+
+    bayesline.lines_x.size = line_cap
+    bayesline.maxBLLines = line_cap
+    bayesline.maxSplineKnots = spline_cap
+    print(
+        "Adaptive RJMCMC caps from startup: "
+        f"max lines {line_cap} (startup {initialized_lines}), "
+        f"max spline knots {spline_cap} (startup {initialized_knots})"
+    )
 
 
 def BayesLineInitialize(bayesline: BayesLineParams) -> None:
     """Initialize combined PSD arrays before burn-in or sampling."""
 
     if bayesline.Sbase is not None:
-        bayesline.Snf = bayesline.Sbase + bayesline.Sline
+        if bayesline.Sline is None:
+            bayesline.Sline = np.zeros_like(bayesline.Sbase)
+        if bayesline.Sgauss is None:
+            bayesline.Sgauss = np.zeros_like(bayesline.Sbase)
+        bayesline.Snf = bayesline.Sbase + bayesline.Sline + bayesline.Sgauss
 
 
 def blstart(line: LorentzianParams, data: np.ndarray, residual: np.ndarray, n: int, dt: float,
@@ -2461,7 +3150,13 @@ def BayesLineBurnin(bayesline: BayesLineParams, timeData: np.ndarray, freqData: 
     bayesline.Sbase = np.exp(spline_eval_array(bayesline.spline_x.points, bayesline.spline_x.data,
                                                bayesline.freq, 1))
     full_spectrum_spline(bayesline.Sline, data, bayesline.lines_x)
-    bayesline.Snf = bayesline.Sbase + bayesline.Sline
+    if bayesline.Sgauss is None or bayesline.Sgauss.size != bayesline.Sbase.size:
+        bayesline.Sgauss = np.zeros_like(bayesline.Sbase)
+    else:
+        bayesline.Sgauss.fill(0.0)
+    if bayesline.bumps_x is not None:
+        bayesline.bumps_x.n = 0
+    bayesline.Snf = bayesline.Sbase + bayesline.Sline + bayesline.Sgauss
     if write_start:
         np.savetxt(BL_START_FILENAME, np.column_stack((bayesline.freq, bayesline.power,
                                                        bayesline.Sbase, bayesline.Sline)))
@@ -2487,18 +3182,22 @@ def BayesLineBurnin(bayesline: BayesLineParams, timeData: np.ndarray, freqData: 
     bayesline.priors.upper = (bayesline.Sbase + 100.0 * bayesline.Sline) * 10.0
     bayesline.priors.upper = np.maximum(bayesline.priors.upper, bayesline.priors.lower * 100.0)
 
-    full_freq = np.arange(data.n // 2, dtype=np.float64) / data.t_obs
     np.savetxt("start_psd_bw.dat", np.column_stack((bayesline.freq, bayesline.Snf)))
     np.savetxt("spline.dat", np.column_stack((bayesline.spline.points, np.exp(bayesline.spline.data))))
-    np.savetxt("freq_nolines.dat", np.column_stack((full_freq[1:], freqData[2:data.n:2], freqData[3:data.n + 1:2])))
 
 
 def BayesLineLorentzSplineMCMC(bayesline: BayesLineParams, heat: float, steps: int,
                                priorFlag: int, dan: list[float], fprop: np.ndarray,
                                SplineFlag: int,
                                psd_samples: Optional[np.ndarray] = None,
-                               spline_samples: Optional[np.ndarray] = None) -> int:
-    """Main reversible-jump sampler for spline knots and Lorentzian lines."""
+                               spline_samples: Optional[np.ndarray] = None,
+                               gaussian_samples: Optional[np.ndarray] = None,
+                               count_trace: Optional[np.ndarray] = None,
+                               line_trim: bool = False,
+                               gaussian_bumps: bool = False,
+                               projection_target: Optional[BayesLineParams] = None,
+                               projection_scale: float = 1.0) -> int:
+    """Main reversible-jump sampler for spline knots, Lorentzians, and optional Gaussian bumps."""
 
     assert bayesline.data is not None
     assert bayesline.lines_x is not None
@@ -2512,6 +3211,7 @@ def BayesLineLorentzSplineMCMC(bayesline: BayesLineParams, heat: float, steps: i
     rng = bayesline.rng
     data = bayesline.data
     lines = bayesline.lines_x
+    bumps = bayesline.bumps_x
     spline = bayesline.spline_x
     freq = bayesline.freq
     power = bayesline.power
@@ -2522,6 +3222,14 @@ def BayesLineLorentzSplineMCMC(bayesline: BayesLineParams, heat: float, steps: i
     t_obs = data.t_obs
     ncut = data.ncut
     tmax = lines.size
+    spline_tmax = bayesline.maxSplineKnots if bayesline.maxSplineKnots > 0 else spline.n
+    gaussian_enabled = bool(gaussian_bumps)
+    if gaussian_enabled and bumps is None:
+        raise RuntimeError("Gaussian bumps were requested but no bump container is allocated")
+    sigma_min = float(bayesline.gaussianSigmaMin)
+    sigma_max = float(bayesline.gaussianSigmaMax)
+    if gaussian_enabled and (sigma_min <= 0.0 or sigma_max <= sigma_min):
+        raise ValueError("Gaussian bump sigma bounds must satisfy 0 < sigma_min < sigma_max")
     if lines.ltemplate is None:
         raise RuntimeError("Lorentzian lookup table has not been loaded")
     numin = lines.numin
@@ -2535,17 +3243,23 @@ def BayesLineLorentzSplineMCMC(bayesline: BayesLineParams, heat: float, steps: i
     sline = sline_from_lookup(ncut, data.imin, t_obs, lines.nf, lines.nnu, lines.wdth,
                               lines.lnumin, lines.lnumax, lines.ltemplate,
                               lines.f, lines.a, lines.nu, lines.n)
-    snx = sbase + sline
+    if gaussian_enabled and bumps is not None:
+        sgauss = gaussian_bumps_from_params(freq, bumps)
+    else:
+        sgauss = np.zeros(ncut, dtype=np.float64)
+        if bumps is not None and not gaussian_enabled:
+            bumps.n = 0
+    snx = sbase + sline + sgauss
     logLx = 1.0 if bayesline.constantLogLFlag else loglike(power, snx)
     logPsx = logprior_bounds(priors, snx) if priorFlag == 1 else 0.0
 
-    ac = np.zeros(6, dtype=np.int64)
-    cc = np.ones(6, dtype=np.int64)
+    ac = np.zeros(8, dtype=np.int64)
+    cc = np.ones(8, dtype=np.int64)
     fweights = np.maximum(fprop[:ncut], np.finfo(float).tiny)
     if np.sum(fweights) <= 0.0:
         fweights[:] = 1.0
     fprop[:ncut] = fweights / np.sum(fweights)
-    shiftval = max(1.0 / t_obs, min(2.0, 2.0 * rng.random()))
+    shiftval = max(1.0 / t_obs, min(DFMIN, DFMIN * rng.random()))
     sample_count = 0
     sample_target = 0 if psd_samples is None else int(psd_samples.shape[0])
     sample_start = steps // 2
@@ -2565,21 +3279,35 @@ def BayesLineLorentzSplineMCMC(bayesline: BayesLineParams, heat: float, steps: i
         prop_f = lines.f[:lines.n]
         prop_a = lines.a[:lines.n]
         prop_nu = lines.nu[:lines.n]
+        prop_nbump = 0 if bumps is None else bumps.n
+        prop_bf = np.empty(0, dtype=np.float64) if bumps is None else bumps.f[:bumps.n]
+        prop_ba = np.empty(0, dtype=np.float64) if bumps is None else bumps.a[:bumps.n]
+        prop_bs = np.empty(0, dtype=np.float64) if bumps is None else bumps.sigma[:bumps.n]
         sn_prop = None
         sbase_prop = sbase
         sline_prop = sline
+        sgauss_prop = sgauss
         logLy_local = None
+        spline_dimension_log_factor = 0.0
         proposal_ilow = 0
         proposal_ihigh = ncut
         spline_changed_index = -1
 
-        if rng.random() > 0.5:
+        if gaussian_enabled and bumps is not None and bumps.size > 0:
+            proposal_selector = rng.random()
+            choose_spline = proposal_selector < (1.0 / 3.0)
+            choose_bump = proposal_selector >= (2.0 / 3.0)
+        else:
+            choose_spline = rng.random() > 0.5
+            choose_bump = False
+
+        if choose_spline:
             alpha = rng.random()
             if alpha > 0.5:
                 lbl = 0
                 if rng.random() > 0.5:
                     typ = 5
-                    if spline.n >= 7 and spline.n < max(8, bayesline.spline.n if bayesline.spline else spline.n + 1):
+                    if spline.n >= 7 and spline.n < spline_tmax:
                         newfreq = flow + (fhigh - flow) * rng.random()
                         mdl = spline_eval_one(spline.points, spline.data, newfreq, SplineFlag)
                         ji = min(max(int((newfreq - flow) * t_obs), 0), ncut - 1)
@@ -2588,6 +3316,11 @@ def BayesLineLorentzSplineMCMC(bayesline: BayesLineParams, heat: float, steps: i
                         sp = max(sp, 1.0e-6)
                         prange = math.log(lower * 100.0) - math.log(lower)
                         newval = rjdraw(mdl, sp, prange, math.log(lower), rng)
+                        spline_dimension_log_factor = spline_spacing_birth_log_factor(
+                            spline.n, flow, fhigh, DFMIN
+                        )
+                        if not math.isfinite(spline_dimension_log_factor):
+                            check = True
                         prop_points = np.append(spline.points, newfreq)
                         prop_sdata = np.append(spline.data, newval)
                         order = np.argsort(prop_points)
@@ -2613,6 +3346,12 @@ def BayesLineLorentzSplineMCMC(bayesline: BayesLineParams, heat: float, steps: i
                         lower = max(priors.lower[ji], np.finfo(float).tiny) if priors.lower is not None else max(sbase[ji] / 10.0, np.finfo(float).tiny)
                         sp = max(abs(math.log(lower)) * 1.0e-3, 1.0e-6)
                         prange = math.log(lower * 100.0) - math.log(lower)
+                        reverse_birth_factor = spline_spacing_birth_log_factor(
+                            spline.n - 1, flow, fhigh, DFMIN
+                        )
+                        if not math.isfinite(reverse_birth_factor):
+                            check = True
+                        spline_dimension_log_factor = -reverse_birth_factor
                         logqx = rjden(mdl, float(spline.data[ki]), sp, prange)
                         logpx = -math.log(prange)
                     else:
@@ -2668,7 +3407,7 @@ def BayesLineLorentzSplineMCMC(bayesline: BayesLineParams, heat: float, steps: i
                         spline_changed_index = ii
 
             if not check:
-                if np.any(np.diff(prop_points) < 2.0):
+                if np.any(np.diff(prop_points) < DFMIN):
                     check = True
                 if prop_points[0] < flow or prop_points[-1] > fhigh:
                     check = True
@@ -2679,10 +3418,135 @@ def BayesLineLorentzSplineMCMC(bayesline: BayesLineParams, heat: float, steps: i
                     if np.any(prop_sdata < low) or np.any(prop_sdata > high):
                         check = True
                 if not check:
+                    fixed_psd = sline + sgauss if gaussian_enabled else sline
                     sbase_prop, sn_prop, logLy_local, proposal_ilow, proposal_ihigh = spline_proposal_update(
-                        prop_points, prop_sdata, freq, data, sbase, sline, snx,
-                        power, logLx, SplineFlag, spline_changed_index
+                        prop_points, prop_sdata, freq, data, sbase, fixed_psd, snx,
+                        power, logLx, SplineFlag, spline_changed_index,
+                        compute_loglike=not bayesline.constantLogLFlag
                     )
+
+        elif choose_bump:
+            assert bumps is not None
+            if rng.random() > 0.5:
+                lbl = 6
+                if rng.random() > 0.5:
+                    typ = 8
+                    if bumps.n < bumps.size:
+                        nf, na, ns = draw_gaussian_bump_from_prior(
+                            priors, sbase, flow, fhigh, t_obs, ncut, sigma_min, sigma_max, rng
+                        )
+                        prop_nbump = bumps.n + 1
+                        prop_bf = np.empty(prop_nbump, dtype=np.float64)
+                        prop_ba = np.empty(prop_nbump, dtype=np.float64)
+                        prop_bs = np.empty(prop_nbump, dtype=np.float64)
+                        prop_bf[:bumps.n] = bumps.f[:bumps.n]
+                        prop_ba[:bumps.n] = bumps.a[:bumps.n]
+                        prop_bs[:bumps.n] = bumps.sigma[:bumps.n]
+                        prop_bf[bumps.n] = nf
+                        prop_ba[bumps.n] = na
+                        prop_bs[bumps.n] = ns
+                        sn_prop = snx.copy()
+                        sgauss_prop = sgauss.copy()
+                        ilow, ihigh = add_gaussian_bump_band_inplace(sn_prop, freq, nf, na, ns, 1.0)
+                        add_gaussian_bump_band_inplace(sgauss_prop, freq, nf, na, ns, 1.0)
+                        proposal_ilow = ilow
+                        proposal_ihigh = ihigh
+                        if ihigh <= ilow:
+                            check = True
+                        elif not bayesline.constantLogLFlag:
+                            logLy_local = logLx + delta_loglike_range(power, sn_prop, snx, ilow, ihigh)
+                    else:
+                        check = True
+                else:
+                    typ = 9
+                    if bumps.n > 0:
+                        ki = int(rng.integers(0, bumps.n))
+                        of = float(bumps.f[ki])
+                        oa = float(bumps.a[ki])
+                        os = float(bumps.sigma[ki])
+                        prop_nbump = bumps.n - 1
+                        prop_bf = np.empty(prop_nbump, dtype=np.float64)
+                        prop_ba = np.empty(prop_nbump, dtype=np.float64)
+                        prop_bs = np.empty(prop_nbump, dtype=np.float64)
+                        if ki > 0:
+                            prop_bf[:ki] = bumps.f[:ki]
+                            prop_ba[:ki] = bumps.a[:ki]
+                            prop_bs[:ki] = bumps.sigma[:ki]
+                        if ki < prop_nbump:
+                            prop_bf[ki:] = bumps.f[ki + 1:bumps.n]
+                            prop_ba[ki:] = bumps.a[ki + 1:bumps.n]
+                            prop_bs[ki:] = bumps.sigma[ki + 1:bumps.n]
+                        sn_prop = snx.copy()
+                        sgauss_prop = sgauss.copy()
+                        ilow, ihigh = add_gaussian_bump_band_inplace(sn_prop, freq, of, oa, os, -1.0)
+                        add_gaussian_bump_band_inplace(sgauss_prop, freq, of, oa, os, -1.0)
+                        proposal_ilow = ilow
+                        proposal_ihigh = ihigh
+                        if ihigh <= ilow:
+                            check = True
+                        elif not bayesline.constantLogLFlag:
+                            logLy_local = logLx + delta_loglike_range(power, sn_prop, snx, ilow, ihigh)
+                    else:
+                        check = True
+            else:
+                lbl = 7
+                typ = 10
+                if bumps.n > 0:
+                    prop_bf = bumps.f[:bumps.n].copy()
+                    prop_ba = bumps.a[:bumps.n].copy()
+                    prop_bs = bumps.sigma[:bumps.n].copy()
+                    ii = int(rng.integers(0, bumps.n))
+                    oldf = float(prop_bf[ii])
+                    olda = float(prop_ba[ii])
+                    olds = float(prop_bs[ii])
+                    if rng.random() > 0.8:
+                        newf, newa, news = draw_gaussian_bump_from_prior(
+                            priors, sbase, flow, fhigh, t_obs, ncut, sigma_min, sigma_max, rng
+                        )
+                    else:
+                        beta = rng.random()
+                        if beta > 0.9:
+                            scale = 1.0
+                        elif beta > 0.6:
+                            scale = 0.4
+                        elif beta > 0.3:
+                            scale = 0.15
+                        else:
+                            scale = 0.05
+                        newf = oldf + rng.normal(0.0, max(0.25 / t_obs, 0.5 * olds) * scale)
+                        newa = olda * math.exp(rng.normal(0.0, scale))
+                        news = olds * math.exp(rng.normal(0.0, 0.5 * scale))
+                    if newf < flow or newf > fhigh or news < sigma_min or news > sigma_max:
+                        check = True
+                    if not check:
+                        amin, amax = gaussian_bump_amplitude_bounds(priors, sbase, flow, t_obs, ncut, newf)
+                        if newa < amin or newa > amax:
+                            check = True
+                    if not check:
+                        prop_bf[ii] = newf
+                        prop_ba[ii] = newa
+                        prop_bs[ii] = news
+                        sn_prop = snx.copy()
+                        sgauss_prop = sgauss.copy()
+                        ilowx, ihighx = add_gaussian_bump_band_inplace(sn_prop, freq, oldf, olda, olds, -1.0)
+                        add_gaussian_bump_band_inplace(sgauss_prop, freq, oldf, olda, olds, -1.0)
+                        ilowy, ihighy = add_gaussian_bump_band_inplace(sn_prop, freq, newf, newa, news, 1.0)
+                        add_gaussian_bump_band_inplace(sgauss_prop, freq, newf, newa, news, 1.0)
+                        if ihighx <= ilowx:
+                            proposal_ilow = ilowy
+                            proposal_ihigh = ihighy
+                        elif ihighy <= ilowy:
+                            proposal_ilow = ilowx
+                            proposal_ihigh = ihighx
+                        else:
+                            proposal_ilow = min(ilowx, ilowy)
+                            proposal_ihigh = max(ihighx, ihighy)
+                        if proposal_ihigh <= proposal_ilow:
+                            check = True
+                        elif not bayesline.constantLogLFlag:
+                            logLy_local = logLx + delta_loglike_range(power, sn_prop, snx, proposal_ilow, proposal_ihigh)
+                else:
+                    check = True
 
         else:
             if tmax == 0:
@@ -2719,7 +3583,8 @@ def BayesLineLorentzSplineMCMC(bayesline: BayesLineParams, heat: float, steps: i
                         )
                         proposal_ilow = ilow
                         proposal_ihigh = ihigh
-                        logLy_local = logLx + delta_loglike_range(power, sn_prop, snx, ilow, ihigh)
+                        if not bayesline.constantLogLFlag:
+                            logLy_local = logLx + delta_loglike_range(power, sn_prop, snx, ilow, ihigh)
                     else:
                         check = True
                 else:
@@ -2755,7 +3620,8 @@ def BayesLineLorentzSplineMCMC(bayesline: BayesLineParams, heat: float, steps: i
                         )
                         proposal_ilow = ilow
                         proposal_ihigh = ihigh
-                        logLy_local = logLx + delta_loglike_range(power, sn_prop, snx, ilow, ihigh)
+                        if not bayesline.constantLogLFlag:
+                            logLy_local = logLx + delta_loglike_range(power, sn_prop, snx, ilow, ihigh)
                     else:
                         check = True
             else:
@@ -2822,7 +3688,8 @@ def BayesLineLorentzSplineMCMC(bayesline: BayesLineParams, heat: float, steps: i
                         ihigh = max(ihighx, ihighy)
                         proposal_ilow = ilow
                         proposal_ihigh = ihigh
-                        logLy_local = logLx + delta_loglike_range(power, sn_prop, snx, ilow, ihigh)
+                        if not bayesline.constantLogLFlag:
+                            logLy_local = logLx + delta_loglike_range(power, sn_prop, snx, ilow, ihigh)
                 else:
                     check = True
 
@@ -2842,9 +3709,11 @@ def BayesLineLorentzSplineMCMC(bayesline: BayesLineParams, heat: float, steps: i
                     logPsy = logprior_bounds(priors, sn_prop)
             else:
                 logPsy = 0.0
-            logpy -= 0.5 * float(prop_nlines)
-            logpx -= 0.5 * float(lines.n)
-            logH = (logLy - logLx) * heat + logpy - logqy - logpx + logqx
+            if line_trim:
+                logpy -= LINE_COUNT_PRIOR_ZETA * float(prop_nlines)
+                logpx -= LINE_COUNT_PRIOR_ZETA * float(lines.n)
+            logH = ((logLy - logLx) * heat + logpy - logqy - logpx + logqx
+                    + spline_dimension_log_factor)
             if priorFlag != 0:
                 logH += logPsy - logPsx
             cc[lbl] += 1
@@ -2856,7 +3725,15 @@ def BayesLineLorentzSplineMCMC(bayesline: BayesLineParams, heat: float, steps: i
                 snx = sn_prop
                 sbase = sbase_prop
                 sline = sline_prop
-                if typ >= 4:
+                sgauss = sgauss_prop
+                if typ >= 8:
+                    assert bumps is not None
+                    bumps.n = prop_nbump
+                    if prop_nbump > 0:
+                        bumps.f[:prop_nbump] = prop_bf
+                        bumps.a[:prop_nbump] = prop_ba
+                        bumps.sigma[:prop_nbump] = prop_bs
+                elif typ >= 4:
                     spline.points = prop_points.copy()
                     spline.data = prop_sdata.copy()
                 else:
@@ -2866,15 +3743,38 @@ def BayesLineLorentzSplineMCMC(bayesline: BayesLineParams, heat: float, steps: i
                     lines.nu[:prop_nlines] = prop_nu
                     lines.q[:prop_nlines] = lines.f[:prop_nlines] / np.maximum(lines.nu[:prop_nlines], np.finfo(float).tiny)
 
+        if count_trace is not None and mc < count_trace.shape[0]:
+            count_trace[mc, 0] = mc
+            count_trace[mc, 1] = lines.n
+            count_trace[mc, 2] = spline.n
+            if count_trace.shape[1] > 3:
+                count_trace[mc, 3] = 0 if bumps is None else bumps.n
+
         if sample_count < sample_target and mc >= sample_start and (mc - sample_start) % sample_stride == 0:
-            psd_samples[sample_count, :] = snx
-            if spline_samples is not None:
-                spline_samples[sample_count, :] = sbase
+            if projection_target is not None:
+                target_sbase, _target_sline, target_sgauss, target_snf = projected_model_components_from_state(
+                    spline, lines, bumps, data, projection_target, projection_scale, SplineFlag, gaussian_enabled
+                )
+                psd_samples[sample_count, :] = target_snf
+                if spline_samples is not None:
+                    spline_samples[sample_count, :] = target_sbase
+                if gaussian_samples is not None:
+                    gaussian_samples[sample_count, :] = target_sgauss
+            else:
+                psd_samples[sample_count, :] = snx
+                if spline_samples is not None:
+                    spline_samples[sample_count, :] = sbase
+                if gaussian_samples is not None:
+                    gaussian_samples[sample_count, :] = sgauss
             sample_count += 1
 
         if mc % 1000 == 0:
-            rates = [ac[i] / cc[i] for i in range(6)]
-            print(f"{mc} {lines.n} {spline.n} {logLx:.6e} " + " ".join(f"{r:.6f}" for r in rates))
+            rates = [ac[i] / cc[i] for i in range(8)]
+            bump_count = 0 if bumps is None else bumps.n
+            if gaussian_enabled:
+                print(f"{mc} {lines.n} {spline.n} {bump_count} {logLx:.6e} " + " ".join(f"{r:.6f}" for r in rates))
+            else:
+                print(f"{mc} {lines.n} {spline.n} {bump_count} {logLx:.6e} " + " ".join(f"{r:.6f}" for r in rates[:6]))
 
     bayesline.spline_x = SplineParams(points=spline.points.copy(), data=spline.data.copy())
     if bayesline.spline is not None:
@@ -2885,9 +3785,14 @@ def BayesLineLorentzSplineMCMC(bayesline: BayesLineParams, heat: float, steps: i
     final_sline = sline_from_lookup(ncut, data.imin, t_obs, lines.nf, lines.nnu, lines.wdth,
                                     lines.lnumin, lines.lnumax, lines.ltemplate,
                                     lines.f, lines.a, lines.nu, lines.n)
-    final_snf = final_sbase + final_sline
+    if gaussian_enabled and bumps is not None:
+        final_sgauss = gaussian_bumps_from_params(freq, bumps)
+    else:
+        final_sgauss = np.zeros(ncut, dtype=np.float64)
+    final_snf = final_sbase + final_sline + final_sgauss
     bayesline.Sbase = final_sbase
     bayesline.Sline = final_sline
+    bayesline.Sgauss = final_sgauss
     bayesline.Snf = final_snf
     ratio = power / np.maximum(final_snf, np.finfo(float).tiny)
     dan[0] = float(np.max(ratio))
@@ -2898,21 +3803,40 @@ def BayesLineRJMCMC(bayesline: BayesLineParams, freqData: np.ndarray, psd: np.nd
                     invpsd: np.ndarray, splinePSD: np.ndarray, N: int, cycle: int,
                     beta: float, priorFlag: int, fprop: np.ndarray, SplineFlag: int,
                     psd_samples: Optional[np.ndarray] = None,
-                    spline_samples: Optional[np.ndarray] = None) -> int:
+                    spline_samples: Optional[np.ndarray] = None,
+                    gaussian_samples: Optional[np.ndarray] = None,
+                    count_trace: Optional[np.ndarray] = None,
+                    line_trim: bool = False,
+                    gaussian_bumps: bool = False,
+                    projection_target: Optional[BayesLineParams] = None,
+                    projection_scale: float = 1.0) -> int:
     """Public C-style RJMCMC wrapper that returns full-band PSD arrays."""
 
     del freqData
     dan = [0.0]
     collected = BayesLineLorentzSplineMCMC(
         bayesline, beta, cycle, priorFlag, dan, fprop, SplineFlag,
-        psd_samples=psd_samples, spline_samples=spline_samples
+        psd_samples=psd_samples, spline_samples=spline_samples,
+        gaussian_samples=gaussian_samples,
+        count_trace=count_trace,
+        line_trim=line_trim,
+        gaussian_bumps=gaussian_bumps,
+        projection_target=projection_target,
+        projection_scale=projection_scale
     )
-    assert bayesline.data is not None and bayesline.Snf is not None and bayesline.Sbase is not None
-    data = bayesline.data
+    if projection_target is not None:
+        project_bayesline_state_to_target(
+            bayesline, projection_target, projection_scale, SplineFlag, gaussian_bumps
+        )
+        output_state = projection_target
+    else:
+        output_state = bayesline
+    assert output_state.data is not None and output_state.Snf is not None and output_state.Sbase is not None
+    data = output_state.data
     psd.fill(0.0)
     splinePSD.fill(0.0)
-    psd[data.imin:data.imax] = bayesline.Snf
-    splinePSD[data.imin:data.imax] = bayesline.Sbase
+    psd[data.imin:data.imax] = output_state.Snf
+    splinePSD[data.imin:data.imax] = output_state.Sbase
     psd[:data.imin] = 1.0
     splinePSD[:data.imin] = 1.0
     psd[data.imax:N // 2] = 1.0
@@ -2939,6 +3863,28 @@ def segment_bounds(trigger_time: float, duration: float) -> Tuple[float, float]:
     end = trigger_time + TRIGGER_OFFSET_FROM_END
     start = end - duration
     return start, end
+
+
+def centered_segment_bounds(center_time: float, duration: float) -> Tuple[float, float]:
+    """Return a segment of the given duration centered on ``center_time``."""
+
+    half = 0.5 * duration
+    return center_time - half, center_time + half
+
+
+def expanded_fetch_bounds(trigger_time: float, analysis_duration: float,
+                          expand: int) -> Tuple[float, float]:
+    """Return the union needed for the analysis segment and expanded PSD segment."""
+
+    analysis_start, analysis_end = segment_bounds(trigger_time, analysis_duration)
+    psd_start, psd_end = centered_segment_bounds(trigger_time, analysis_duration * float(expand))
+    return min(analysis_start, psd_start), max(analysis_end, psd_end)
+
+
+def is_power_of_two_int(value: int) -> bool:
+    """Return True when ``value`` is a positive power of two."""
+
+    return value > 0 and (value & (value - 1)) == 0
 
 
 def gwpy_sample_rate_hz(series) -> float:
@@ -3019,18 +3965,19 @@ def lal_resample_and_crop(series, target_rate: float, start: float,
     return crop_regular_arrays(output_times, output, start, end, output_rate)
 
 
-def fetch_ligo_data(trigger_time: float, duration: float, ifo: str, source: str,
-                    channel: Optional[str], output_file: Optional[str],
-                    target_rate: float, padding: float, resampler: str) -> str:
-    """Fetch, resample, crop, and save strain data for BWtest."""
+def fetch_ligo_data_bounds(start: float, end: float, ifo: str, source: str,
+                           channel: Optional[str], output_file: Optional[str],
+                           target_rate: float, padding: float, resampler: str,
+                           trigger_time: Optional[float] = None) -> str:
+    """Fetch, resample, crop to explicit bounds, and save strain data for BWtest."""
 
-    start, end = segment_bounds(trigger_time, duration)
     outfile = output_file if output_file is not None else f"{ifo}.txt"
     fetch_start = start - padding
     fetch_end = end + padding
 
     print(f"Fetching {ifo} data from {fetch_start:.6f} to {fetch_end:.6f}")
-    print(f"Trigger time {trigger_time:.6f} is {TRIGGER_OFFSET_FROM_END:.1f} seconds before segment end")
+    if trigger_time is not None:
+        print(f"Trigger time {trigger_time:.6f}")
     print(f"Target sample rate after {resampler} resampling = {target_rate:g} Hz")
 
     try:
@@ -3083,6 +4030,19 @@ def fetch_ligo_data(trigger_time: float, duration: float, ifo: str, source: str,
     return outfile
 
 
+def fetch_ligo_data(trigger_time: float, duration: float, ifo: str, source: str,
+                    channel: Optional[str], output_file: Optional[str],
+                    target_rate: float, padding: float, resampler: str) -> str:
+    """Fetch, resample, crop, and save the standard trigger-offset analysis segment."""
+
+    start, end = segment_bounds(trigger_time, duration)
+    print(f"Trigger time {trigger_time:.6f} is {TRIGGER_OFFSET_FROM_END:.1f} seconds before segment end")
+    return fetch_ligo_data_bounds(
+        start, end, ifo, source, channel, output_file,
+        target_rate, padding, resampler, trigger_time=trigger_time
+    )
+
+
 def read_frame(filename: str) -> Tuple[np.ndarray, np.ndarray]:
     """Read a two-column strain file: GPS time and strain."""
 
@@ -3093,6 +4053,219 @@ def read_frame(filename: str) -> Tuple[np.ndarray, np.ndarray]:
     strain = arr[:, 1].copy()
     _require_power_of_two(strain.size)
     return time, strain
+
+
+def infer_regular_dt(times: np.ndarray) -> float:
+    """Infer the sample spacing from a regular GPS-time array."""
+
+    if times.size < 2:
+        raise ValueError("not enough time samples")
+    diffs = np.diff(times)
+    dt = float(np.median(diffs))
+    if not math.isfinite(dt) or dt <= 0.0:
+        raise ValueError("input times are not increasing")
+    return dt
+
+
+def crop_arrays_by_time(times: np.ndarray, strain: np.ndarray,
+                        start: float, duration: float) -> Tuple[np.ndarray, np.ndarray]:
+    """Crop regularly sampled arrays by GPS start time and duration."""
+
+    dt = infer_regular_dt(times)
+    sample_count = int(round(duration / dt))
+    if sample_count <= 0:
+        raise ValueError("requested crop has no samples")
+    start_index = int(round((start - times[0]) / dt))
+    end_index = start_index + sample_count
+    if start_index < 0 or end_index > strain.size:
+        raise ValueError(
+            f"not enough data for requested segment [{start:.6f}, {start + duration:.6f}]"
+        )
+    out_times = times[start_index:end_index].copy()
+    out_strain = strain[start_index:end_index].copy()
+    _require_power_of_two(out_strain.size)
+    return out_times, out_strain
+
+
+def prepare_frequency_segment(times: np.ndarray, strain: np.ndarray,
+                              duration: float, no_tukey: bool) -> Tuple[
+                                  np.ndarray, np.ndarray, np.ndarray, np.ndarray, float, float, float
+                              ]:
+    """Prepare one analysis/PSD segment: optional Tukey window, FFT, and BW fdata."""
+
+    n = strain.size
+    _require_power_of_two(n)
+    t_obs = float(duration)
+    dt = t_obs / n
+    data = strain.copy()
+    alpha = 2.0 * T_RISE / t_obs
+    window_power_correction = tukey_power_correction(n, alpha)
+    if not no_tukey:
+        tukey_inplace(data, alpha)
+    dataf_c = np.fft.rfft(data)
+    fdata = np.zeros(n, dtype=np.float64)
+    fdata[2:n:2] = dataf_c[1:n // 2].real
+    fdata[3:n + 1:2] = dataf_c[1:n // 2].imag
+    return times.copy(), data, dataf_c, fdata, dt, alpha, window_power_correction
+
+
+def projected_line_amplitudes(lines: LorentzianParams, source_data: DataParams,
+                              target_lines: LorentzianParams, target_data: DataParams,
+                              internal_scale: float) -> np.ndarray:
+    """Map fit-duration line peak heights to target-duration peak heights.
+
+    ``lines.a`` is not a raw oscillator amplitude.  The lookup table stores a
+    unit-peak, Tukey-windowed Lorentzian shape, so ``lines.a`` is the peak
+    height of that windowed profile in BayesLine's internal PSD units.
+
+    When ``--expand`` is used, the sampler fits a longer PSD segment but the
+    reported products live on the shorter analysis segment.  Two conversions
+    are needed:
+
+    1. ``internal_scale`` converts between internal PSD units.  The physical
+       PSD output scale is ``4 * window_power_correction / Tobs``, so the
+       factor of 4 cancels between the fit and target durations.
+    2. A raw line with the same ``f0`` and ``nu`` has a different windowed peak
+       after convolution with the fit-duration Tukey window than it does after
+       convolution with the target-duration Tukey window.  The peak lookup
+       stores that raw-to-windowed response, so multiplying by
+       ``target_peak / fit_peak`` keeps the underlying physical line fixed
+       while rebuilding it with the target-duration lookup table.
+    """
+
+    scaled_line_amp = lines.a[:lines.n] * internal_scale
+    if lines.n > 0:
+        if lines.peak_template is not None and target_lines.peak_template is not None:
+            scaled_line_amp = scaled_line_amp.copy()
+            for k in range(lines.n):
+                fit_peak = lorentzian_peak_response_value(
+                    lines.peak_template, source_data.t_obs, lines.nf, lines.nnu,
+                    lines.lnumin, lines.lnumax, float(lines.f[k]), float(lines.nu[k])
+                )
+                target_peak = lorentzian_peak_response_value(
+                    target_lines.peak_template, target_data.t_obs, target_lines.nf, target_lines.nnu,
+                    target_lines.lnumin, target_lines.lnumax, float(lines.f[k]), float(lines.nu[k])
+                )
+                scaled_line_amp[k] *= target_peak / max(fit_peak, np.finfo(float).tiny)
+    return scaled_line_amp
+
+
+def projected_model_components_from_state(spline: SplineParams,
+                                          lines: LorentzianParams,
+                                          bumps: Optional[GaussianBumpParams],
+                                          source_data: DataParams,
+                                          target: BayesLineParams,
+                                          internal_scale: float,
+                                          spline_flag: int,
+                                          gaussian_enabled: bool) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Project the current fit state onto a target-duration BayesLine grid.
+
+    Smooth spline and Gaussian-bump amplitudes only need the internal-unit
+    conversion because they are evaluated directly at the target frequencies.
+    Lorentzian lines need the extra peak-response correction handled by
+    ``projected_line_amplitudes`` because their stored amplitudes refer to a
+    duration-dependent Tukey-windowed lookup profile.
+    """
+
+    if target.data is None or target.freq is None or target.lines_x is None:
+        raise RuntimeError("target BayesLine state is not initialized for projection")
+    target_data = target.data
+    target_lines = target.lines_x
+    scaled_spline_data = spline.data + math.log(internal_scale)
+    sbase = np.exp(spline_eval_array(spline.points, scaled_spline_data, target.freq, spline_flag))
+
+    if lines.n > 0:
+        scaled_line_amp = projected_line_amplitudes(
+            lines, source_data, target_lines, target_data, internal_scale
+        )
+        sline = sline_from_lookup(
+            target_data.ncut, target_data.imin, target_data.t_obs,
+            target_lines.nf, target_lines.nnu, target_lines.wdth,
+            target_lines.lnumin, target_lines.lnumax, target_lines.ltemplate,
+            lines.f[:lines.n], scaled_line_amp, lines.nu[:lines.n], lines.n
+        )
+    else:
+        sline = np.zeros(target_data.ncut, dtype=np.float64)
+
+    sgauss = np.zeros(target_data.ncut, dtype=np.float64)
+    if gaussian_enabled and bumps is not None:
+        for k in range(bumps.n):
+            add_gaussian_bump_band_inplace(
+                sgauss, target.freq, float(bumps.f[k]),
+                float(bumps.a[k]) * internal_scale, float(bumps.sigma[k]), 1.0
+            )
+    snf = sbase + sline + sgauss
+    return sbase, sline, sgauss, snf
+
+
+def clone_lorentzian_lookup_container(template: LorentzianParams, size: int) -> LorentzianParams:
+    """Allocate a Lorentzian container while preserving an attached target lookup."""
+
+    out = LorentzianParams(size=size)
+    out.nf = template.nf
+    out.nnu = template.nnu
+    out.wdth = template.wdth
+    out.imin = template.imin
+    out.numin = template.numin
+    out.numax = template.numax
+    out.lnumin = template.lnumin
+    out.lnumax = template.lnumax
+    out.ltemplate = template.ltemplate
+    out.peak_template = template.peak_template
+    return out
+
+
+def project_bayesline_state_to_target(source: BayesLineParams, target: BayesLineParams,
+                                      internal_scale: float, spline_flag: int,
+                                      gaussian_enabled: bool) -> None:
+    """Copy the final expanded-duration model into target-duration units."""
+
+    if source.spline_x is None or source.lines_x is None:
+        raise RuntimeError("source BayesLine state is incomplete")
+    if target.lines_x is None:
+        raise RuntimeError("target BayesLine state is incomplete")
+    if source.data is None:
+        raise RuntimeError("source BayesLine data are incomplete")
+
+    sbase, sline, sgauss, snf = projected_model_components_from_state(
+        source.spline_x, source.lines_x, source.bumps_x, source.data,
+        target, internal_scale, spline_flag, gaussian_enabled
+    )
+    scaled_spline_data = source.spline_x.data + math.log(internal_scale)
+    target.spline_x = SplineParams(source.spline_x.points.copy(), scaled_spline_data.copy())
+    target.spline = SplineParams(source.spline_x.points.copy(), scaled_spline_data.copy())
+
+    nlines = source.lines_x.n
+    if target.lines_x.size < nlines:
+        target.lines_x = clone_lorentzian_lookup_container(target.lines_x, nlines)
+    target.lines_x.n = nlines
+    if nlines > 0:
+        target_line_amp = projected_line_amplitudes(
+            source.lines_x, source.data, target.lines_x, target.data, internal_scale
+        )
+        target.lines_x.f[:nlines] = source.lines_x.f[:nlines]
+        target.lines_x.nu[:nlines] = source.lines_x.nu[:nlines]
+        target.lines_x.a[:nlines] = target_line_amp
+        target.lines_x.q[:nlines] = target.lines_x.f[:nlines] / np.maximum(target.lines_x.nu[:nlines], np.finfo(float).tiny)
+
+    if gaussian_enabled and source.bumps_x is not None:
+        nbump = source.bumps_x.n
+        if target.bumps_x is None or target.bumps_x.size < nbump:
+            target.bumps_x = create_gaussianBumpParams(max(nbump, 1))
+        target.bumps_x.n = nbump
+        if nbump > 0:
+            target.bumps_x.f[:nbump] = source.bumps_x.f[:nbump]
+            target.bumps_x.a[:nbump] = source.bumps_x.a[:nbump] * internal_scale
+            target.bumps_x.sigma[:nbump] = source.bumps_x.sigma[:nbump]
+    elif target.bumps_x is not None:
+        target.bumps_x.n = 0
+
+    target.Sbase = sbase
+    target.Sline = sline
+    target.Sgauss = sgauss
+    target.Snf = snf
+    target.Sna = snf.copy()
+    target.rng = source.rng
 
 
 def decimation_factor_for_nyquist(data_nyquist: float, requested_nyquist: float) -> int:
@@ -3134,6 +4307,116 @@ def tagged_output_name(base_name: str, input_spec: InputSpec) -> str:
     return f"{stem}_{input_spec.output_tag}.{suffix}"
 
 
+def plot_prior_recovery_histograms(count_trace: np.ndarray, line_max: int, spline_max: int,
+                                   gaussian_max: Optional[int] = None,
+                                   burnin_fraction: float = 0.5,
+                                   plot_file: str = "prior_recovery_histograms.pdf") -> None:
+    """Write dimension histograms from a prior-recovery run."""
+
+    if count_trace.size == 0:
+        print("warning: prior-recovery trace is empty; skipping histogram plot")
+        return
+    if burnin_fraction < 0.0 or burnin_fraction >= 1.0:
+        print("warning: invalid prior-recovery histogram burn-in fraction; skipping histogram plot")
+        return
+
+    start = int(math.floor(burnin_fraction * count_trace.shape[0]))
+    samples = count_trace[start:]
+    if samples.size == 0:
+        print("warning: no prior-recovery samples remain after histogram burn-in cut")
+        return
+
+    line_counts = samples[:, 1].astype(np.int64)
+    spline_counts = samples[:, 2].astype(np.int64)
+    has_gaussian_counts = count_trace.shape[1] > 3
+    gaussian_counts = samples[:, 3].astype(np.int64) if has_gaussian_counts else None
+
+    def integer_histogram(values: np.ndarray, lo: int, hi: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        observed_lo = int(np.min(values))
+        observed_hi = int(np.max(values))
+        lo = min(lo, observed_lo)
+        hi = max(hi, observed_hi)
+        centers = np.arange(lo, hi + 1, dtype=np.int64)
+        bins = np.arange(lo, hi + 2, dtype=np.float64) - 0.5
+        counts, _ = np.histogram(values, bins=bins)
+        prob = counts.astype(np.float64) / max(1, int(np.sum(counts)))
+        return centers, counts, prob
+
+    line_x, line_hist, line_prob = integer_histogram(line_counts, 1, line_max)
+    spline_x, spline_hist, spline_prob = integer_histogram(spline_counts, 7, spline_max)
+    gaussian_x = gaussian_hist = gaussian_prob = None
+    if gaussian_counts is not None:
+        gaussian_hi = gaussian_max if gaussian_max is not None else int(np.max(gaussian_counts))
+        gaussian_x, gaussian_hist, gaussian_prob = integer_histogram(
+            gaussian_counts, 0, max(0, gaussian_hi)
+        )
+    np.savetxt(
+        "prior_recovery_line_histogram.dat",
+        np.column_stack((line_x, line_prob, line_hist)),
+        fmt=["%d", "%.18e", "%d"],
+        header="n_lines probability count",
+    )
+    np.savetxt(
+        "prior_recovery_spline_histogram.dat",
+        np.column_stack((spline_x, spline_prob, spline_hist)),
+        fmt=["%d", "%.18e", "%d"],
+        header="n_spline probability count",
+    )
+    written_files = [
+        "prior_recovery_line_histogram.dat",
+        "prior_recovery_spline_histogram.dat",
+    ]
+    if gaussian_x is not None and gaussian_hist is not None and gaussian_prob is not None:
+        np.savetxt(
+            "prior_recovery_gaussian_histogram.dat",
+            np.column_stack((gaussian_x, gaussian_prob, gaussian_hist)),
+            fmt=["%d", "%.18e", "%d"],
+            header="n_gaussian_bumps probability count",
+        )
+        written_files.append("prior_recovery_gaussian_histogram.dat")
+
+    try:
+        import os
+        import tempfile
+
+        os.environ.setdefault("MPLCONFIGDIR", str(Path(tempfile.gettempdir()) / "bwtest_matplotlib"))
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception as exc:
+        print(f"warning: matplotlib unavailable; wrote histogram data files but not {plot_file}: {exc}")
+        return
+
+    npanels = 3 if gaussian_x is not None and gaussian_prob is not None else 2
+    fig_height = 9.5 if npanels == 3 else 7.0
+    fig, axes = plt.subplots(npanels, 1, figsize=(9.0, fig_height), constrained_layout=True)
+    axes = np.atleast_1d(axes)
+    panels = [
+        (axes[0], line_x, line_prob, "number of Lorentzian lines", "P(n_lines)"),
+        (axes[1], spline_x, spline_prob, "number of Akima spline knots", "P(n_spline)"),
+    ]
+    if npanels == 3:
+        panels.append(
+            (axes[2], gaussian_x, gaussian_prob, "number of Gaussian PSD bumps", "P(n_gaussian)")
+        )
+    for ax, xval, prob, xlabel, ylabel in panels:
+        ax.bar(xval, prob, width=0.85, color="0.45", edgecolor="0.2", linewidth=0.2)
+        if xval.size > 0:
+            ax.axhline(1.0 / float(xval.size), color="tab:red", linestyle="--", linewidth=1.0,
+                       label="uniform over plotted support")
+            ax.set_xlim(float(xval[0]) - 0.75, float(xval[-1]) + 0.75)
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel(ylabel)
+        ax.grid(True, axis="y", color="0.9", linewidth=0.7)
+        ax.legend(loc="best", frameon=False)
+    fig.suptitle(f"Prior recovery histograms, samples {start} to {count_trace.shape[0] - 1}")
+    fig.savefig(plot_file)
+    plt.close(fig)
+    print(f"Wrote {plot_file}")
+    print("Wrote " + ", ".join(written_files))
+
+
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog=Path(argv[0]).name,
@@ -3163,6 +4446,19 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="existing two-column strain text file; skips fetching and infers duration from the file",
     )
     parser.add_argument(
+        "--duration",
+        "--analysis-duration",
+        type=float,
+        default=None,
+        help="desired analysis duration in seconds for an existing input file when --expand > 1",
+    )
+    parser.add_argument(
+        "--expand",
+        type=int,
+        default=1,
+        help="power-of-two PSD-duration multiplier; default 1 keeps the original one-segment path",
+    )
+    parser.add_argument(
         "--nyquist",
         "--fmax",
         dest="nyquist",
@@ -3190,8 +4486,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument(
         "--resampler",
         choices=("lal", "gwpy"),
-        default="lal",
-        help="frame/GWOSC resampler; default lal uses LALSuite's Kaiser-windowed sinc routine",
+        default=None,
+        help="frame/GWOSC resampler; default is lal for --source cluster and gwpy for --source open",
     )
     parser.add_argument(
         "--no-tukey",
@@ -3221,7 +4517,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--write-line-subtracted-time",
         "--writelinesubtime",
         action="store_true",
-        help="write unwhitened time-domain line-subtracted diagnostics before and after glitch cleaning",
+        help="write unwhitened no-lines diagnostics: freq_nolines.dat plus time-domain outputs before and after glitch cleaning",
     )
     parser.add_argument(
         "--write_glitch",
@@ -3243,12 +4539,75 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="cluster SNR threshold used with --feature, default %(default)g",
     )
     parser.add_argument(
+        "--sinefit",
+        "--sine-fit",
+        action="store_true",
+        help="write sinefit.dat and freq_nosine.dat for Tukeyed-sinusoid line diagnostics/subtraction",
+    )
+    parser.add_argument(
+        "--linetrim",
+        "--line-trim",
+        action="store_true",
+        help=f"turn on the exp(-ZETA*nlines) line-count prior with ZETA={LINE_COUNT_PRIOR_ZETA:g}; off by default",
+    )
+    parser.add_argument(
+        "--gaussian_bumps",
+        "--gaussian-bumps",
+        action="store_true",
+        help=(
+            "turn on broad Gaussian PSD bumps in the RJMCMC; the model starts "
+            "with zero bumps and proposes reversible-jump birth/death/update moves"
+        ),
+    )
+    parser.add_argument(
+        "--gaussian_bump_sigma_min",
+        "--gaussian-bump-sigma-min",
+        type=float,
+        default=GAUSSIAN_BUMP_SIGMA_MIN,
+        help="minimum Gaussian-bump width in Hz, default %(default)g",
+    )
+    parser.add_argument(
+        "--gaussian_bump_sigma_max",
+        "--gaussian-bump-sigma-max",
+        type=float,
+        default=GAUSSIAN_BUMP_SIGMA_MAX,
+        help="maximum Gaussian-bump width in Hz, default %(default)g",
+    )
+    parser.add_argument(
+        "--prior_recovery",
+        "--prior-recovery",
+        action="store_true",
+        help="run the RJMCMC with constant likelihood, disable soft count/PSD priors, and write prior_recovery_counts.dat",
+    )
+    parser.add_argument(
+        "--prior_recovery_plot_burnin",
+        "--prior-recovery-plot-burnin",
+        type=float,
+        default=0.5,
+        help="fraction of prior-recovery count trace to discard before histogramming, default %(default)g",
+    )
+    parser.add_argument(
+        "--rjmcmc_steps",
+        "--rjmcmc-steps",
+        "--mcmc-steps",
+        type=int,
+        default=100000,
+        help="number of Lorentzian+spline RJMCMC iterations, default %(default)d",
+    )
+    parser.add_argument(
         "--psd_samples",
         "--psd-samples",
         "--median-psd-samples",
         type=int,
         default=200,
         help="number of second-half RJMCMC PSD states to store for the median PSD, default %(default)d",
+    )
+    parser.add_argument(
+        "--psd_range",
+        "--psd-range",
+        "--write-psd-range",
+        action="store_true",
+        help="write psd_range.dat with frequency, MCMC-sample mean PSD, and PSD standard deviation",
     )
     parser.add_argument(
         "--timing",
@@ -3260,9 +4619,18 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 def resolve_input_file(args: argparse.Namespace, nyquist: int) -> InputSpec:
     if args.input_file is not None:
+        analysis_duration = args.duration
         if args.inputs:
-            print("warning: --file was supplied, so positional inputs are ignored")
-        return InputSpec(args.input_file, fetched_from_frame=False)
+            if len(args.inputs) == 1 and analysis_duration is None:
+                try:
+                    analysis_duration = float(args.inputs[0])
+                except ValueError as exc:
+                    raise ValueError("--file accepts at most one positional analysis duration") from exc
+            else:
+                print("warning: --file was supplied, so positional inputs are ignored")
+        if analysis_duration is not None and analysis_duration <= 0.0:
+            raise ValueError("analysis duration must be positive")
+        return InputSpec(args.input_file, fetched_from_frame=False, analysis_duration=analysis_duration)
 
     if len(args.inputs) == 1:
         try:
@@ -3272,9 +4640,24 @@ def resolve_input_file(args: argparse.Namespace, nyquist: int) -> InputSpec:
         else:
             if not Path(args.inputs[0]).exists():
                 raise ValueError("provide both trigger_time and duration, or use --file INPUT")
-        return InputSpec(args.inputs[0], fetched_from_frame=False)
+        analysis_duration = args.duration
+        if analysis_duration is not None and analysis_duration <= 0.0:
+            raise ValueError("analysis duration must be positive")
+        return InputSpec(args.inputs[0], fetched_from_frame=False, analysis_duration=analysis_duration)
 
     if len(args.inputs) == 2:
+        first = Path(args.inputs[0])
+        if first.exists():
+            if args.duration is not None:
+                raise ValueError("analysis duration was supplied both positionally and with --duration")
+            try:
+                analysis_duration = float(args.inputs[1])
+            except ValueError as exc:
+                raise ValueError("file input with two positional arguments must be INPUT_FILE duration") from exc
+            if analysis_duration <= 0.0:
+                raise ValueError("analysis duration must be positive")
+            return InputSpec(args.inputs[0], fetched_from_frame=False, analysis_duration=analysis_duration)
+
         try:
             trigger_time = float(args.inputs[0])
             duration = float(args.inputs[1])
@@ -3285,13 +4668,27 @@ def resolve_input_file(args: argparse.Namespace, nyquist: int) -> InputSpec:
         if args.padding < 0.0:
             raise ValueError("padding must be non-negative")
         target_rate = 2.0 * float(nyquist)
-        filename = fetch_ligo_data(
-            trigger_time, duration, args.ifo, args.source, args.channel,
-            args.output, target_rate, args.padding, args.resampler
-        )
+        if args.expand > 1:
+            start, end = expanded_fetch_bounds(trigger_time, duration, args.expand)
+            filename = fetch_ligo_data_bounds(
+                start, end, args.ifo, args.source, args.channel,
+                args.output, target_rate, args.padding, args.resampler,
+                trigger_time=trigger_time
+            )
+        else:
+            filename = fetch_ligo_data(
+                trigger_time, duration, args.ifo, args.source, args.channel,
+                args.output, target_rate, args.padding, args.resampler
+            )
         trigger_label = int(math.floor(trigger_time + 0.5))
         output_tag = f"{detector_label_from_args(args)}_{trigger_label}"
-        return InputSpec(filename, fetched_from_frame=True, output_tag=output_tag)
+        return InputSpec(
+            filename,
+            fetched_from_frame=True,
+            output_tag=output_tag,
+            trigger_time=trigger_time,
+            analysis_duration=duration,
+        )
 
     raise ValueError("provide a frame file, --file INPUT, or trigger_time duration")
 
@@ -3316,15 +4713,38 @@ def main(argv: list[str]) -> int:
     if not ok:
         print(f"warning: requested Nyquist frequency {args.nyquist:g} Hz is not a power of two")
         return 1
+    if args.expand < 1 or not is_power_of_two_int(int(args.expand)):
+        print("warning: --expand must be a positive power of two")
+        return 1
+    args.expand = int(args.expand)
     if not math.isfinite(args.fmin) or args.fmin <= 0.0 or args.fmin >= float(nyquist):
         print(f"warning: requested fmin {args.fmin:g} Hz must be finite and below Nyquist {nyquist:g} Hz")
+        return 1
+    if args.duration is not None and (not math.isfinite(args.duration) or args.duration <= 0.0):
+        print("warning: --duration must be positive and finite")
         return 1
     if args.psd_samples < 1:
         print("warning: --psd-samples must be at least 1")
         return 1
+    if args.rjmcmc_steps < 1:
+        print("warning: --rjmcmc-steps must be at least 1")
+        return 1
+    if (not math.isfinite(args.prior_recovery_plot_burnin)
+            or args.prior_recovery_plot_burnin < 0.0
+            or args.prior_recovery_plot_burnin >= 1.0):
+        print("warning: --prior-recovery-plot-burnin must be in the range [0, 1)")
+        return 1
     if not math.isfinite(args.feature_snr_thresh) or args.feature_snr_thresh < 0.0:
         print("warning: --feature-snr-thresh must be finite and non-negative")
         return 1
+    if (not math.isfinite(args.gaussian_bump_sigma_min)
+            or not math.isfinite(args.gaussian_bump_sigma_max)
+            or args.gaussian_bump_sigma_min <= 0.0
+            or args.gaussian_bump_sigma_max <= args.gaussian_bump_sigma_min):
+        print("warning: Gaussian bump widths must satisfy 0 < sigma_min < sigma_max")
+        return 1
+    if args.resampler is None:
+        args.resampler = "gwpy" if args.source == "open" else "lal"
 
     fmin = float(args.fmin)
     fmax = float(nyquist)
@@ -3336,111 +4756,318 @@ def main(argv: list[str]) -> int:
         return 1
     timing_mark("read_input")
 
+    expand_factor = int(args.expand)
+    expanded_psd = expand_factor > 1
+    file_duration_requested = (not input_spec.fetched_from_frame
+                               and input_spec.analysis_duration is not None)
+    segment_crop_requested = expanded_psd or file_duration_requested
     ND = timeX.size
-    print(f"Number of points in data = {ND}")
+    print(f"Number of points in input data = {ND}")
 
-    dt = (timeX[-1] - timeX[0]) / ND
-    Tobs = float(round(ND * dt))
-    dt = Tobs / ND
-    fny = 1.0 / (2.0 * dt)
-    print(f"{Tobs:f} {dt:e} {fny:f} {fmax:f}")
-    sample_rate_matches_request = math.isclose(fny, fmax, rel_tol=1.0e-6, abs_tol=1.0e-6)
-    if sample_rate_matches_request:
-        fny = fmax
-    if fmax > fny:
-        print(f"warning: requested Nyquist {fmax:g} Hz exceeds data Nyquist {fny:g} Hz")
+    if segment_crop_requested and input_spec.analysis_duration is None:
+        print("warning: an explicit analysis duration is required for this segmented input mode")
         return 1
 
-    dec = decimation_factor_for_nyquist(fny, fmax)
-    print(f"Down sample = {dec}")
+    if segment_crop_requested:
+        analysis_duration = float(input_spec.analysis_duration)
+        psd_duration = analysis_duration * float(expand_factor)
+        if psd_duration > 256.0:
+            print(f"WARNING: PSD segment is {psd_duration:g} seconds, which exceeds 256 seconds")
 
-    if input_spec.fetched_from_frame and dec > 1:
-        expected_rate = 2.0 * fmax
-        actual_rate = 2.0 * fny
-        print(
-            f"warning: fetched frame data should have been resampled to {expected_rate:g} Hz, "
-            f"but the saved data imply {actual_rate:g} Hz"
-        )
-        return 1
-
-    N = ND // dec
-    try:
-        _require_power_of_two(N)
-    except ValueError as exc:
-        print(f"warning: {exc} after downsampling by {dec}")
-        return 1
-    print(f"Number of points used in analysis = {N}")
-
-    if input_spec.fetched_from_frame:
-        print("Skipping Butterworth decimation for externally resampled frame input")
-    elif dec == 1:
+        dt_in = infer_regular_dt(timeX)
+        input_duration = dt_in * ND
+        fny = 1.0 / (2.0 * dt_in)
+        print(f"Input duration {input_duration:f} s, dt {dt_in:e}, Nyquist {fny:f}, requested {fmax:f}")
+        sample_rate_matches_request = math.isclose(fny, fmax, rel_tol=1.0e-6, abs_tol=1.0e-6)
         if sample_rate_matches_request:
-            print("Sample rate already matches requested Nyquist; skipping Butterworth decimation")
+            fny = fmax
+        if fmax > fny:
+            print(f"warning: requested Nyquist {fmax:g} Hz exceeds data Nyquist {fny:g} Hz")
+            return 1
+
+        dec = decimation_factor_for_nyquist(fny, fmax)
+        print(f"Down sample = {dec}")
+        if input_spec.fetched_from_frame and dec > 1:
+            expected_rate = 2.0 * fmax
+            actual_rate = 2.0 * fny
+            print(
+                f"warning: fetched frame data should have been resampled to {expected_rate:g} Hz, "
+                f"but the saved data imply {actual_rate:g} Hz"
+            )
+            return 1
+
+        if input_spec.fetched_from_frame:
+            print("Skipping Butterworth decimation for externally resampled frame input")
+        elif dec == 1:
+            if sample_rate_matches_request:
+                print("Sample rate already matches requested Nyquist; skipping Butterworth decimation")
+            else:
+                print("Skipping Butterworth decimation; legacy integer downsampling factor is 1")
         else:
-            print("Skipping Butterworth decimation; legacy integer downsampling factor is 1")
+            fmn = 1.0 / psd_duration
+            fmx = fmax
+            dataX = bwbpf_numba(dataX, 1, 8, 1.0 / dt_in, fmx, fmn)
+            dataX = bwbpf_numba(dataX, -1, 8, 1.0 / dt_in, fmx, fmn)
+
+        full_times = timeX[::dec].copy()
+        full_data = dataX[::dec].copy()
+        if input_spec.fetched_from_frame:
+            if input_spec.trigger_time is None:
+                print("warning: fetched-data trigger time is missing")
+                return 1
+            trigger_time = float(input_spec.trigger_time)
+        else:
+            # A plain file has no trigger metadata.  When the user supplies an
+            # analysis duration, treat the file center as the trigger so the
+            # analysis segment can keep the usual trigger+4 end time.
+            trigger_time = float(timeX[0]) + 0.5 * input_duration
+            print(
+                "WARNING: user-supplied analysis duration assumes the trigger "
+                f"is at the center of the provided data, GPS {trigger_time:.6f}"
+            )
+
+        analysis_start, analysis_end = segment_bounds(trigger_time, analysis_duration)
+        if expanded_psd:
+            psd_start, psd_end = centered_segment_bounds(trigger_time, psd_duration)
+        else:
+            psd_start, psd_end = analysis_start, analysis_end
+        needed_start = min(analysis_start, psd_start)
+        needed_end = max(analysis_end, psd_end)
+        available_start = float(full_times[0])
+        available_end = available_start + infer_regular_dt(full_times) * full_times.size
+        tol = 0.5 * infer_regular_dt(full_times)
+        if needed_start < available_start - tol or needed_end > available_end + tol:
+            print(
+                "warning: not enough data provided for requested analysis/PSD segments; "
+                f"need [{needed_start:.6f}, {needed_end:.6f}] "
+                f"but file covers [{available_start:.6f}, {available_end:.6f}]"
+            )
+            return 1
+
+        if expanded_psd:
+            print(
+                f"Using analysis segment [{analysis_start:.6f}, {analysis_end:.6f}] "
+                f"and expanded PSD segment [{psd_start:.6f}, {psd_end:.6f}]"
+            )
+        else:
+            print(
+                f"Using requested analysis duration {analysis_duration:g} s from input file; "
+                f"analysis/PSD segment [{analysis_start:.6f}, {analysis_end:.6f}]"
+            )
+        try:
+            # The fit segment drives BayesLine PSD estimation.  With --expand
+            # it is longer and centered on the trigger; otherwise it is the
+            # same segment used for final products and ADtest-facing files.
+            fit_times_raw, fit_data_raw = crop_arrays_by_time(full_times, full_data, psd_start, psd_duration)
+            analysis_times_raw, analysis_data_raw = crop_arrays_by_time(
+                full_times, full_data, analysis_start, analysis_duration
+            )
+        except ValueError as exc:
+            print(f"warning: {exc}")
+            return 1
+
+        Tobs = analysis_duration
+        fit_Tobs = psd_duration
+        print(f"Number of points used in analysis = {analysis_data_raw.size}")
+        print(f"Number of points used for PSD estimation = {fit_data_raw.size}")
     else:
-        fmn = 1.0 / Tobs
-        fmx = fmax
-        dataX = bwbpf_numba(dataX, 1, 8, 1.0 / dt, fmx, fmn)
-        dataX = bwbpf_numba(dataX, -1, 8, 1.0 / dt, fmx, fmn)
+        print(f"Number of points in data = {ND}")
+        dt = (timeX[-1] - timeX[0]) / ND
+        Tobs = float(round(ND * dt))
+        dt = Tobs / ND
+        fny = 1.0 / (2.0 * dt)
+        print(f"{Tobs:f} {dt:e} {fny:f} {fmax:f}")
+        sample_rate_matches_request = math.isclose(fny, fmax, rel_tol=1.0e-6, abs_tol=1.0e-6)
+        if sample_rate_matches_request:
+            fny = fmax
+        if fmax > fny:
+            print(f"warning: requested Nyquist {fmax:g} Hz exceeds data Nyquist {fny:g} Hz")
+            return 1
 
-    times = timeX[::dec][:N].copy()
-    data = dataX[::dec][:N].copy()
+        dec = decimation_factor_for_nyquist(fny, fmax)
+        print(f"Down sample = {dec}")
 
-    alpha = 2.0 * T_RISE / Tobs
-    window_power_correction = tukey_power_correction(N, alpha)
+        if input_spec.fetched_from_frame and dec > 1:
+            expected_rate = 2.0 * fmax
+            actual_rate = 2.0 * fny
+            print(
+                f"warning: fetched frame data should have been resampled to {expected_rate:g} Hz, "
+                f"but the saved data imply {actual_rate:g} Hz"
+            )
+            return 1
+
+        N = ND // dec
+        try:
+            _require_power_of_two(N)
+        except ValueError as exc:
+            print(f"warning: {exc} after downsampling by {dec}")
+            return 1
+        print(f"Number of points used in analysis = {N}")
+
+        if input_spec.fetched_from_frame:
+            print("Skipping Butterworth decimation for externally resampled frame input")
+        elif dec == 1:
+            if sample_rate_matches_request:
+                print("Sample rate already matches requested Nyquist; skipping Butterworth decimation")
+            else:
+                print("Skipping Butterworth decimation; legacy integer downsampling factor is 1")
+        else:
+            fmn = 1.0 / Tobs
+            fmx = fmax
+            dataX = bwbpf_numba(dataX, 1, 8, 1.0 / dt, fmx, fmn)
+            dataX = bwbpf_numba(dataX, -1, 8, 1.0 / dt, fmx, fmn)
+
+        analysis_times_raw = timeX[::dec][:N].copy()
+        analysis_data_raw = dataX[::dec][:N].copy()
+        fit_times_raw = analysis_times_raw
+        fit_data_raw = analysis_data_raw
+        fit_Tobs = Tobs
+
+    N = analysis_data_raw.size
+    fit_N = fit_data_raw.size
+
     if args.no_tukey:
         print("WARNING: --no-tukey set; BWtest will not apply a new Tukey window to the input data")
         print("WARNING: line model still uses the standard Tukey-windowed Lorentzian lookup")
         print("WARNING: output scaling still applies the usual one-window Tukey power correction")
-    else:
-        tukey_inplace(data, alpha)
 
-    dataf_c = np.fft.rfft(data)
-    dt = Tobs / N
+    times, data, dataf_c, fdata, dt, alpha, window_power_correction = prepare_frequency_segment(
+        analysis_times_raw, analysis_data_raw, Tobs, args.no_tukey
+    )
+    if expanded_psd:
+        # In the normal path, BayesLineBurnin wavelet-cleans fdata in place.  In
+        # the expanded path burn-in cleans the long PSD segment, so we perform
+        # the same wavelet-cleaning step separately for the analysis segment.
+        fit_times, fit_data, fit_dataf_c, fit_fdata, fit_dt, fit_alpha, fit_window_power_correction = prepare_frequency_segment(
+            fit_times_raw, fit_data_raw, fit_Tobs, args.no_tukey
+        )
+        cleaned_analysis_time = bayesline_clean_time(data, dt)
+        cleaned_analysis_fft = np.fft.rfft(cleaned_analysis_time) * (dt / math.sqrt(2.0))
+        fdata.fill(0.0)
+        fdata[2:N:2] = cleaned_analysis_fft[1:N // 2].real
+        fdata[3:N + 1:2] = cleaned_analysis_fft[1:N // 2].imag
+    else:
+        fit_times = times
+        fit_data = data
+        fit_dataf_c = dataf_c
+        fit_fdata = fdata
+        fit_dt = dt
+        fit_alpha = alpha
+        fit_window_power_correction = window_power_correction
     raw_freq = np.arange(1, N // 2, dtype=np.float64) / Tobs
     raw_power = 2.0 * dt * dt * window_power_correction * np.abs(dataf_c[1:N // 2]) ** 2 / Tobs
     np.savetxt("periodogram_raw.dat", np.column_stack((raw_freq, raw_power)))
-
-    fdata = np.zeros(N, dtype=np.float64)
-    fdata[2:N:2] = dataf_c[1:N // 2].real
-    fdata[3:N + 1:2] = dataf_c[1:N // 2].imag
+    if expanded_psd:
+        fit_raw_freq = np.arange(1, fit_N // 2, dtype=np.float64) / fit_Tobs
+        fit_raw_power = 2.0 * fit_dt * fit_dt * fit_window_power_correction * np.abs(fit_dataf_c[1:fit_N // 2]) ** 2 / fit_Tobs
+        np.savetxt("periodogram_raw_psd.dat", np.column_stack((fit_raw_freq, fit_raw_power)))
     timing_mark("preprocess_fft")
 
     psd = np.zeros(N // 2, dtype=np.float64)
     invpsd = np.zeros(N // 2, dtype=np.float64)
     splinePSD = np.zeros(N // 2, dtype=np.float64)
-    fprop = np.zeros(N // 2, dtype=np.float64)
+    fprop = np.zeros(fit_N // 2, dtype=np.float64)
 
-    bptr = BayesLineParams()
-    BayesLineSetup(bptr, fdata, fmin, fmax, dt, Tobs)
-    print(f"BayesLine line array size = {bptr.maxBLLines}")
+    fit_bptr = BayesLineParams()
+    BayesLineSetup(fit_bptr, fit_fdata, fmin, fmax, fit_dt, fit_Tobs)
+    fit_bptr.gaussianSigmaMin = float(args.gaussian_bump_sigma_min)
+    fit_bptr.gaussianSigmaMax = float(args.gaussian_bump_sigma_max)
+    projection_bptr: Optional[BayesLineParams] = None
+    projection_scale = 1.0
+    if expanded_psd:
+        projection_bptr = BayesLineParams()
+        # This setup loads/generates the requested-duration line lookup.  The
+        # sampled line parameters come from the long PSD segment, but output
+        # products must live on the shorter analysis segment.  A line is not
+        # downsampled from the long grid; it is rebuilt from the target lookup
+        # so the Tukey-windowed line shape matches the analysis duration.
+        BayesLineSetup(projection_bptr, fdata, fmin, fmax, dt, Tobs)
+        assert fit_bptr.data is not None and fit_bptr.lines_x is not None
+        assert projection_bptr.data is not None and projection_bptr.lines_x is not None
+        attach_lorentzian_peak_lookup(fit_bptr.lines_x, fit_bptr.data)
+        attach_lorentzian_peak_lookup(projection_bptr.lines_x, projection_bptr.data)
+        # BayesLine samples PSDs in internal units.  The physical PSD written
+        # to file is internal * (4 * window_power_correction / Tobs).  To keep
+        # the physical PSD fixed when moving from the fit duration to the
+        # target duration, multiply internal amplitudes by the ratio below.
+        # Lorentzian line amplitudes receive an additional target_peak/fit_peak
+        # correction inside projected_line_amplitudes().
+        projection_scale = (fit_window_power_correction / fit_Tobs) / (window_power_correction / Tobs)
+        print(
+            f"Expanded PSD estimation: analysis T={Tobs:g} s, PSD T={fit_Tobs:g} s, "
+            f"projection internal scale={projection_scale:.6e}"
+        )
+    print(f"BayesLine line array size = {fit_bptr.maxBLLines}")
+    if args.gaussian_bumps:
+        print(
+            "Gaussian bump RJMCMC enabled: "
+            f"array size = {fit_bptr.maxBLBumps}, "
+            f"sigma range = [{fit_bptr.gaussianSigmaMin:g}, {fit_bptr.gaussianSigmaMax:g}] Hz"
+        )
     timing_mark("BayesLineSetup")
-    BayesLineBurnin(bptr, data, fdata, "H1", fprop, 1, write_start=args.write_bl_start)
+    BayesLineBurnin(fit_bptr, fit_data, fit_fdata, "H1", fprop, 1, write_start=args.write_bl_start)
+    adapt_post_startup_model_caps(fit_bptr)
     timing_mark("BayesLineBurnin")
 
-    assert bptr.data is not None and bptr.Sbase is not None and bptr.Snf is not None
-    imin = int(bptr.data.fmin * Tobs)
+    assert fit_bptr.data is not None and fit_bptr.Sbase is not None and fit_bptr.Snf is not None
+    imin = int(fit_bptr.data.fmin * fit_Tobs)
     output_psd_scale = 4.0 * window_power_correction / Tobs
-    p_freq = np.arange(imin, N // 2, dtype=np.float64) / Tobs
-    p_pow = output_psd_scale * 2.0 * (fdata[2 * imin:N:2] ** 2 +
-                                      fdata[2 * imin + 1:N + 1:2] ** 2)
+    fit_output_psd_scale = 4.0 * fit_window_power_correction / fit_Tobs
+    p_freq = np.arange(imin, fit_N // 2, dtype=np.float64) / fit_Tobs
+    p_pow = fit_output_psd_scale * 2.0 * (fit_fdata[2 * imin:fit_N:2] ** 2 +
+                                          fit_fdata[2 * imin + 1:fit_N + 1:2] ** 2)
     model_len = p_freq.size
     np.savetxt("periodogram.dat", np.column_stack((p_freq, p_pow[:model_len],
-                                                   output_psd_scale * bptr.Sbase[:model_len],
-                                                   output_psd_scale * bptr.Snf[:model_len])))
-    fprop_freq = np.arange(bptr.data.imin, N // 2, dtype=np.float64) / Tobs
+                                                   fit_output_psd_scale * fit_bptr.Sbase[:model_len],
+                                                   fit_output_psd_scale * fit_bptr.Snf[:model_len])))
+    fprop_freq = np.arange(fit_bptr.data.imin, fit_N // 2, dtype=np.float64) / fit_Tobs
     np.savetxt("fprop.dat", np.column_stack((fprop_freq, fprop[:fprop_freq.size])))
     timing_mark("startup_diagnostics")
 
-    rjmcmc_steps = 100000
-    psd_samples = np.empty((args.psd_samples, bptr.data.ncut), dtype=np.float64)
+    rjmcmc_steps = args.rjmcmc_steps
+    sample_ncut = projection_bptr.data.ncut if projection_bptr is not None and projection_bptr.data is not None else fit_bptr.data.ncut
+    psd_samples = np.empty((args.psd_samples, sample_ncut), dtype=np.float64)
     spline_samples = np.empty_like(psd_samples)
+    gaussian_samples = np.empty_like(psd_samples) if args.gaussian_bumps else None
+    trace_columns = 4 if args.gaussian_bumps else 3
+    count_trace = np.empty((rjmcmc_steps, trace_columns), dtype=np.int64) if args.prior_recovery else None
+    spline_prior_max = fit_bptr.maxSplineKnots
+    prior_flag = 1
+    line_trim_enabled = args.linetrim
+    if args.prior_recovery:
+        fit_bptr.constantLogLFlag = 1
+        prior_flag = 0
+        line_trim_enabled = False
+        print("Prior recovery mode: RJMCMC likelihood is constant; soft PSD and line-count priors are disabled")
+        if args.linetrim:
+            print("Prior recovery mode: ignoring --linetrim so line counts are not exponentially biased")
     collected_psd_samples = BayesLineRJMCMC(
-        bptr, fdata, psd, invpsd, splinePSD, N, rjmcmc_steps, 1.0, 1, fprop, 1,
-        psd_samples=psd_samples, spline_samples=spline_samples
+        fit_bptr, fit_fdata, psd, invpsd, splinePSD, N, rjmcmc_steps, 1.0, prior_flag, fprop, 1,
+        psd_samples=psd_samples, spline_samples=spline_samples,
+        gaussian_samples=gaussian_samples,
+        count_trace=count_trace,
+        line_trim=line_trim_enabled,
+        gaussian_bumps=args.gaussian_bumps,
+        projection_target=projection_bptr,
+        projection_scale=projection_scale
     )
+    bptr = projection_bptr if projection_bptr is not None else fit_bptr
     timing_mark("BayesLineRJMCMC")
+    if count_trace is not None:
+        np.savetxt(
+            "prior_recovery_counts.dat",
+            count_trace,
+            fmt="%d",
+            header="iteration n_lines n_spline" + (" n_gaussian_bumps" if args.gaussian_bumps else ""),
+        )
+        print("Wrote prior_recovery_counts.dat with iteration, n_lines, n_spline")
+        plot_prior_recovery_histograms(
+            count_trace,
+            fit_bptr.maxBLLines,
+            spline_prior_max,
+            gaussian_max=fit_bptr.maxBLBumps if args.gaussian_bumps else None,
+            burnin_fraction=args.prior_recovery_plot_burnin,
+        )
 
     bw_freq = np.arange(N // 2, dtype=np.float64) / Tobs
     freq_out = np.zeros((N // 2, 3), dtype=np.float64)
@@ -3459,32 +5086,82 @@ def main(argv: list[str]) -> int:
     if fairdraw_psd_out.size > 1:
         fairdraw_psd_out[0] = fairdraw_psd_out[1]
     fairdraw_smooth_out = psd_scale * splinePSD.copy()
-    fairdraw_line_out = fairdraw_psd_out - fairdraw_smooth_out
+    fairdraw_gaussian = np.zeros_like(psd)
+    if bptr.Sgauss is not None:
+        fairdraw_gaussian[bptr.data.imin:bptr.data.imax] = bptr.Sgauss
+    fairdraw_gaussian_out = psd_scale * fairdraw_gaussian
+    fairdraw_line_out = fairdraw_psd_out - fairdraw_smooth_out - fairdraw_gaussian_out
     np.savetxt("BWfairdrawpsd.dat", np.column_stack((bw_freq, fairdraw_psd_out)))
-    np.savetxt("BWfairdrawpsd_components.dat",
-               np.column_stack((bw_freq, fairdraw_psd_out, fairdraw_smooth_out, fairdraw_line_out)))
+    if args.gaussian_bumps:
+        np.savetxt("BWfairdrawpsd_components.dat",
+                   np.column_stack((bw_freq, fairdraw_psd_out, fairdraw_smooth_out,
+                                    fairdraw_line_out, fairdraw_gaussian_out)))
+    else:
+        np.savetxt("BWfairdrawpsd_components.dat",
+                   np.column_stack((bw_freq, fairdraw_psd_out, fairdraw_smooth_out, fairdraw_line_out)))
 
     median_psd = psd.copy()
     median_spline = splinePSD.copy()
+    median_gaussian = fairdraw_gaussian.copy()
+    average_psd = psd.copy()
     if collected_psd_samples > 0:
+        active_samples = psd_samples[:collected_psd_samples]
         median_psd.fill(1.0)
         median_spline.fill(1.0)
-        median_psd[bptr.data.imin:bptr.data.imax] = np.median(psd_samples[:collected_psd_samples], axis=0)
+        median_gaussian.fill(0.0)
+        average_psd.fill(1.0)
+        median_psd[bptr.data.imin:bptr.data.imax] = np.median(active_samples, axis=0)
         median_spline[bptr.data.imin:bptr.data.imax] = np.median(spline_samples[:collected_psd_samples], axis=0)
+        if gaussian_samples is not None:
+            median_gaussian[bptr.data.imin:bptr.data.imax] = np.median(
+                gaussian_samples[:collected_psd_samples], axis=0
+            )
+        average_psd[bptr.data.imin:bptr.data.imax] = np.mean(active_samples, axis=0)
         if collected_psd_samples != args.psd_samples:
             print(f"warning: collected {collected_psd_samples} PSD samples, requested {args.psd_samples}")
+    if args.prior_recovery:
+        print("Prior recovery mode: skipped average-PSD likelihood diagnostic")
+    else:
+        average_model_active = np.maximum(average_psd[bptr.data.imin:bptr.data.imax], np.finfo(float).tiny)
+        average_summand = -(bptr.power / average_model_active + np.log(average_model_active))
+        average_loglike = float(np.sum(average_summand))
+        np.savetxt(
+            "BW_likelihood_summand.dat",
+            np.column_stack((bptr.freq, average_summand)),
+            header="frequency log_likelihood_summand",
+        )
+        print("Wrote BW_likelihood_summand.dat for the average PSD model")
+        print(f"Average PSD model log likelihood = {average_loglike:.12e} ({average_loglike / bptr.data.ncut:.12e} per frequency bin)")
 
     median_psd_out = psd_scale * median_psd
     if median_psd_out.size > 1:
         median_psd_out[0] = median_psd_out[1]
     median_smooth_out = psd_scale * median_spline
-    median_line_out = median_psd_out - median_smooth_out
+    median_gaussian_out = psd_scale * median_gaussian
+    median_line_out = median_psd_out - median_smooth_out - median_gaussian_out
     bwpsd_filename = tagged_output_name("BWpsd.dat", input_spec)
     frequency_data_filename = tagged_output_name("frequency_data.dat", input_spec)
     if input_spec.output_tag:
         print(f"Writing tagged main outputs: {bwpsd_filename}, {frequency_data_filename}")
     np.savetxt(bwpsd_filename, np.column_stack((bw_freq, median_psd_out)))
-    np.savetxt("BWpsd_components.dat", np.column_stack((bw_freq, median_psd_out, median_smooth_out, median_line_out)))
+    if args.gaussian_bumps:
+        np.savetxt("BWpsd_components.dat",
+                   np.column_stack((bw_freq, median_psd_out, median_smooth_out,
+                                    median_line_out, median_gaussian_out)))
+    else:
+        np.savetxt("BWpsd_components.dat", np.column_stack((bw_freq, median_psd_out, median_smooth_out, median_line_out)))
+    if args.psd_range:
+        std_psd = np.zeros_like(psd)
+        if collected_psd_samples > 0:
+            ddof = 1 if collected_psd_samples > 1 else 0
+            std_psd[bptr.data.imin:bptr.data.imax] = np.std(active_samples, axis=0, ddof=ddof)
+        mean_psd_out = psd_scale * average_psd
+        std_psd_out = psd_scale * std_psd
+        if mean_psd_out.size > 1:
+            mean_psd_out[0] = mean_psd_out[1]
+            std_psd_out[0] = std_psd_out[1]
+        np.savetxt("psd_range.dat", np.column_stack((bw_freq, mean_psd_out, std_psd_out)))
+        print("Wrote psd_range.dat with MCMC-sample mean PSD and standard deviation")
     np.savetxt(frequency_data_filename, freq_out)
     if args.write_glitch:
         write_glitch_time_domain_files(times, data, fdata, median_psd_out, dt, window_power_correction)
@@ -3496,7 +5173,11 @@ def main(argv: list[str]) -> int:
     if args.writewhite:
         write_whitened_line_subtracted_files(bptr, dataf_c, fdata, dt, bptr.rng)
     if args.write_line_subtracted_time:
+        write_line_subtracted_frequency_file(bptr, dataf_c, dt, bptr.rng)
         write_time_domain_line_subtracted_files(bptr, times, dataf_c, fdata, dt, bptr.rng)
+    if args.sinefit:
+        sinefit(bptr, N, alpha)
+        write_sine_subtracted_frequency_file(bptr, dataf_c, dt, N, alpha)
     timing_mark("write_outputs")
 
     if args.timing:
