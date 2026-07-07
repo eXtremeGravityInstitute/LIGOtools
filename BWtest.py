@@ -275,6 +275,8 @@ FEATURE_SNR_THRESH = 4.0
 FEATURE_QSCAN_SUBSCALE = 40
 SINEFIT_SCAN_POINTS = 41
 LINE_COUNT_PRIOR_ZETA = 0.5
+LINE_NU_MIN = 1.0e-5
+LINE_NU_MAX = 1.0e-1
 GAUSSIAN_BUMP_ARRAY_SCALE = 10.0
 GAUSSIAN_BUMP_SIGMA_MIN = 0.2
 GAUSSIAN_BUMP_SIGMA_MAX = 5.0
@@ -299,10 +301,10 @@ class LorentzianParams:
     nnu: int = 0
     wdth: int = 0
     imin: int = 0
-    numin: float = 1.0e-4
-    numax: float = 1.0e-1
-    lnumin: float = math.log(1.0e-4)
-    lnumax: float = math.log(1.0e-1)
+    numin: float = LINE_NU_MIN
+    numax: float = LINE_NU_MAX
+    lnumin: float = math.log(LINE_NU_MIN)
+    lnumax: float = math.log(LINE_NU_MAX)
     ltemplate: Optional[np.ndarray] = None
     peak_template: Optional[np.ndarray] = None
 
@@ -1368,7 +1370,7 @@ def windowed_lorentzian_template(f0: float, nu: float, amp: float, jwidth: int, 
 
 def generate_lorentzian_lookup(t_obs: float, tukey_rise: float = T_RISE, nf: int = 40,
                                nnu: int = 20, wdth: Optional[int] = None,
-                               numin: float = 1.0e-4, numax: float = 1.0e-1,
+                               numin: float = LINE_NU_MIN, numax: float = LINE_NU_MAX,
                                n_samples: Optional[int] = None,
                                oversample: int = 128) -> Tuple[int, int, int, float, float, np.ndarray]:
     """Generate the duration/rise-dependent lookup table used by llook."""
@@ -1465,27 +1467,68 @@ def load_lorentzian_lookup(t_obs: float, tukey_rise: float = T_RISE,
     """Load an existing lookup table, or compute and save it if missing."""
 
     filename = Path(f"lookup_{int(round(t_obs))}_{tukey_rise:.2f}.dat")
-    if not filename.exists():
-        print(f"{filename} not found; generating windowed Lorentzian lookup table")
+    expected_nf = 40
+    expected_nnu = 20
+    expected_wdth = max(4, int(16.0 * t_obs))
+    expected_numin = LINE_NU_MIN
+    expected_numax = LINE_NU_MAX
+
+    def generate_and_write(reason: str) -> Tuple[int, int, int, float, float, np.ndarray]:
+        print(f"{filename} {reason}; generating windowed Lorentzian lookup table")
         if not SCIPY_AVAILABLE:
             print("warning: scipy is not available; falling back to slow np.convolve lookup generation")
         nf, nnu, wdth, numin, numax, ltemplate = generate_lorentzian_lookup(
-            t_obs, tukey_rise=tukey_rise, n_samples=n_samples
+            t_obs, tukey_rise=tukey_rise, nf=expected_nf, nnu=expected_nnu,
+            wdth=expected_wdth, numin=expected_numin, numax=expected_numax,
+            n_samples=n_samples
         )
         write_lorentzian_lookup(filename, nf, nnu, wdth, numin, numax, ltemplate)
         return nf, nnu, wdth, numin, numax, ltemplate
 
-    with filename.open("r", encoding="utf-8") as handle:
-        header = handle.readline().split()
+    if not filename.exists():
+        return generate_and_write("not found")
+
+    try:
+        with filename.open("r", encoding="utf-8") as handle:
+            header = handle.readline().split()
+        if len(header) != 5:
+            return generate_and_write("header is malformed")
+        nf = int(header[0])
+        nnu = int(header[1])
+        wdth = int(header[2])
+        numin = float(header[3])
+        numax = float(header[4])
+    except (OSError, ValueError):
+        return generate_and_write("header could not be read")
+
+    header_matches = (
+        nf == expected_nf
+        and nnu == expected_nnu
+        and wdth == expected_wdth
+        and math.isclose(numin, expected_numin, rel_tol=1.0e-12, abs_tol=0.0)
+        and math.isclose(numax, expected_numax, rel_tol=1.0e-12, abs_tol=0.0)
+    )
+    if not header_matches:
+        print(
+            f"{filename} header {nf} {nnu} {wdth} {numin:e} {numax:e} "
+            f"does not match expected {expected_nf} {expected_nnu} {expected_wdth} "
+            f"{expected_numin:e} {expected_numax:e}"
+        )
+        return generate_and_write("has stale lookup settings")
+
     nf = int(header[0])
     nnu = int(header[1])
     wdth = int(header[2])
     numin = float(header[3])
     numax = float(header[4])
-    values = np.loadtxt(filename, dtype=np.float64, skiprows=1)
+    try:
+        values = np.loadtxt(filename, dtype=np.float64, skiprows=1)
+    except (OSError, ValueError):
+        return generate_and_write("body could not be read")
     expected = (nf + 1) * (nnu + 1) * wdth
     if values.size != expected:
-        raise ValueError(f"{filename} has {values.size} template values; expected {expected}")
+        print(f"{filename} has {values.size} template values; expected {expected}")
+        return generate_and_write("has incomplete lookup data")
     return nf, nnu, wdth, numin, numax, values.reshape((nf + 1, nnu + 1, wdth))
 
 
@@ -1498,8 +1541,9 @@ def load_lorentzian_peak_lookup(t_obs: float, nf: int, nnu: int, wdth: int,
     if n_samples is None:
         n_samples = int(round(2.0 * t_obs * 1024.0))
     filename = Path(f"lookup_peak_{int(round(t_obs))}_{tukey_rise:.2f}.dat")
-    if not filename.exists():
-        print(f"{filename} not found; generating windowed Lorentzian peak-response table")
+
+    def generate_and_write(reason: str) -> np.ndarray:
+        print(f"{filename} {reason}; generating windowed Lorentzian peak-response table")
         if not SCIPY_AVAILABLE:
             print("warning: scipy is not available; falling back to slow np.convolve peak generation")
         peak_template = generate_lorentzian_peak_lookup(
@@ -1511,20 +1555,38 @@ def load_lorentzian_peak_lookup(t_obs: float, nf: int, nnu: int, wdth: int,
                 handle.write(f"{value:.16e}\n")
         return peak_template
 
-    with filename.open("r", encoding="utf-8") as handle:
-        header = handle.readline().split()
-    file_nf = int(header[0])
-    file_nnu = int(header[1])
-    file_wdth = int(header[2])
-    file_numin = float(header[3])
-    file_numax = float(header[4])
+    if not filename.exists():
+        return generate_and_write("not found")
+
+    try:
+        with filename.open("r", encoding="utf-8") as handle:
+            header = handle.readline().split()
+        if len(header) != 5:
+            return generate_and_write("header is malformed")
+        file_nf = int(header[0])
+        file_nnu = int(header[1])
+        file_wdth = int(header[2])
+        file_numin = float(header[3])
+        file_numax = float(header[4])
+    except (OSError, ValueError):
+        return generate_and_write("header could not be read")
+
     if (file_nf != nf or file_nnu != nnu or file_wdth != wdth
-            or not math.isclose(file_numin, numin) or not math.isclose(file_numax, numax)):
-        raise ValueError(f"{filename} metadata do not match the Lorentzian lookup table")
-    values = np.loadtxt(filename, dtype=np.float64, skiprows=1)
+            or not math.isclose(file_numin, numin, rel_tol=1.0e-12, abs_tol=0.0)
+            or not math.isclose(file_numax, numax, rel_tol=1.0e-12, abs_tol=0.0)):
+        print(
+            f"{filename} header {file_nf} {file_nnu} {file_wdth} {file_numin:e} {file_numax:e} "
+            f"does not match expected {nf} {nnu} {wdth} {numin:e} {numax:e}"
+        )
+        return generate_and_write("has stale lookup settings")
+    try:
+        values = np.loadtxt(filename, dtype=np.float64, skiprows=1)
+    except (OSError, ValueError):
+        return generate_and_write("body could not be read")
     expected = (nf + 1) * (nnu + 1)
     if values.size != expected:
-        raise ValueError(f"{filename} has {values.size} peak values; expected {expected}")
+        print(f"{filename} has {values.size} peak values; expected {expected}")
+        return generate_and_write("has incomplete peak data")
     return values.reshape((nf + 1, nnu + 1))
 
 
