@@ -78,7 +78,12 @@ Usage examples:
         is at the center of the file and crops the usual trigger+4 analysis
         segment.  With --expand 1 this cropped segment is also the PSD segment.
         With --expand > 1 the file must contain the full centered PSD segment.
-    --linetrim Turns on the prior that exponentially supresses the number of lines
+    --linetrim Turns on the prior that exponentially supresses the number of lines.
+        The C BayesLine sampler currently keeps this prior on, so use this flag
+        when comparing Python BWtest output directly against BWtest.c.
+    --linecut X Sets the cut_lorentz delta-log-likelihood threshold used to
+        retain refined Lorentzian lines. The earlier lineget/Lpeak admission
+        passes use staged thresholds 100, 30, linemul, linemul.
     --prior-recovery Runs the RJMCMC with a constant likelihood and writes
         prior_recovery_counts.dat with iteration, number of lines, and number
         of spline knots for reversible-jump balance checks. With
@@ -87,6 +92,8 @@ Usage examples:
         using the second half of the trace by default; with --gaussian-bumps,
         this includes prior_recovery_gaussian_histogram.dat.
     --rjmcmc-steps N Sets the number of RJMCMC iterations, default 100000.
+    --seed N Sets the random seed used by both the startup fit and RJMCMC,
+        default 1234.
     --gaussian-bumps Turns on an additional reversible-jump model component
         for broad Gaussian PSD excesses. The model starts with zero bumps; the
         sampler can add/delete/update bumps only in the RJMCMC stage.
@@ -128,6 +135,12 @@ Important output files:
 
     BL_start.dat
         Optional startup diagnostic: frequency, periodogram, smooth PSD, line PSD.
+        The PSD columns are scaled to the same physical one-sided convention as
+        BWpsd.dat.
+
+    start_psd_bw.dat and spline.dat
+        Startup total PSD and Akima-spline knot diagnostics. These are also
+        scaled to the BWpsd.dat one-sided PSD convention.
 
     BWpsd_components.dat
         Median total, smooth, and line PSD components. With --gaussian-bumps,
@@ -264,6 +277,12 @@ except Exception:  # pragma: no cover - exercised on systems without numba
 TPI = 2.0 * math.pi
 LN2 = math.log(2.0)
 LINEMUL = 9.0
+LINECUT = 6.0
+# medspecspline uses LINEMUL for the PSD construction.  The line proposal can
+# use a lower threshold to help the RJMCMC visit weaker excesses without
+# changing the posterior target or the startup PSD model.
+LINE_PROPOSAL_THRESH = 7.0
+LINE_PROPOSAL_BOOST = 10.0
 T_RISE = 1.0
 FSTEP = 4.0
 DFMIN = 0.5
@@ -1006,7 +1025,8 @@ def robust_smooth(power: np.ndarray, width: int = 24) -> np.ndarray:
     return np.exp(moving_average_numba(np.log(np.maximum(clipped, np.finfo(float).tiny)), width))
 
 
-def medspecspline_power(power: np.ndarray, df: float, N: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+def medspecspline_power(power: np.ndarray, df: float, N: int,
+                        return_line_proposal: bool = False):
     """Python equivalent of C medspecspline, with Akima interpolation.
 
     The input is a periodogram-like power spectrum. The output triplet mirrors
@@ -1066,8 +1086,12 @@ def medspecspline_power(power: np.ndarray, df: float, N: int) -> Tuple[np.ndarra
         SM[1:] = np.exp(akima_eval_array(fc_arr, sc, nc, freqs[1:]))
         SM[0] = SM[1]
     SN = SM.copy()
+    line_proposal = np.ones(n2, dtype=np.float64)
     ratio = S / np.maximum(SM, np.finfo(float).tiny)
     SN[ratio > LINEMUL] = S[ratio > LINEMUL]
+    line_proposal[ratio > LINE_PROPOSAL_THRESH] = LINE_PROPOSAL_BOOST
+    if return_line_proposal:
+        return S, SN, SM, line_proposal
     return S, SN, SM
 
 
@@ -2565,15 +2589,17 @@ def write_sine_subtracted_frequency_file(bayesline: BayesLineParams,
 
 
 def lineget_candidates(power: np.ndarray, smooth: np.ndarray, freqs: np.ndarray,
-                       istart: int, iend: int, max_lines: int) -> np.ndarray:
-    """Find local periodogram peaks above LINEMUL, preserving C scan order."""
+                       istart: int, iend: int, max_lines: int,
+                       candidate_threshold: float) -> np.ndarray:
+    """Find local periodogram peaks above a staged power threshold."""
 
-    return lineget_candidates_numba(power, smooth, freqs, istart, iend, max_lines)
+    return lineget_candidates_numba(power, smooth, freqs, istart, iend, max_lines, candidate_threshold)
 
 
 @njit(cache=True)
 def lineget_candidates_numba(power: np.ndarray, smooth: np.ndarray, freqs: np.ndarray,
-                             istart: int, iend: int, max_lines: int) -> np.ndarray:
+                             istart: int, iend: int, max_lines: int,
+                             candidate_threshold: float) -> np.ndarray:
     """Compiled local peak finder for the C lineget scan."""
 
     start = max(3, istart)
@@ -2581,7 +2607,7 @@ def lineget_candidates_numba(power: np.ndarray, smooth: np.ndarray, freqs: np.nd
     found = np.empty(max_lines, dtype=np.float64)
     count = 0
     for i in range(start, stop):
-        if power[i] / max(smooth[i], np.finfo(np.float64).tiny) > LINEMUL:
+        if power[i] / max(smooth[i], np.finfo(np.float64).tiny) > candidate_threshold:
             if power[i] > power[i - 1] and power[i] > power[i + 1]:
                 found[count] = freqs[i]
                 count += 1
@@ -2689,7 +2715,7 @@ def cut_lorentz_windowed_numba(smooth: np.ndarray, line_model: np.ndarray,
                                t_obs: float, nf: int, nnu: int, wdth: int,
                                lnumin: float, lnumax: float, numin: float, numax: float,
                                ltemplate: np.ndarray, freq_offsets: np.ndarray,
-                               log_offsets: np.ndarray) -> Tuple[float, float, float, float]:
+                               log_offsets: np.ndarray, linecut: float) -> Tuple[float, float, float, float]:
     """Compiled C cut_lorentz equivalent, mutating line_model in-place."""
 
     n2 = power.size
@@ -2759,7 +2785,7 @@ def cut_lorentz_windowed_numba(smooth: np.ndarray, line_model: np.ndarray,
     for i in range(local_n):
         line_model[imin + i] = base[i]
 
-    if dlogL >= 10.0:
+    if dlogL >= linecut:
         add_lookup_line_inplace(line_model, t_obs, nf, nnu, wdth, lnumin, lnumax,
                                 ltemplate, best_f, best_amp, best_nu, 1.0)
         return dlogL, best_f, best_nu, best_amp
@@ -2768,7 +2794,7 @@ def cut_lorentz_windowed_numba(smooth: np.ndarray, line_model: np.ndarray,
 
 def cut_lorentz_windowed(line: LorentzianParams, smooth: np.ndarray, line_model: np.ndarray,
                          power: np.ndarray, f0: float, nu: float, amp: float,
-                         t_obs: float) -> Tuple[float, float, float, float, np.ndarray]:
+                         t_obs: float, linecut: float = LINECUT) -> Tuple[float, float, float, float, np.ndarray]:
     """C cut_lorentz: refine one candidate and remove it if it is not needed."""
 
     if line.ltemplate is None:
@@ -2777,14 +2803,17 @@ def cut_lorentz_windowed(line: LorentzianParams, smooth: np.ndarray, line_model:
     log_offsets = np.arange(-4, 5, dtype=np.float64) / 8.0
     dlogL, best_f, best_nu, best_amp = cut_lorentz_windowed_numba(
         smooth, line_model, power, f0, nu, amp, t_obs, line.nf, line.nnu, line.wdth,
-        line.lnumin, line.lnumax, line.numin, line.numax, line.ltemplate, freq_offsets, log_offsets
+        line.lnumin, line.lnumax, line.numin, line.numax, line.ltemplate, freq_offsets, log_offsets,
+        linecut
     )
     return dlogL, best_f, best_nu, best_amp, line_model
 
 
 def lorentzfit_four_pass(line: LorentzianParams, data_fft: np.ndarray, freqs: np.ndarray,
                          t_obs: float, istart: int, iend: int, max_lines: int,
-                         rng: np.random.Generator) -> np.ndarray:
+                         rng: np.random.Generator, linecut: float = LINECUT,
+                         line_proposal: Optional[np.ndarray] = None,
+                         line_proposal_lorentzfit: Optional[np.ndarray] = None) -> np.ndarray:
     """Four-pass C lorentzfit startup using windowed lines and lmcmc cleanup."""
 
     if line.ltemplate is None:
@@ -2810,11 +2839,15 @@ def lorentzfit_four_pass(line: LorentzianParams, data_fft: np.ndarray, freqs: np
 
     for m in range(4):
         lnm = lnu1 if m == 0 else (lnu2 if m == 1 else lnumax)
+        # The staged threshold limits early passes to only the loudest
+        # excesses, both in the raw candidate scan and the Lpeak admission
+        # test. linecut is the separate cut_lorentz refinement threshold.
+        candidate_threshold = 100.0 if m == 0 else (30.0 if m == 1 else LINEMUL)
         nu_grid = np.exp(lnumin + (lnm - lnumin) * np.arange(21, dtype=np.float64) / 20.0)
         power = 2.0 * np.abs(dprime[:n2]) ** 2
         PG, _, SM = medspecspline_power(power, 1.0 / t_obs, n)
-        candidates = lineget_candidates(PG, SM, freqs[:n2], istart, iend, max_lines)
-        print(f"There are {candidates.size} line candidates")
+        candidates = lineget_candidates(PG, SM, freqs[:n2], istart, iend, max_lines, candidate_threshold)
+        print(f"There are {candidates.size} line candidates above threshold {candidate_threshold:g}")
 
         added = 0
         for fpeak in candidates:
@@ -2824,12 +2857,20 @@ def lorentzfit_four_pass(line: LorentzianParams, data_fft: np.ndarray, freqs: np
                 float(fpeak), PG, SM, n, 2, t_obs, line.nf, line.nnu, line.wdth,
                 line.lnumin, line.lnumax, line.ltemplate, freq_offsets, nu_grid
             )
-            if best_logL > 10.0 and best_amp > 0.0:
+            if best_logL >= candidate_threshold and best_amp > 0.0:
                 idx = nltotal + added
                 lf[idx] = best_f
                 lnu[idx] = best_nu
                 lamp[idx] = best_amp
                 lgL[idx] = best_logL
+                if line_proposal is not None:
+                    prop_idx = int(best_f * t_obs)
+                    if 0 <= prop_idx < min(line_proposal.size, n2):
+                        line_proposal[prop_idx] = max(line_proposal[prop_idx], LINE_PROPOSAL_BOOST)
+                        if line_proposal_lorentzfit is not None:
+                            line_proposal_lorentzfit[prop_idx] = max(
+                                line_proposal_lorentzfit[prop_idx], LINE_PROPOSAL_BOOST
+                            )
                 add_lookup_line_inplace(line_model, t_obs, line.nf, line.nnu, line.wdth,
                                         line.lnumin, line.lnumax, line.ltemplate,
                                         best_f, best_amp, best_nu, 1.0)
@@ -2848,9 +2889,10 @@ def lorentzfit_four_pass(line: LorentzianParams, data_fft: np.ndarray, freqs: np
                 dlogL, fnew, nunew, ampnew = cut_lorentz_windowed_numba(
                     SM, line_model, PR, lf[iidx], lnu[iidx], lamp[iidx], t_obs,
                     line.nf, line.nnu, line.wdth, line.lnumin, line.lnumax,
-                    line.numin, line.numax, line.ltemplate, cut_freq_offsets, cut_log_offsets
+                    line.numin, line.numax, line.ltemplate, cut_freq_offsets, cut_log_offsets,
+                    linecut
                 )
-                if dlogL > 8.0 and kept < max_lines:
+                if dlogL >= linecut and kept < max_lines:
                     new_lf[kept] = fnew
                     new_lnu[kept] = nunew
                     new_lamp[kept] = ampnew
@@ -3154,7 +3196,11 @@ def BayesLineInitialize(bayesline: BayesLineParams) -> None:
 
 def blstart(line: LorentzianParams, data: np.ndarray, residual: np.ndarray, n: int, dt: float,
             fmin: float, fstep: float, Nsp: list[int], dspline: np.ndarray,
-            pspline: np.ndarray, max_lines: int) -> None:
+            pspline: np.ndarray, max_lines: int, linecut: float = LINECUT,
+            rng: Optional[np.random.Generator] = None,
+            line_proposal: Optional[np.ndarray] = None,
+            line_proposal_medspec: Optional[np.ndarray] = None,
+            line_proposal_lorentzfit: Optional[np.ndarray] = None) -> None:
     """C blstart equivalent.
 
     The ordering is important: wavelet-clean the time series, write that cleaned
@@ -3163,7 +3209,8 @@ def blstart(line: LorentzianParams, data: np.ndarray, residual: np.ndarray, n: i
     """
 
     freqs = np.fft.rfftfreq(n, dt)
-    rng = np.random.default_rng(1234)
+    if rng is None:
+        rng = np.random.default_rng(1234)
     cleaned_time = bayesline_clean_time(data, dt)
     fft = np.fft.rfft(cleaned_time)
     # C blstart writes BayesWave-scaled residual Fourier coefficients back to
@@ -3176,8 +3223,21 @@ def blstart(line: LorentzianParams, data: np.ndarray, residual: np.ndarray, n: i
     residual[1] = 0.0
     residual[2:n:2] = scaled_fft[1:n // 2].real
     residual[3:n + 1:2] = scaled_fft[1:n // 2].imag
+    if line_proposal is not None:
+        raw_power = 2.0 * np.abs(scaled_fft[:n // 2]) ** 2
+        _, _, _, proposal_full = medspecspline_power(
+            raw_power, 1.0 / (n * dt), n, return_line_proposal=True
+        )
+        ncopy = min(line_proposal.size, proposal_full.size)
+        line_proposal[:ncopy] = proposal_full[:ncopy]
+        if line_proposal_medspec is not None:
+            ncopy = min(line_proposal_medspec.size, proposal_full.size)
+            line_proposal_medspec[:ncopy] = proposal_full[:ncopy]
+    # lorentzfit adds any Lpeak-refined startup candidates to this same
+    # proposal map before cut_lorentz prunes weak lines.
     line_cleaned_fft = lorentzfit_four_pass(line, scaled_fft, freqs, n * dt,
-                                            istart, iend, max_lines, rng)
+                                            istart, iend, max_lines, rng, linecut,
+                                            line_proposal, line_proposal_lorentzfit)
     line_cleaned_power = 2.0 * np.abs(line_cleaned_fft[:n // 2]) ** 2
     _, _, SM = medspecspline_power(line_cleaned_power, 1.0 / (n * dt), n)
     splinef, splineA = splinestart_akima(n, istart, iend, fstep, SM, freqs[:n // 2], n * dt, rng)
@@ -3190,7 +3250,9 @@ def blstart(line: LorentzianParams, data: np.ndarray, residual: np.ndarray, n: i
 
 def BayesLineBurnin(bayesline: BayesLineParams, timeData: np.ndarray, freqData: np.ndarray,
                     ifo: str, fprop: np.ndarray, SplineFlag: int,
-                    write_start: bool = False) -> None:
+                    write_start: bool = False, output_psd_scale: float = 1.0,
+                    linecut: float = LINECUT,
+                    startup_rng: Optional[np.random.Generator] = None) -> None:
     """Run the C burn-in/startup path and optionally write startup diagnostics."""
 
     del ifo, SplineFlag
@@ -3200,8 +3262,12 @@ def BayesLineBurnin(bayesline: BayesLineParams, timeData: np.ndarray, freqData: 
     Nsp = [0]
     dspline = np.zeros(max(4, data.ncut), dtype=np.float64)
     pspline = np.zeros_like(dspline)
+    line_proposal_full = np.ones(data.n // 2, dtype=np.float64)
+    line_proposal_medspec_full = np.ones(data.n // 2, dtype=np.float64)
+    line_proposal_lorentzfit_full = np.ones(data.n // 2, dtype=np.float64)
     blstart(bayesline.lines_x, timeData, freqData, data.n, data.t_obs / data.n, data.fmin,
-            data.fgrid, Nsp, dspline, pspline, bayesline.maxBLLines)
+            data.fgrid, Nsp, dspline, pspline, bayesline.maxBLLines, linecut, startup_rng,
+            line_proposal_full, line_proposal_medspec_full, line_proposal_lorentzfit_full)
     imax = data.imax
     imin = data.imin
     bayesline.power = (freqData[2 * imin:2 * imax:2] ** 2 +
@@ -3219,14 +3285,42 @@ def BayesLineBurnin(bayesline: BayesLineParams, timeData: np.ndarray, freqData: 
     if bayesline.bumps_x is not None:
         bayesline.bumps_x.n = 0
     bayesline.Snf = bayesline.Sbase + bayesline.Sline + bayesline.Sgauss
+    # The startup spline and line finder follow C medspecspline, which builds
+    # models from the one-sided power 2*|d_f|^2.  The long RJMCMC state and
+    # BWpsd.dat convention use the half-complex likelihood PSD units, so startup
+    # model diagnostics need an extra factor of 1/2 when converted to the final
+    # physical one-sided PSD scale.  The periodogram diagnostic keeps the same
+    # convention as periodogram.dat: its expectation is 2*PSD.
+    startup_model_scale = 0.5 * output_psd_scale
     if write_start:
-        np.savetxt(BL_START_FILENAME, np.column_stack((bayesline.freq, bayesline.power,
-                                                       bayesline.Sbase, bayesline.Sline)))
-    fprop[:data.ncut] = 1.0
-    fprop[:data.ncut][2.0 * bayesline.power / np.maximum(bayesline.Sbase, np.finfo(float).tiny) > 10.0] = 100.0
+        np.savetxt(
+            BL_START_FILENAME,
+            np.column_stack((
+                bayesline.freq,
+                2.0 * output_psd_scale * bayesline.power,
+                startup_model_scale * bayesline.Sbase,
+                startup_model_scale * bayesline.Sline,
+            )),
+        )
+    # Proposal only: this data-derived histogram guides line birth and
+    # global-relocation moves toward medspecspline excess bins. The Hastings
+    # ratio uses the same fprop density, so this does not become a prior or
+    # double-count the data in the target posterior.
+    fprop[:data.ncut] = line_proposal_full[data.imin:data.imax]
     fsum = float(np.sum(fprop[:data.ncut]))
     if fsum > 0.0:
         fprop[:data.ncut] /= fsum
+        source_norm = fsum
+    else:
+        fprop[:data.ncut] = 1.0 / max(1, data.ncut)
+        source_norm = float(max(1, data.ncut))
+    medspec_source = line_proposal_medspec_full[data.imin:data.imax] / source_norm
+    lorentzfit_source = line_proposal_lorentzfit_full[data.imin:data.imax] / source_norm
+    np.savetxt(
+        "line_proposal.dat",
+        np.column_stack((bayesline.freq, fprop[:data.ncut], medspec_source, lorentzfit_source)),
+        header="frequency normalized_line_proposal medspec_source_scaled lorentzfit_source_scaled",
+    )
     print(f"There are {bayesline.lines_x.n} line candidates")
     print(f"Total lines {bayesline.lines_x.n}")
 
@@ -3244,8 +3338,9 @@ def BayesLineBurnin(bayesline: BayesLineParams, timeData: np.ndarray, freqData: 
     bayesline.priors.upper = (bayesline.Sbase + 100.0 * bayesline.Sline) * 10.0
     bayesline.priors.upper = np.maximum(bayesline.priors.upper, bayesline.priors.lower * 100.0)
 
-    np.savetxt("start_psd_bw.dat", np.column_stack((bayesline.freq, bayesline.Snf)))
-    np.savetxt("spline.dat", np.column_stack((bayesline.spline.points, np.exp(bayesline.spline.data))))
+    np.savetxt("start_psd_bw.dat", np.column_stack((bayesline.freq, startup_model_scale * bayesline.Snf)))
+    np.savetxt("spline.dat", np.column_stack((bayesline.spline.points,
+                                              startup_model_scale * np.exp(bayesline.spline.data))))
 
 
 def BayesLineLorentzSplineMCMC(bayesline: BayesLineParams, heat: float, steps: int,
@@ -4610,7 +4705,17 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--linetrim",
         "--line-trim",
         action="store_true",
-        help=f"turn on the exp(-ZETA*nlines) line-count prior with ZETA={LINE_COUNT_PRIOR_ZETA:g}; off by default",
+        help=(
+            f"turn on the exp(-ZETA*nlines) line-count prior with ZETA={LINE_COUNT_PRIOR_ZETA:g}; "
+            "off by default, but on in the C BayesLine sampler"
+        ),
+    )
+    parser.add_argument(
+        "--linecut",
+        "--line-cut",
+        type=float,
+        default=LINECUT,
+        help="cut_lorentz delta-log-likelihood retention threshold, default %(default)g",
     )
     parser.add_argument(
         "--gaussian_bumps",
@@ -4655,6 +4760,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         type=int,
         default=100000,
         help="number of Lorentzian+spline RJMCMC iterations, default %(default)d",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=1234,
+        help="random seed for startup and RJMCMC stochastic steps, default %(default)d",
     )
     parser.add_argument(
         "--psd_samples",
@@ -4790,6 +4901,12 @@ def main(argv: list[str]) -> int:
         return 1
     if args.rjmcmc_steps < 1:
         print("warning: --rjmcmc-steps must be at least 1")
+        return 1
+    if args.seed < 0:
+        print("warning: --seed must be non-negative")
+        return 1
+    if not math.isfinite(args.linecut) or args.linecut < 0.0:
+        print("warning: --linecut must be finite and non-negative")
         return 1
     if (not math.isfinite(args.prior_recovery_plot_burnin)
             or args.prior_recovery_plot_burnin < 0.0
@@ -5016,6 +5133,8 @@ def main(argv: list[str]) -> int:
         fit_dt = dt
         fit_alpha = alpha
         fit_window_power_correction = window_power_correction
+    output_psd_scale = 4.0 * window_power_correction / Tobs
+    fit_output_psd_scale = 4.0 * fit_window_power_correction / fit_Tobs
     raw_freq = np.arange(1, N // 2, dtype=np.float64) / Tobs
     raw_power = 2.0 * dt * dt * window_power_correction * np.abs(dataf_c[1:N // 2]) ** 2 / Tobs
     np.savetxt("periodogram_raw.dat", np.column_stack((raw_freq, raw_power)))
@@ -5031,6 +5150,9 @@ def main(argv: list[str]) -> int:
     fprop = np.zeros(fit_N // 2, dtype=np.float64)
 
     fit_bptr = BayesLineParams()
+    run_seed = int(args.seed)
+    fit_bptr.rng = np.random.default_rng(run_seed)
+    startup_rng = np.random.default_rng(run_seed)
     BayesLineSetup(fit_bptr, fit_fdata, fmin, fmax, fit_dt, fit_Tobs)
     fit_bptr.gaussianSigmaMin = float(args.gaussian_bump_sigma_min)
     fit_bptr.gaussianSigmaMax = float(args.gaussian_bump_sigma_max)
@@ -5060,6 +5182,7 @@ def main(argv: list[str]) -> int:
             f"projection internal scale={projection_scale:.6e}"
         )
     print(f"BayesLine line array size = {fit_bptr.maxBLLines}")
+    print(f"BayesLine startup linecut = {args.linecut:g}")
     if args.gaussian_bumps:
         print(
             "Gaussian bump RJMCMC enabled: "
@@ -5067,21 +5190,26 @@ def main(argv: list[str]) -> int:
             f"sigma range = [{fit_bptr.gaussianSigmaMin:g}, {fit_bptr.gaussianSigmaMax:g}] Hz"
         )
     timing_mark("BayesLineSetup")
-    BayesLineBurnin(fit_bptr, fit_data, fit_fdata, "H1", fprop, 1, write_start=args.write_bl_start)
+    BayesLineBurnin(
+        fit_bptr, fit_data, fit_fdata, "H1", fprop, 1,
+        write_start=args.write_bl_start,
+        output_psd_scale=fit_output_psd_scale,
+        linecut=args.linecut,
+        startup_rng=startup_rng,
+    )
     adapt_post_startup_model_caps(fit_bptr)
     timing_mark("BayesLineBurnin")
 
     assert fit_bptr.data is not None and fit_bptr.Sbase is not None and fit_bptr.Snf is not None
     imin = int(fit_bptr.data.fmin * fit_Tobs)
-    output_psd_scale = 4.0 * window_power_correction / Tobs
-    fit_output_psd_scale = 4.0 * fit_window_power_correction / fit_Tobs
+    startup_model_psd_scale = 0.5 * fit_output_psd_scale
     p_freq = np.arange(imin, fit_N // 2, dtype=np.float64) / fit_Tobs
     p_pow = fit_output_psd_scale * 2.0 * (fit_fdata[2 * imin:fit_N:2] ** 2 +
                                           fit_fdata[2 * imin + 1:fit_N + 1:2] ** 2)
     model_len = p_freq.size
     np.savetxt("periodogram.dat", np.column_stack((p_freq, p_pow[:model_len],
-                                                   fit_output_psd_scale * fit_bptr.Sbase[:model_len],
-                                                   fit_output_psd_scale * fit_bptr.Snf[:model_len])))
+                                                   startup_model_psd_scale * fit_bptr.Sbase[:model_len],
+                                                   startup_model_psd_scale * fit_bptr.Snf[:model_len])))
     fprop_freq = np.arange(fit_bptr.data.imin, fit_N // 2, dtype=np.float64) / fit_Tobs
     np.savetxt("fprop.dat", np.column_stack((fprop_freq, fprop[:fprop_freq.size])))
     timing_mark("startup_diagnostics")
