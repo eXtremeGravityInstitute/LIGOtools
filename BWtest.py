@@ -27,18 +27,19 @@ Usage examples:
     Running on a LVK machine
     python BWtest.py 1126259462.4 8 --channel H1:GDS-CALIB_STRAIN --nyquist 1024
 
-    LVK frame read with expanded PSD estimation
+    LVK frame read with a symmetric context prior
     python BWtest.py 1126259462.4 8 --channel H1:GDS-CALIB_STRAIN \
         --nyquist 1024 --expand 4
 
-        Here the requested analysis duration is 8 seconds and the PSD duration
-        is 4*8 = 32 seconds.  The analysis segment is still the usual
-        [1126259458.4, 1126259466.4], ending 4 seconds after the trigger.  It
-        is used for frequency_data.dat, whitening, glitch/feature output, and
-        line-subtracted diagnostics.  The PSD-estimation segment is centered
-        on the trigger, [1126259446.4, 1126259478.4], and is used for BayesLine
-        burn-in/RJMCMC.  The final PSD model from that 32-second fit is rebuilt
-        on the 8-second analysis grid before writing BWpsd.dat.
+        Here the requested analysis duration is 8 seconds. The target analysis
+        segment is still the usual [1126259458.4, 1126259466.4], ending 4 seconds
+        after the trigger.  With --expand 4, BWtest takes two 8-second chunks
+        before the target and two 8-second chunks after it, wavelet-cleans each
+        chunk independently, averages their powers on the 8-second frequency
+        grid, and runs a context RJMCMC with the proper four-segment Welch
+        likelihood. Those same-grid context PSD samples become an inflated
+        component prior plus a line-birth proposal for a second RJMCMC run on
+        the actual 8-second target segment.
     
     Running anywhere and getting the data from GWOSC
     python BWtest.py 1126259462.4 8 --source open --ifo L1 --nyquist 1024
@@ -56,34 +57,48 @@ Usage examples:
     the requested Nyquist.
     
     Use python BWtest.py --help to see the many additional options. Some of these are
-    --expand N Uses N times the requested analysis duration for PSD estimation,
-        then projects the PSD model back to the requested analysis grid. N must
-        be a power of two. The default is 1, which keeps the original path.
+    --expand N Uses N target-duration context chunks split evenly before and
+        after the target segment for a two-stage PSD run. N must be a power of
+        two. The default is 1, which keeps the original one-segment path.
 
         When N > 1, BWtest uses two segments:
         * the requested analysis segment still ends 4 seconds after the trigger
           and is used for frequency_data.dat, whitening, glitch/feature output,
           and line-subtracted diagnostics;
-        * the longer PSD segment is centered on the trigger and is used only for
-          BayesLine burn-in/RJMCMC, including startup line finding and lmcmc
-          line subtraction during PSD initialization.
+        * the context has N independent Tobs chunks split evenly before and
+          after the target. Initialization uses the nearest preceding chunk.
+          The context RJMCMC then uses the average cleaned power from all chunks
+          with likelihood multiplicity N, equivalent to the correct Welch
+          likelihood for N independent periodograms on the same grid.
+          Context PSD samples are summarized as component priors: the smooth
+          spline component uses a Gaussian prior in log PSD, while line and
+          Gaussian-bump components use Gaussian priors in
+          log1p(component/smooth). The standard deviations are inflated by
+          --context-prior-inflate, default sqrt(N), and floored by
+          --context-prior-sigma-floor, default 0.5.
 
-        The final PSD model is then rebuilt on the requested analysis grid.
-        The spline and Gaussian components are evaluated on that grid; the
-        Lorentzian line component is rebuilt with the requested-duration Tukey
-        lookup table.
+        The target run skips startup line/spline discovery and starts from the
+        final same-grid context state. It uses the context components
+        as priors and a context-derived line proposal, but the likelihood is
+        computed only from the target analysis segment.  Expanded runs write
+        context_psd_prior.dat, context_component_prior.dat, fprop_context.dat,
+        and line_proposal.dat so the context prior and proposal can be
+        inspected. Since context and target use the same duration, the final
+        context state is copied directly onto the target line/spline grids.
 
         For user-supplied files, providing a duration, e.g.
-        ``python BWtest.py frame_32.dat 8``, means BWtest assumes the trigger
-        is at the center of the file and crops the usual trigger+4 analysis
-        segment.  With --expand 1 this cropped segment is also the PSD segment.
-        With --expand > 1 the file must contain the full centered PSD segment.
+        ``python BWtest.py frame_40.dat 8 --expand 4``, means BWtest assumes the
+        target 8-second analysis segment is centered in the file, with two
+        8-second context chunks before and two after. With --expand 1 the
+        historical file behavior is unchanged: the file center is treated as the
+        trigger and the trigger+4 analysis segment is cropped.
     --linetrim Turns on the prior that exponentially supresses the number of lines.
         The C BayesLine sampler currently keeps this prior on, so use this flag
         when comparing Python BWtest output directly against BWtest.c.
     --linecut X Sets the cut_lorentz delta-log-likelihood threshold used to
         retain refined Lorentzian lines. The earlier lineget/Lpeak admission
-        passes use staged thresholds 100, 30, linemul, linemul.
+        passes use staged periodogram thresholds 100, 30, linemul, linemul;
+        the late Lpeak likelihood admission threshold is LINETHRESH.
     --prior-recovery Runs the RJMCMC with a constant likelihood and writes
         prior_recovery_counts.dat with iteration, number of lines, and number
         of spline knots for reversible-jump balance checks. With
@@ -145,6 +160,20 @@ Important output files:
     BWpsd_components.dat
         Median total, smooth, and line PSD components. With --gaussian-bumps,
         a fifth column gives the broad-Gaussian component.
+
+    context_psd_prior.dat and context_component_prior.dat
+        Written for --expand > 1. context_psd_prior.dat is a plotting diagnostic
+        for the same-grid context PSD prior: frequency, total PSD center, and
+        total log-PSD sigma. context_component_prior.dat records the active
+        component priors used by the target run: smooth PSD center and log sigma,
+        plus log1p(component/smooth) centers and sigmas for the line component
+        and, when enabled, Gaussian bumps.
+
+    line_parameters.dat
+        Optional with --write-line-params: final fair-draw Lorentzian line
+        parameters, including the fitted windowed peak height and the inferred
+        raw Lorentzian amplitude. For fetched data this file is tagged in the
+        same way as BWpsd.dat.
 
     psd_range.dat
         Optional with --psd-range: frequency, MCMC-sample mean PSD, and
@@ -278,10 +307,11 @@ TPI = 2.0 * math.pi
 LN2 = math.log(2.0)
 LINEMUL = 9.0
 LINECUT = 6.0
+LINETHRESH = 8.0
 # medspecspline uses LINEMUL for the PSD construction.  The line proposal can
 # use a lower threshold to help the RJMCMC visit weaker excesses without
 # changing the posterior target or the startup PSD model.
-LINE_PROPOSAL_THRESH = 7.0
+LINE_PROPOSAL_THRESH = 6.0
 LINE_PROPOSAL_BOOST = 10.0
 T_RISE = 1.0
 FSTEP = 4.0
@@ -304,6 +334,7 @@ DEFAULT_ANALYSIS_FMAX = 1024.0
 TRIGGER_OFFSET_FROM_END = 4.0
 BL_START_FILENAME = "BL_start.dat"
 LINE_ARRAY_SCALE = 500.0
+CONTEXT_PRIOR_LOG_SIGMA_FLOOR = 0.5
 
 
 @dataclass
@@ -325,7 +356,6 @@ class LorentzianParams:
     lnumin: float = math.log(LINE_NU_MIN)
     lnumax: float = math.log(LINE_NU_MAX)
     ltemplate: Optional[np.ndarray] = None
-    peak_template: Optional[np.ndarray] = None
 
     def __post_init__(self) -> None:
         self.f = np.zeros(self.size, dtype=np.float64)
@@ -404,6 +434,15 @@ class BayesLinePriors:
     upper: Optional[np.ndarray] = None
     mean: Optional[np.ndarray] = None
     sigma: Optional[np.ndarray] = None
+    use_context_psd_prior: bool = False
+    use_context_component_prior: bool = False
+    smooth_mean: Optional[np.ndarray] = None
+    smooth_sigma: Optional[np.ndarray] = None
+    component_reference: Optional[np.ndarray] = None
+    line_log1p_mean: Optional[np.ndarray] = None
+    line_log1p_sigma: Optional[np.ndarray] = None
+    gaussian_log1p_mean: Optional[np.ndarray] = None
+    gaussian_log1p_sigma: Optional[np.ndarray] = None
 
 
 @dataclass
@@ -434,6 +473,7 @@ class BayesLineParams:
     rng: np.random.Generator = field(default_factory=lambda: np.random.default_rng(1234))
     constantLogLFlag: int = 0
     flatPriorFlag: int = 0
+    power_multiplicity: float = 1.0
 
 
 def line_array_size_for_duration(t_obs: float) -> int:
@@ -567,8 +607,8 @@ def moving_average_numba(x: np.ndarray, half_width: int) -> np.ndarray:
 
 
 @njit(cache=True)
-def loglike_numba(power: np.ndarray, sn: np.ndarray) -> float:
-    """Whittle likelihood for periodogram samples given a PSD model."""
+def loglike_numba(power: np.ndarray, sn: np.ndarray, multiplicity: float) -> float:
+    """Whittle likelihood for averaged periodogram samples given a PSD model."""
 
     val = 0.0
     tiny = np.finfo(np.float64).tiny
@@ -576,7 +616,7 @@ def loglike_numba(power: np.ndarray, sn: np.ndarray) -> float:
         s = sn[i]
         if s < tiny:
             s = tiny
-        val -= power[i] / s + math.log(s)
+        val -= multiplicity * (power[i] / s + math.log(s))
     return val
 
 
@@ -594,6 +634,53 @@ def logprior_bounds_numba(lower: np.ndarray, upper: np.ndarray, sn: np.ndarray) 
         if s < lower[i]:
             ds = math.log(s) - math.log(max(lower[i], tiny))
             val -= 0.5 * ds * ds
+    return val
+
+
+@njit(cache=True)
+def logprior_logpsd_gaussian_numba(mean: np.ndarray, sigma: np.ndarray, sn: np.ndarray) -> float:
+    """Gaussian log-PSD prior used by the two-stage --expand context run."""
+
+    val = 0.0
+    tiny = np.finfo(np.float64).tiny
+    for i in range(sn.size):
+        s = max(sn[i], tiny)
+        mu = math.log(max(mean[i], tiny))
+        sig = max(sigma[i], 1.0e-12)
+        z = (math.log(s) - mu) / sig
+        val -= 0.5 * z * z
+    return val
+
+
+@njit(cache=True)
+def logprior_smooth_component_numba(mean: np.ndarray, sigma: np.ndarray,
+                                    sbase: np.ndarray) -> float:
+    """Gaussian log-prior for the smooth Akima component."""
+
+    val = 0.0
+    tiny = np.finfo(np.float64).tiny
+    for i in range(sbase.size):
+        s = max(sbase[i], tiny)
+        mu = math.log(max(mean[i], tiny))
+        sig = max(sigma[i], 1.0e-12)
+        z = (math.log(s) - mu) / sig
+        val -= 0.5 * z * z
+    return val
+
+
+@njit(cache=True)
+def logprior_ratio_component_numba(reference: np.ndarray, mean: np.ndarray,
+                                   sigma: np.ndarray, component: np.ndarray) -> float:
+    """Gaussian prior for non-negative PSD components in log1p(component/reference)."""
+
+    val = 0.0
+    tiny = np.finfo(np.float64).tiny
+    for i in range(component.size):
+        ref = max(reference[i], tiny)
+        x = math.log1p(max(component[i], 0.0) / ref)
+        sig = max(sigma[i], 1.0e-12)
+        z = (x - mean[i]) / sig
+        val -= 0.5 * z * z
     return val
 
 
@@ -640,6 +727,70 @@ def delta_logprior_bounds_range_numba(lower: np.ndarray, upper: np.ndarray,
             new_penalty -= 0.5 * ds * ds
 
         val += new_penalty - old_penalty
+    return val
+
+
+@njit(cache=True)
+def delta_logprior_logpsd_gaussian_range_numba(mean: np.ndarray, sigma: np.ndarray,
+                                               sn_new: np.ndarray, sn_old: np.ndarray,
+                                               ilow: int, ihigh: int) -> float:
+    """Local difference of the context Gaussian log-PSD prior."""
+
+    val = 0.0
+    tiny = np.finfo(np.float64).tiny
+    lo = max(0, ilow)
+    hi = min(sn_new.size, ihigh)
+    for i in range(lo, hi):
+        mu = math.log(max(mean[i], tiny))
+        sig = max(sigma[i], 1.0e-12)
+        sold = max(sn_old[i], tiny)
+        snew = max(sn_new[i], tiny)
+        zold = (math.log(sold) - mu) / sig
+        znew = (math.log(snew) - mu) / sig
+        val += -0.5 * znew * znew + 0.5 * zold * zold
+    return val
+
+
+@njit(cache=True)
+def delta_logprior_smooth_component_range_numba(mean: np.ndarray, sigma: np.ndarray,
+                                                sbase_new: np.ndarray, sbase_old: np.ndarray,
+                                                ilow: int, ihigh: int) -> float:
+    """Local difference of the smooth-component context prior."""
+
+    val = 0.0
+    tiny = np.finfo(np.float64).tiny
+    lo = max(0, ilow)
+    hi = min(sbase_new.size, ihigh)
+    for i in range(lo, hi):
+        mu = math.log(max(mean[i], tiny))
+        sig = max(sigma[i], 1.0e-12)
+        sold = max(sbase_old[i], tiny)
+        snew = max(sbase_new[i], tiny)
+        zold = (math.log(sold) - mu) / sig
+        znew = (math.log(snew) - mu) / sig
+        val += -0.5 * znew * znew + 0.5 * zold * zold
+    return val
+
+
+@njit(cache=True)
+def delta_logprior_ratio_component_range_numba(reference: np.ndarray, mean: np.ndarray,
+                                               sigma: np.ndarray, comp_new: np.ndarray,
+                                               comp_old: np.ndarray, ilow: int,
+                                               ihigh: int) -> float:
+    """Local difference of a log1p(component/reference) context prior."""
+
+    val = 0.0
+    tiny = np.finfo(np.float64).tiny
+    lo = max(0, ilow)
+    hi = min(comp_new.size, ihigh)
+    for i in range(lo, hi):
+        ref = max(reference[i], tiny)
+        sig = max(sigma[i], 1.0e-12)
+        xold = math.log1p(max(comp_old[i], 0.0) / ref)
+        xnew = math.log1p(max(comp_new[i], 0.0) / ref)
+        zold = (xold - mean[i]) / sig
+        znew = (xnew - mean[i]) / sig
+        val += -0.5 * znew * znew + 0.5 * zold * zold
     return val
 
 
@@ -750,18 +901,6 @@ def lorentzian_lookup_value(ltemplate: np.ndarray, ii: int, jj: int,
 
 
 @njit(cache=True)
-def lorentzian_peak_response_value(peak_template: np.ndarray, t_obs: float,
-                                   nf: int, nnu: int, lnumin: float, lnumax: float,
-                                   f0: float, nu: float) -> float:
-    """Interpolate the raw-unit peak of a windowed Lorentzian."""
-
-    _, ii, jj, y, z = lorentzian_lookup_params(t_obs, nf, nnu, lnumin, lnumax, f0, nu)
-    logv = (1.0 - z) * ((1.0 - y) * peak_template[ii, jj] + y * peak_template[ii + 1, jj])
-    logv += z * ((1.0 - y) * peak_template[ii, jj + 1] + y * peak_template[ii + 1, jj + 1])
-    return math.exp(logv)
-
-
-@njit(cache=True)
 def local_lorentzian_template(t_obs: float, nf: int, nnu: int, wdth: int,
                               lnumin: float, lnumax: float, ltemplate: np.ndarray,
                               f0: float, amp: float, nu: float) -> Tuple[int, np.ndarray]:
@@ -820,7 +959,7 @@ def add_lookup_line_band_inplace(line_model: np.ndarray, data_imin: int, t_obs: 
 
 @njit(cache=True)
 def delta_loglike_range(power: np.ndarray, sn_new: np.ndarray, sn_old: np.ndarray,
-                        ilow: int, ihigh: int) -> float:
+                        ilow: int, ihigh: int, multiplicity: float) -> float:
     """Likelihood difference over a local proposal window."""
 
     val = 0.0
@@ -830,7 +969,7 @@ def delta_loglike_range(power: np.ndarray, sn_new: np.ndarray, sn_old: np.ndarra
     for i in range(lo, hi):
         snew = max(sn_new[i], tiny)
         sold = max(sn_old[i], tiny)
-        val += power[i] / sold - power[i] / snew + math.log(sold / snew)
+        val += multiplicity * (power[i] / sold - power[i] / snew + math.log(sold / snew))
     return val
 
 
@@ -1441,40 +1580,6 @@ def generate_lorentzian_lookup(t_obs: float, tukey_rise: float = T_RISE, nf: int
     return nf, nnu, wdth, numin, numax, ltemplate
 
 
-def generate_lorentzian_peak_lookup(t_obs: float, tukey_rise: float, nf: int,
-                                    nnu: int, wdth: int, numin: float, numax: float,
-                                    n_samples: int, oversample: int = 128) -> np.ndarray:
-    """Generate log peak response before lookup-table unit-peak normalization."""
-
-    alpha = 2.0 * tukey_rise / t_obs
-    nx = oversample * n_samples
-    jwidth = wdth * oversample // 2
-
-    tuk = np.full(n_samples, 1.0 / n_samples, dtype=np.float64)
-    tukey_inplace(tuk, alpha)
-    tuk_long = np.zeros(nx, dtype=np.float64)
-    start = nx // 2
-    tuk_long[start:start + n_samples] = tuk
-    tuk_fft = np.fft.rfft(tuk_long)
-    twl = np.abs(tuk_fft[:jwidth]) ** 2
-
-    peak_template = np.zeros((nf + 1, nnu + 1), dtype=np.float64)
-    lnumin = math.log(numin)
-    lnumax = math.log(numax)
-    m = int(40.0 * t_obs)
-    tiny = np.finfo(float).tiny
-
-    for ii in range(nf + 1):
-        f0 = 40.0 + (2.0 * ii - nf) / nf * 0.5 / t_obs
-        for jj in range(nnu + 1):
-            nu = math.exp(lnumin + (lnumax - lnumin) * jj / nnu)
-            line = windowed_lorentzian_template(f0, nu, 1.0, jwidth, n_samples, t_obs, oversample, twl)
-            lo = max(0, m - 4)
-            hi = min(line.size, m + 5)
-            peak_template[ii, jj] = math.log(max(float(np.max(line[lo:hi])), tiny))
-    return peak_template
-
-
 def write_lorentzian_lookup(filename: Path, nf: int, nnu: int, wdth: int,
                             numin: float, numax: float, ltemplate: np.ndarray) -> None:
     """Write a lookup table in the same flat text format as BayesLine.c."""
@@ -1556,64 +1661,6 @@ def load_lorentzian_lookup(t_obs: float, tukey_rise: float = T_RISE,
     return nf, nnu, wdth, numin, numax, values.reshape((nf + 1, nnu + 1, wdth))
 
 
-def load_lorentzian_peak_lookup(t_obs: float, nf: int, nnu: int, wdth: int,
-                                numin: float, numax: float,
-                                tukey_rise: float = T_RISE,
-                                n_samples: Optional[int] = None) -> np.ndarray:
-    """Load or compute the duration-dependent line peak-response table."""
-
-    if n_samples is None:
-        n_samples = int(round(2.0 * t_obs * 1024.0))
-    filename = Path(f"lookup_peak_{int(round(t_obs))}_{tukey_rise:.2f}.dat")
-
-    def generate_and_write(reason: str) -> np.ndarray:
-        print(f"{filename} {reason}; generating windowed Lorentzian peak-response table")
-        if not SCIPY_AVAILABLE:
-            print("warning: scipy is not available; falling back to slow np.convolve peak generation")
-        peak_template = generate_lorentzian_peak_lookup(
-            t_obs, tukey_rise, nf, nnu, wdth, numin, numax, n_samples
-        )
-        with filename.open("w", encoding="utf-8") as handle:
-            handle.write(f"{nf} {nnu} {wdth} {numin:e} {numax:e}\n")
-            for value in peak_template.reshape(-1):
-                handle.write(f"{value:.16e}\n")
-        return peak_template
-
-    if not filename.exists():
-        return generate_and_write("not found")
-
-    try:
-        with filename.open("r", encoding="utf-8") as handle:
-            header = handle.readline().split()
-        if len(header) != 5:
-            return generate_and_write("header is malformed")
-        file_nf = int(header[0])
-        file_nnu = int(header[1])
-        file_wdth = int(header[2])
-        file_numin = float(header[3])
-        file_numax = float(header[4])
-    except (OSError, ValueError):
-        return generate_and_write("header could not be read")
-
-    if (file_nf != nf or file_nnu != nnu or file_wdth != wdth
-            or not math.isclose(file_numin, numin, rel_tol=1.0e-12, abs_tol=0.0)
-            or not math.isclose(file_numax, numax, rel_tol=1.0e-12, abs_tol=0.0)):
-        print(
-            f"{filename} header {file_nf} {file_nnu} {file_wdth} {file_numin:e} {file_numax:e} "
-            f"does not match expected {nf} {nnu} {wdth} {numin:e} {numax:e}"
-        )
-        return generate_and_write("has stale lookup settings")
-    try:
-        values = np.loadtxt(filename, dtype=np.float64, skiprows=1)
-    except (OSError, ValueError):
-        return generate_and_write("body could not be read")
-    expected = (nf + 1) * (nnu + 1)
-    if values.size != expected:
-        print(f"{filename} has {values.size} peak values; expected {expected}")
-        return generate_and_write("has incomplete peak data")
-    return values.reshape((nf + 1, nnu + 1))
-
-
 def attach_lorentzian_lookup(lines: LorentzianParams, data: DataParams) -> None:
     """Attach the lookup metadata and table to the active line model."""
 
@@ -1627,17 +1674,6 @@ def attach_lorentzian_lookup(lines: LorentzianParams, data: DataParams) -> None:
     lines.lnumin = math.log(numin)
     lines.lnumax = math.log(numax)
     lines.ltemplate = ltemplate
-
-
-def attach_lorentzian_peak_lookup(lines: LorentzianParams, data: DataParams) -> None:
-    """Attach the raw-to-windowed peak response used for duration projection."""
-
-    if lines.peak_template is not None:
-        return
-    lines.peak_template = load_lorentzian_peak_lookup(
-        data.t_obs, lines.nf, lines.nnu, lines.wdth,
-        lines.numin, lines.numax, n_samples=data.n
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -2839,15 +2875,20 @@ def lorentzfit_four_pass(line: LorentzianParams, data_fft: np.ndarray, freqs: np
 
     for m in range(4):
         lnm = lnu1 if m == 0 else (lnu2 if m == 1 else lnumax)
-        # The staged threshold limits early passes to only the loudest
-        # excesses, both in the raw candidate scan and the Lpeak admission
-        # test. linecut is the separate cut_lorentz refinement threshold.
+        # The staged power threshold limits early passes to only the loudest
+        # periodogram excesses. The late-pass Lpeak likelihood threshold is
+        # decoupled from LINEMUL so the RJMCMC can be seeded with weaker line
+        # candidates without changing medspecspline's PSD construction.
         candidate_threshold = 100.0 if m == 0 else (30.0 if m == 1 else LINEMUL)
+        likelihood_threshold = 100.0 if m == 0 else (30.0 if m == 1 else LINETHRESH)
         nu_grid = np.exp(lnumin + (lnm - lnumin) * np.arange(21, dtype=np.float64) / 20.0)
         power = 2.0 * np.abs(dprime[:n2]) ** 2
         PG, _, SM = medspecspline_power(power, 1.0 / t_obs, n)
         candidates = lineget_candidates(PG, SM, freqs[:n2], istart, iend, max_lines, candidate_threshold)
-        print(f"There are {candidates.size} line candidates above threshold {candidate_threshold:g}")
+        print(
+            f"There are {candidates.size} line candidates above power threshold {candidate_threshold:g} "
+            f"(Lpeak threshold {likelihood_threshold:g})"
+        )
 
         added = 0
         for fpeak in candidates:
@@ -2857,7 +2898,7 @@ def lorentzfit_four_pass(line: LorentzianParams, data_fft: np.ndarray, freqs: np
                 float(fpeak), PG, SM, n, 2, t_obs, line.nf, line.nnu, line.wdth,
                 line.lnumin, line.lnumax, line.ltemplate, freq_offsets, nu_grid
             )
-            if best_logL >= candidate_threshold and best_amp > 0.0:
+            if best_logL >= likelihood_threshold and best_amp > 0.0:
                 idx = nltotal + added
                 lf[idx] = best_f
                 lnu[idx] = best_nu
@@ -2955,7 +2996,8 @@ def spline_proposal_update(prop_points: np.ndarray, prop_sdata: np.ndarray,
                            sbase: np.ndarray, fixed_psd: np.ndarray, snx: np.ndarray,
                            power: np.ndarray, logLx: float, spline_flag: int,
                            changed_index: int,
-                           compute_loglike: bool = True) -> Tuple[np.ndarray, np.ndarray, Optional[float], int, int]:
+                           compute_loglike: bool = True,
+                           multiplicity: float = 1.0) -> Tuple[np.ndarray, np.ndarray, Optional[float], int, int]:
     """Build a proposed PSD after a spline move, using local Akima updates.
 
     The Akima branch mirrors BayesLine.c: changing one spline knot only affects
@@ -2978,7 +3020,7 @@ def spline_proposal_update(prop_points: np.ndarray, prop_sdata: np.ndarray,
         sn_prop[imin:imax] = sbase_prop[imin:imax] + fixed_psd[imin:imax]
     logLy_local = None
     if compute_loglike:
-        logLy_local = logLx + delta_loglike_range(power, sn_prop, snx, imin, imax)
+        logLy_local = logLx + delta_loglike_range(power, sn_prop, snx, imin, imax, multiplicity)
     return sbase_prop, sn_prop, logLy_local, imin, imax
 
 
@@ -3016,18 +3058,90 @@ def full_spectrum_spline(Sline: np.ndarray, data: DataParams, lines: LorentzianP
                                  lines.f, lines.a, lines.nu, lines.n)
 
 
-def loglike(power: np.ndarray, sn: np.ndarray) -> float:
+def loglike(power: np.ndarray, sn: np.ndarray, multiplicity: float = 1.0) -> float:
     """Python wrapper around the numba likelihood kernel."""
 
-    return float(loglike_numba(power, sn))
+    return float(loglike_numba(power, sn, multiplicity))
 
 
-def logprior_bounds(priors: BayesLinePriors, sn: np.ndarray) -> float:
-    """Evaluate the PSD soft-bound prior if bounds are configured."""
+def logprior_model(priors: BayesLinePriors, sn: np.ndarray,
+                   sbase: np.ndarray, sline: np.ndarray,
+                   sgauss: np.ndarray) -> float:
+    """Evaluate active PSD/component priors for the current model."""
 
-    if priors.lower is None or priors.upper is None:
-        return 0.0
-    return float(logprior_bounds_numba(priors.lower, priors.upper, sn))
+    val = 0.0
+    if priors.lower is not None and priors.upper is not None:
+        val += float(logprior_bounds_numba(priors.lower, priors.upper, sn))
+    if priors.use_context_psd_prior and priors.mean is not None and priors.sigma is not None:
+        val += float(logprior_logpsd_gaussian_numba(priors.mean, priors.sigma, sn))
+    if priors.use_context_component_prior:
+        if priors.smooth_mean is not None and priors.smooth_sigma is not None:
+            val += float(logprior_smooth_component_numba(
+                priors.smooth_mean, priors.smooth_sigma, sbase
+            ))
+        if (priors.component_reference is not None
+                and priors.line_log1p_mean is not None
+                and priors.line_log1p_sigma is not None):
+            val += float(logprior_ratio_component_numba(
+                priors.component_reference, priors.line_log1p_mean,
+                priors.line_log1p_sigma, sline
+            ))
+        if (priors.component_reference is not None
+                and priors.gaussian_log1p_mean is not None
+                and priors.gaussian_log1p_sigma is not None):
+            val += float(logprior_ratio_component_numba(
+                priors.component_reference, priors.gaussian_log1p_mean,
+                priors.gaussian_log1p_sigma, sgauss
+            ))
+    return val
+
+
+def has_local_psd_prior(priors: BayesLinePriors) -> bool:
+    """Return True when a local proposal can update the prior incrementally."""
+
+    return ((priors.lower is not None and priors.upper is not None)
+            or (priors.use_context_psd_prior and priors.mean is not None and priors.sigma is not None)
+            or priors.use_context_component_prior)
+
+
+def delta_logprior_range(priors: BayesLinePriors,
+                         sn_new: np.ndarray, sn_old: np.ndarray,
+                         sbase_new: np.ndarray, sbase_old: np.ndarray,
+                         sline_new: np.ndarray, sline_old: np.ndarray,
+                         sgauss_new: np.ndarray, sgauss_old: np.ndarray,
+                         ilow: int, ihigh: int) -> float:
+    """Local PSD-prior difference for proposals that only touch a small band."""
+
+    val = 0.0
+    if priors.lower is not None and priors.upper is not None:
+        val += float(delta_logprior_bounds_range_numba(
+            priors.lower, priors.upper, sn_new, sn_old, ilow, ihigh
+        ))
+    if priors.use_context_psd_prior and priors.mean is not None and priors.sigma is not None:
+        val += float(delta_logprior_logpsd_gaussian_range_numba(
+            priors.mean, priors.sigma, sn_new, sn_old, ilow, ihigh
+        ))
+    if priors.use_context_component_prior:
+        if priors.smooth_mean is not None and priors.smooth_sigma is not None:
+            val += float(delta_logprior_smooth_component_range_numba(
+                priors.smooth_mean, priors.smooth_sigma,
+                sbase_new, sbase_old, ilow, ihigh
+            ))
+        if (priors.component_reference is not None
+                and priors.line_log1p_mean is not None
+                and priors.line_log1p_sigma is not None):
+            val += float(delta_logprior_ratio_component_range_numba(
+                priors.component_reference, priors.line_log1p_mean,
+                priors.line_log1p_sigma, sline_new, sline_old, ilow, ihigh
+            ))
+        if (priors.component_reference is not None
+                and priors.gaussian_log1p_mean is not None
+                and priors.gaussian_log1p_sigma is not None):
+            val += float(delta_logprior_ratio_component_range_numba(
+                priors.component_reference, priors.gaussian_log1p_mean,
+                priors.gaussian_log1p_sigma, sgauss_new, sgauss_old, ilow, ihigh
+            ))
+    return val
 
 
 def rjdraw(model: float, sp: float, prange: float, pmin: float, rng: np.random.Generator) -> float:
@@ -3194,6 +3308,25 @@ def BayesLineInitialize(bayesline: BayesLineParams) -> None:
         bayesline.Snf = bayesline.Sbase + bayesline.Sline + bayesline.Sgauss
 
 
+def set_power_from_scaled_frequency_data(bayesline: BayesLineParams, freqData: np.ndarray) -> None:
+    """Set likelihood power from BayesLine's post-cleaning dt/sqrt(2) Fourier data.
+
+    BayesLineSetup sees raw FFT packing and initializes power with 2*|d_f|^2.
+    BayesLineBurnin then replaces freqData with the C/BayesWave scaled Fourier
+    convention and updates power to |d_f|^2.  The --expand target stage skips
+    Burnin, so it must make that replacement explicitly after setup.
+    """
+
+    if bayesline.data is None:
+        raise RuntimeError("BayesLine data are not initialized")
+    data = bayesline.data
+    bayesline.power = (
+        freqData[2 * data.imin:2 * data.imax:2] ** 2
+        + freqData[2 * data.imin + 1:2 * data.imax + 1:2] ** 2
+    ).copy()
+    bayesline.spow = bayesline.power.copy()
+
+
 def blstart(line: LorentzianParams, data: np.ndarray, residual: np.ndarray, n: int, dt: float,
             fmin: float, fstep: float, Nsp: list[int], dspline: np.ndarray,
             pspline: np.ndarray, max_lines: int, linecut: float = LINECUT,
@@ -3352,8 +3485,7 @@ def BayesLineLorentzSplineMCMC(bayesline: BayesLineParams, heat: float, steps: i
                                count_trace: Optional[np.ndarray] = None,
                                line_trim: bool = False,
                                gaussian_bumps: bool = False,
-                               projection_target: Optional[BayesLineParams] = None,
-                               projection_scale: float = 1.0) -> int:
+                               debug_acceptance: bool = False) -> int:
     """Main reversible-jump sampler for spline knots, Lorentzians, and optional Gaussian bumps."""
 
     assert bayesline.data is not None
@@ -3373,6 +3505,7 @@ def BayesLineLorentzSplineMCMC(bayesline: BayesLineParams, heat: float, steps: i
     freq = bayesline.freq
     power = bayesline.power
     priors = bayesline.priors
+    likelihood_multiplicity = max(float(bayesline.power_multiplicity), np.finfo(float).tiny)
 
     flow = data.flow
     fhigh = data.fhigh
@@ -3407,11 +3540,14 @@ def BayesLineLorentzSplineMCMC(bayesline: BayesLineParams, heat: float, steps: i
         if bumps is not None and not gaussian_enabled:
             bumps.n = 0
     snx = sbase + sline + sgauss
-    logLx = 1.0 if bayesline.constantLogLFlag else loglike(power, snx)
-    logPsx = logprior_bounds(priors, snx) if priorFlag == 1 else 0.0
+    logLx = 1.0 if bayesline.constantLogLFlag else loglike(power, snx, likelihood_multiplicity)
+    logPsx = logprior_model(priors, snx, sbase, sline, sgauss) if priorFlag == 1 else 0.0
 
     ac = np.zeros(8, dtype=np.int64)
     cc = np.ones(8, dtype=np.int64)
+    proposal_attempts = np.zeros(8, dtype=np.int64)
+    proposal_valid = np.zeros(8, dtype=np.int64)
+    proposal_invalid = np.zeros(8, dtype=np.int64)
     fweights = np.maximum(fprop[:ncut], np.finfo(float).tiny)
     if np.sum(fweights) <= 0.0:
         fweights[:] = 1.0
@@ -3579,7 +3715,8 @@ def BayesLineLorentzSplineMCMC(bayesline: BayesLineParams, heat: float, steps: i
                     sbase_prop, sn_prop, logLy_local, proposal_ilow, proposal_ihigh = spline_proposal_update(
                         prop_points, prop_sdata, freq, data, sbase, fixed_psd, snx,
                         power, logLx, SplineFlag, spline_changed_index,
-                        compute_loglike=not bayesline.constantLogLFlag
+                        compute_loglike=not bayesline.constantLogLFlag,
+                        multiplicity=likelihood_multiplicity
                     )
 
         elif choose_bump:
@@ -3611,7 +3748,9 @@ def BayesLineLorentzSplineMCMC(bayesline: BayesLineParams, heat: float, steps: i
                         if ihigh <= ilow:
                             check = True
                         elif not bayesline.constantLogLFlag:
-                            logLy_local = logLx + delta_loglike_range(power, sn_prop, snx, ilow, ihigh)
+                            logLy_local = logLx + delta_loglike_range(
+                                power, sn_prop, snx, ilow, ihigh, likelihood_multiplicity
+                            )
                     else:
                         check = True
                 else:
@@ -3642,7 +3781,9 @@ def BayesLineLorentzSplineMCMC(bayesline: BayesLineParams, heat: float, steps: i
                         if ihigh <= ilow:
                             check = True
                         elif not bayesline.constantLogLFlag:
-                            logLy_local = logLx + delta_loglike_range(power, sn_prop, snx, ilow, ihigh)
+                            logLy_local = logLx + delta_loglike_range(
+                                power, sn_prop, snx, ilow, ihigh, likelihood_multiplicity
+                            )
                     else:
                         check = True
             else:
@@ -3701,7 +3842,9 @@ def BayesLineLorentzSplineMCMC(bayesline: BayesLineParams, heat: float, steps: i
                         if proposal_ihigh <= proposal_ilow:
                             check = True
                         elif not bayesline.constantLogLFlag:
-                            logLy_local = logLx + delta_loglike_range(power, sn_prop, snx, proposal_ilow, proposal_ihigh)
+                            logLy_local = logLx + delta_loglike_range(
+                                power, sn_prop, snx, proposal_ilow, proposal_ihigh, likelihood_multiplicity
+                            )
                 else:
                     check = True
 
@@ -3741,12 +3884,14 @@ def BayesLineLorentzSplineMCMC(bayesline: BayesLineParams, heat: float, steps: i
                         proposal_ilow = ilow
                         proposal_ihigh = ihigh
                         if not bayesline.constantLogLFlag:
-                            logLy_local = logLx + delta_loglike_range(power, sn_prop, snx, ilow, ihigh)
+                            logLy_local = logLx + delta_loglike_range(
+                                power, sn_prop, snx, ilow, ihigh, likelihood_multiplicity
+                            )
                     else:
                         check = True
                 else:
                     typ = 3
-                    if lines.n > 1:
+                    if lines.n > 0:
                         ki = int(rng.integers(0, lines.n))
                         of = prop_f[ki]
                         oa = prop_a[ki]
@@ -3778,7 +3923,9 @@ def BayesLineLorentzSplineMCMC(bayesline: BayesLineParams, heat: float, steps: i
                         proposal_ilow = ilow
                         proposal_ihigh = ihigh
                         if not bayesline.constantLogLFlag:
-                            logLy_local = logLx + delta_loglike_range(power, sn_prop, snx, ilow, ihigh)
+                            logLy_local = logLx + delta_loglike_range(
+                                power, sn_prop, snx, ilow, ihigh, likelihood_multiplicity
+                            )
                     else:
                         check = True
             else:
@@ -3846,24 +3993,38 @@ def BayesLineLorentzSplineMCMC(bayesline: BayesLineParams, heat: float, steps: i
                         proposal_ilow = ilow
                         proposal_ihigh = ihigh
                         if not bayesline.constantLogLFlag:
-                            logLy_local = logLx + delta_loglike_range(power, sn_prop, snx, ilow, ihigh)
+                            logLy_local = logLx + delta_loglike_range(
+                                power, sn_prop, snx, ilow, ihigh, likelihood_multiplicity
+                            )
                 else:
                     check = True
 
-        if not check and sn_prop is not None and positive_range_numba(sn_prop, proposal_ilow, proposal_ihigh):
+        proposal_positive = False
+        if not check and sn_prop is not None:
+            proposal_positive = positive_range_numba(sn_prop, proposal_ilow, proposal_ihigh)
+        if typ >= 0 and 0 <= lbl < proposal_attempts.size:
+            proposal_attempts[lbl] += 1
+            if not check and sn_prop is not None and proposal_positive:
+                proposal_valid[lbl] += 1
+            else:
+                proposal_invalid[lbl] += 1
+
+        if not check and sn_prop is not None and proposal_positive:
             if bayesline.constantLogLFlag:
                 logLy = 1.0
             elif logLy_local is not None:
                 logLy = logLy_local
             else:
-                logLy = loglike(power, sn_prop)
+                logLy = loglike(power, sn_prop, likelihood_multiplicity)
             if priorFlag == 1:
-                if priors.lower is not None and priors.upper is not None and logLy_local is not None:
-                    logPsy = logPsx + delta_logprior_bounds_range_numba(
-                        priors.lower, priors.upper, sn_prop, snx, proposal_ilow, proposal_ihigh
+                if has_local_psd_prior(priors) and logLy_local is not None:
+                    logPsy = logPsx + delta_logprior_range(
+                        priors, sn_prop, snx,
+                        sbase_prop, sbase, sline_prop, sline, sgauss_prop, sgauss,
+                        proposal_ilow, proposal_ihigh
                     )
                 else:
-                    logPsy = logprior_bounds(priors, sn_prop)
+                    logPsy = logprior_model(priors, sn_prop, sbase_prop, sline_prop, sgauss_prop)
             else:
                 logPsy = 0.0
             if line_trim:
@@ -3908,21 +4069,11 @@ def BayesLineLorentzSplineMCMC(bayesline: BayesLineParams, heat: float, steps: i
                 count_trace[mc, 3] = 0 if bumps is None else bumps.n
 
         if sample_count < sample_target and mc >= sample_start and (mc - sample_start) % sample_stride == 0:
-            if projection_target is not None:
-                target_sbase, _target_sline, target_sgauss, target_snf = projected_model_components_from_state(
-                    spline, lines, bumps, data, projection_target, projection_scale, SplineFlag, gaussian_enabled
-                )
-                psd_samples[sample_count, :] = target_snf
-                if spline_samples is not None:
-                    spline_samples[sample_count, :] = target_sbase
-                if gaussian_samples is not None:
-                    gaussian_samples[sample_count, :] = target_sgauss
-            else:
-                psd_samples[sample_count, :] = snx
-                if spline_samples is not None:
-                    spline_samples[sample_count, :] = sbase
-                if gaussian_samples is not None:
-                    gaussian_samples[sample_count, :] = sgauss
+            psd_samples[sample_count, :] = snx
+            if spline_samples is not None:
+                spline_samples[sample_count, :] = sbase
+            if gaussian_samples is not None:
+                gaussian_samples[sample_count, :] = sgauss
             sample_count += 1
 
         if mc % 1000 == 0:
@@ -3953,6 +4104,14 @@ def BayesLineLorentzSplineMCMC(bayesline: BayesLineParams, heat: float, steps: i
     bayesline.Snf = final_snf
     ratio = power / np.maximum(final_snf, np.finfo(float).tiny)
     dan[0] = float(np.max(ratio))
+    if debug_acceptance:
+        print("MCMC proposal diagnostics by label")
+        for ii in range(8):
+            print(
+                f"  label {ii}: attempts {proposal_attempts[ii]} "
+                f"valid {proposal_valid[ii]} invalid {proposal_invalid[ii]} "
+                f"accepted {ac[ii]}"
+            )
     return sample_count
 
 
@@ -3965,8 +4124,7 @@ def BayesLineRJMCMC(bayesline: BayesLineParams, freqData: np.ndarray, psd: np.nd
                     count_trace: Optional[np.ndarray] = None,
                     line_trim: bool = False,
                     gaussian_bumps: bool = False,
-                    projection_target: Optional[BayesLineParams] = None,
-                    projection_scale: float = 1.0) -> int:
+                    debug_acceptance: bool = False) -> int:
     """Public C-style RJMCMC wrapper that returns full-band PSD arrays."""
 
     del freqData
@@ -3978,16 +4136,9 @@ def BayesLineRJMCMC(bayesline: BayesLineParams, freqData: np.ndarray, psd: np.nd
         count_trace=count_trace,
         line_trim=line_trim,
         gaussian_bumps=gaussian_bumps,
-        projection_target=projection_target,
-        projection_scale=projection_scale
+        debug_acceptance=debug_acceptance
     )
-    if projection_target is not None:
-        project_bayesline_state_to_target(
-            bayesline, projection_target, projection_scale, SplineFlag, gaussian_bumps
-        )
-        output_state = projection_target
-    else:
-        output_state = bayesline
+    output_state = bayesline
     assert output_state.data is not None and output_state.Snf is not None and output_state.Sbase is not None
     data = output_state.data
     psd.fill(0.0)
@@ -4022,20 +4173,16 @@ def segment_bounds(trigger_time: float, duration: float) -> Tuple[float, float]:
     return start, end
 
 
-def centered_segment_bounds(center_time: float, duration: float) -> Tuple[float, float]:
-    """Return a segment of the given duration centered on ``center_time``."""
-
-    half = 0.5 * duration
-    return center_time - half, center_time + half
-
-
 def expanded_fetch_bounds(trigger_time: float, analysis_duration: float,
                           expand: int) -> Tuple[float, float]:
-    """Return the union needed for the analysis segment and expanded PSD segment."""
+    """Return the union needed for the target segment and symmetric context."""
 
     analysis_start, analysis_end = segment_bounds(trigger_time, analysis_duration)
-    psd_start, psd_end = centered_segment_bounds(trigger_time, analysis_duration * float(expand))
-    return min(analysis_start, psd_start), max(analysis_end, psd_end)
+    before_chunks = expand // 2
+    after_chunks = expand - before_chunks
+    context_start = analysis_start - analysis_duration * float(before_chunks)
+    context_end = analysis_end + analysis_duration * float(after_chunks)
+    return min(analysis_start, context_start), max(analysis_end, context_end)
 
 
 def is_power_of_two_int(value: int) -> bool:
@@ -4201,14 +4348,17 @@ def fetch_ligo_data(trigger_time: float, duration: float, ifo: str, source: str,
 
 
 def read_frame(filename: str) -> Tuple[np.ndarray, np.ndarray]:
-    """Read a two-column strain file: GPS time and strain."""
+    """Read a two-column strain file: GPS time and strain.
+
+    The full file is allowed to be non-power-of-two because segmented modes can
+    contain context plus target data. Each FFT segment is checked after cropping.
+    """
 
     arr = np.loadtxt(filename, dtype=np.float64)
     if arr.ndim != 2 or arr.shape[1] < 2:
         raise ValueError(f"{filename} must contain at least two columns")
     time = arr[:, 0].copy()
     strain = arr[:, 1].copy()
-    _require_power_of_two(strain.size)
     return time, strain
 
 
@@ -4266,93 +4416,111 @@ def prepare_frequency_segment(times: np.ndarray, strain: np.ndarray,
     return times.copy(), data, dataf_c, fdata, dt, alpha, window_power_correction
 
 
-def projected_line_amplitudes(lines: LorentzianParams, source_data: DataParams,
-                              target_lines: LorentzianParams, target_data: DataParams,
-                              internal_scale: float) -> np.ndarray:
-    """Map fit-duration line peak heights to target-duration peak heights.
+def cleaned_scaled_fdata_from_windowed(data: np.ndarray, dt: float) -> np.ndarray:
+    """Return BayesLine-scaled Fourier data after wavelet cleaning one segment."""
 
-    ``lines.a`` is not a raw oscillator amplitude.  The lookup table stores a
-    unit-peak, Tukey-windowed Lorentzian shape, so ``lines.a`` is the peak
-    height of that windowed profile in BayesLine's internal PSD units.
+    n = data.size
+    cleaned_time = bayesline_clean_time(data, dt)
+    cleaned_fft = np.fft.rfft(cleaned_time) * (dt / math.sqrt(2.0))
+    fdata = np.zeros(n, dtype=np.float64)
+    fdata[2:n:2] = cleaned_fft[1:n // 2].real
+    fdata[3:n + 1:2] = cleaned_fft[1:n // 2].imag
+    return fdata
 
-    When ``--expand`` is used, the sampler fits a longer PSD segment but the
-    reported products live on the shorter analysis segment.  Two conversions
-    are needed:
 
-    1. ``internal_scale`` converts between internal PSD units.  The physical
-       PSD output scale is ``4 * window_power_correction / Tobs``, so the
-       factor of 4 cancels between the fit and target durations.
-    2. A raw line with the same ``f0`` and ``nu`` has a different windowed peak
-       after convolution with the fit-duration Tukey window than it does after
-       convolution with the target-duration Tukey window.  The peak lookup
-       stores that raw-to-windowed response, so multiplying by
-       ``target_peak / fit_peak`` keeps the underlying physical line fixed
-       while rebuilding it with the target-duration lookup table.
+def full_power_from_scaled_fdata(fdata: np.ndarray) -> np.ndarray:
+    """Return internal BayesLine power from dt/sqrt(2)-scaled packed FFT data."""
+
+    n = fdata.size
+    power = np.zeros(n // 2, dtype=np.float64)
+    power[1:] = fdata[2:n:2] ** 2 + fdata[3:n + 1:2] ** 2
+    return power
+
+
+def build_same_grid_context_average_power(context_times: np.ndarray,
+                                          context_strain: np.ndarray,
+                                          duration: float,
+                                          chunk_count: int,
+                                          no_tukey: bool) -> Tuple[np.ndarray, np.ndarray, float, float, float]:
+    """Average independently cleaned powers from same-duration context chunks.
+
+    The chunks all have the target duration, so the averaged power lives on the
+    same Fourier grid and uses the same windowed-Lorentzian lookup as the
+    target analysis segment.  The context RJMCMC supplies the statistical SNR
+    boost through ``power_multiplicity = chunk_count``.
     """
 
-    scaled_line_amp = lines.a[:lines.n] * internal_scale
-    if lines.n > 0:
-        if lines.peak_template is not None and target_lines.peak_template is not None:
-            scaled_line_amp = scaled_line_amp.copy()
-            for k in range(lines.n):
-                fit_peak = lorentzian_peak_response_value(
-                    lines.peak_template, source_data.t_obs, lines.nf, lines.nnu,
-                    lines.lnumin, lines.lnumax, float(lines.f[k]), float(lines.nu[k])
-                )
-                target_peak = lorentzian_peak_response_value(
-                    target_lines.peak_template, target_data.t_obs, target_lines.nf, target_lines.nnu,
-                    target_lines.lnumin, target_lines.lnumax, float(lines.f[k]), float(lines.nu[k])
-                )
-                scaled_line_amp[k] *= target_peak / max(fit_peak, np.finfo(float).tiny)
-    return scaled_line_amp
+    if chunk_count < 1:
+        raise ValueError("context chunk count must be positive")
+    if context_strain.size % chunk_count != 0:
+        raise ValueError("context segment cannot be split into equal chunks")
+    chunk_n = context_strain.size // chunk_count
+    _require_power_of_two(chunk_n)
+    if context_times.size != context_strain.size:
+        raise ValueError("context time/strain arrays have different lengths")
 
-
-def projected_model_components_from_state(spline: SplineParams,
-                                          lines: LorentzianParams,
-                                          bumps: Optional[GaussianBumpParams],
-                                          source_data: DataParams,
-                                          target: BayesLineParams,
-                                          internal_scale: float,
-                                          spline_flag: int,
-                                          gaussian_enabled: bool) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Project the current fit state onto a target-duration BayesLine grid.
-
-    Smooth spline and Gaussian-bump amplitudes only need the internal-unit
-    conversion because they are evaluated directly at the target frequencies.
-    Lorentzian lines need the extra peak-response correction handled by
-    ``projected_line_amplitudes`` because their stored amplitudes refer to a
-    duration-dependent Tukey-windowed lookup profile.
-    """
-
-    if target.data is None or target.freq is None or target.lines_x is None:
-        raise RuntimeError("target BayesLine state is not initialized for projection")
-    target_data = target.data
-    target_lines = target.lines_x
-    scaled_spline_data = spline.data + math.log(internal_scale)
-    sbase = np.exp(spline_eval_array(spline.points, scaled_spline_data, target.freq, spline_flag))
-
-    if lines.n > 0:
-        scaled_line_amp = projected_line_amplitudes(
-            lines, source_data, target_lines, target_data, internal_scale
+    power_sum = np.zeros(chunk_n // 2, dtype=np.float64)
+    raw_power_sum = np.zeros(chunk_n // 2 - 1, dtype=np.float64)
+    dt = duration / chunk_n
+    window_power_correction = 1.0
+    alpha = 2.0 * T_RISE / duration
+    for m in range(chunk_count):
+        lo = m * chunk_n
+        hi = lo + chunk_n
+        _times, windowed, dataf_c, _raw_fdata, dt, alpha, window_power_correction = prepare_frequency_segment(
+            context_times[lo:hi], context_strain[lo:hi], duration, no_tukey
         )
-        sline = sline_from_lookup(
-            target_data.ncut, target_data.imin, target_data.t_obs,
-            target_lines.nf, target_lines.nnu, target_lines.wdth,
-            target_lines.lnumin, target_lines.lnumax, target_lines.ltemplate,
-            lines.f[:lines.n], scaled_line_amp, lines.nu[:lines.n], lines.n
+        cleaned_fdata = cleaned_scaled_fdata_from_windowed(windowed, dt)
+        power_sum += full_power_from_scaled_fdata(cleaned_fdata)
+        raw_power_sum += (
+            2.0 * dt * dt * window_power_correction
+            * np.abs(dataf_c[1:chunk_n // 2]) ** 2 / duration
         )
-    else:
-        sline = np.zeros(target_data.ncut, dtype=np.float64)
 
-    sgauss = np.zeros(target_data.ncut, dtype=np.float64)
-    if gaussian_enabled and bumps is not None:
-        for k in range(bumps.n):
-            add_gaussian_bump_band_inplace(
-                sgauss, target.freq, float(bumps.f[k]),
-                float(bumps.a[k]) * internal_scale, float(bumps.sigma[k]), 1.0
-            )
-    snf = sbase + sline + sgauss
-    return sbase, sline, sgauss, snf
+    return (
+        power_sum / float(chunk_count),
+        raw_power_sum / float(chunk_count),
+        dt,
+        alpha,
+        window_power_correction,
+    )
+
+
+def final_line_parameter_rows(bayesline: BayesLineParams, psd_scale: float) -> np.ndarray:
+    """Return final fair-draw Lorentzian peak parameters."""
+
+    if bayesline.data is None or bayesline.lines_x is None:
+        raise RuntimeError("BayesLine state is incomplete")
+    lines = bayesline.lines_x
+    if lines.n == 0:
+        return np.empty((0, 5), dtype=np.float64)
+
+    rows = np.zeros((lines.n, 5), dtype=np.float64)
+    tiny = np.finfo(float).tiny
+    for k in range(lines.n):
+        f0 = float(lines.f[k])
+        nu = float(lines.nu[k])
+        a_peak_internal = float(lines.a[k])
+        rows[k, 0] = f0
+        rows[k, 1] = nu
+        rows[k, 2] = f0 / max(nu, tiny)
+        rows[k, 3] = a_peak_internal
+        rows[k, 4] = psd_scale * a_peak_internal
+    order = np.argsort(rows[:, 0])
+    return rows[order]
+
+
+def write_final_line_parameters(bayesline: BayesLineParams, psd_scale: float,
+                                filename: str = "line_parameters.dat") -> None:
+    """Write final fair-draw Lorentzian parameters for cross-duration checks."""
+
+    rows = final_line_parameter_rows(bayesline, psd_scale)
+    np.savetxt(
+        filename,
+        rows,
+        header="f0_Hz nu_Hz Q a_peak_internal a_peak_physical",
+    )
+    print(f"Wrote {filename} with final fair-draw Lorentzian line parameters")
 
 
 def clone_lorentzian_lookup_container(template: LorentzianParams, size: int) -> LorentzianParams:
@@ -4368,42 +4536,50 @@ def clone_lorentzian_lookup_container(template: LorentzianParams, size: int) -> 
     out.lnumin = template.lnumin
     out.lnumax = template.lnumax
     out.ltemplate = template.ltemplate
-    out.peak_template = template.peak_template
     return out
 
 
-def project_bayesline_state_to_target(source: BayesLineParams, target: BayesLineParams,
-                                      internal_scale: float, spline_flag: int,
-                                      gaussian_enabled: bool) -> None:
-    """Copy the final expanded-duration model into target-duration units."""
+def copy_context_state_to_target(source: BayesLineParams, target: BayesLineParams,
+                                 spline_flag: int, gaussian_enabled: bool) -> None:
+    """Copy a same-duration context posterior state into the target state.
+
+    The current ``--expand`` design stacks independent target-duration context
+    chunks, so the context and target BayesLine grids have identical frequency
+    spacing, lookup tables, Tukey roll-off, and internal PSD units.  No line
+    peak or area rescaling is applied here; copied parameters are rebuilt on the
+    target arrays only to attach them to the target likelihood.
+    """
 
     if source.spline_x is None or source.lines_x is None:
         raise RuntimeError("source BayesLine state is incomplete")
-    if target.lines_x is None:
+    if target.data is None or target.freq is None or target.lines_x is None:
         raise RuntimeError("target BayesLine state is incomplete")
-    if source.data is None:
+    if source.data is None or source.freq is None:
         raise RuntimeError("source BayesLine data are incomplete")
+    if source.data.ncut != target.data.ncut or not np.allclose(source.freq, target.freq, rtol=0.0, atol=1.0e-12):
+        raise RuntimeError("context and target grids differ; same-grid state copy is invalid")
 
-    sbase, sline, sgauss, snf = projected_model_components_from_state(
-        source.spline_x, source.lines_x, source.bumps_x, source.data,
-        target, internal_scale, spline_flag, gaussian_enabled
-    )
-    scaled_spline_data = source.spline_x.data + math.log(internal_scale)
-    target.spline_x = SplineParams(source.spline_x.points.copy(), scaled_spline_data.copy())
-    target.spline = SplineParams(source.spline_x.points.copy(), scaled_spline_data.copy())
+    target_points = source.spline_x.points.copy()
+    target_spline_data = source.spline_x.data.copy()
+    target.spline_x = SplineParams(target_points, target_spline_data)
+    target.spline = SplineParams(target_points.copy(), target_spline_data.copy())
+    sbase = np.exp(spline_eval_array(target_points, target_spline_data, target.freq, spline_flag))
 
     nlines = source.lines_x.n
     if target.lines_x.size < nlines:
         target.lines_x = clone_lorentzian_lookup_container(target.lines_x, nlines)
     target.lines_x.n = nlines
     if nlines > 0:
-        target_line_amp = projected_line_amplitudes(
-            source.lines_x, source.data, target.lines_x, target.data, internal_scale
-        )
         target.lines_x.f[:nlines] = source.lines_x.f[:nlines]
         target.lines_x.nu[:nlines] = source.lines_x.nu[:nlines]
-        target.lines_x.a[:nlines] = target_line_amp
+        target.lines_x.a[:nlines] = source.lines_x.a[:nlines]
         target.lines_x.q[:nlines] = target.lines_x.f[:nlines] / np.maximum(target.lines_x.nu[:nlines], np.finfo(float).tiny)
+    sline = sline_from_lookup(
+        target.data.ncut, target.data.imin, target.data.t_obs,
+        target.lines_x.nf, target.lines_x.nnu, target.lines_x.wdth,
+        target.lines_x.lnumin, target.lines_x.lnumax, target.lines_x.ltemplate,
+        target.lines_x.f, target.lines_x.a, target.lines_x.nu, target.lines_x.n
+    )
 
     if gaussian_enabled and source.bumps_x is not None:
         nbump = source.bumps_x.n
@@ -4412,17 +4588,290 @@ def project_bayesline_state_to_target(source: BayesLineParams, target: BayesLine
         target.bumps_x.n = nbump
         if nbump > 0:
             target.bumps_x.f[:nbump] = source.bumps_x.f[:nbump]
-            target.bumps_x.a[:nbump] = source.bumps_x.a[:nbump] * internal_scale
+            target.bumps_x.a[:nbump] = source.bumps_x.a[:nbump]
             target.bumps_x.sigma[:nbump] = source.bumps_x.sigma[:nbump]
     elif target.bumps_x is not None:
         target.bumps_x.n = 0
+    if gaussian_enabled and target.bumps_x is not None:
+        sgauss = gaussian_bumps_from_params(target.freq, target.bumps_x)
+    else:
+        sgauss = np.zeros(target.data.ncut, dtype=np.float64)
 
     target.Sbase = sbase
     target.Sline = sline
     target.Sgauss = sgauss
-    target.Snf = snf
-    target.Sna = snf.copy()
+    target.Snf = sbase + sline + sgauss
+    target.Sna = target.Snf.copy()
     target.rng = source.rng
+
+
+def ensure_lorentzian_capacity(lines: LorentzianParams, capacity: int) -> LorentzianParams:
+    """Return a Lorentzian container with at least ``capacity`` storage slots."""
+
+    capacity = max(int(capacity), int(lines.n), 1)
+    if lines.f.size >= capacity:
+        lines.size = capacity
+        return lines
+
+    out = clone_lorentzian_lookup_container(lines, capacity)
+    ncopy = min(lines.n, capacity)
+    out.n = ncopy
+    if ncopy > 0:
+        out.f[:ncopy] = lines.f[:ncopy]
+        out.a[:ncopy] = lines.a[:ncopy]
+        out.nu[:ncopy] = lines.nu[:ncopy]
+        out.q[:ncopy] = lines.q[:ncopy]
+    return out
+
+
+def ensure_gaussian_bump_capacity(bumps: GaussianBumpParams, capacity: int) -> GaussianBumpParams:
+    """Return a Gaussian-bump container with at least ``capacity`` storage slots."""
+
+    capacity = max(int(capacity), int(bumps.n), 1)
+    if bumps.f.size >= capacity:
+        bumps.size = capacity
+        return bumps
+
+    out = GaussianBumpParams(size=capacity)
+    ncopy = min(bumps.n, capacity)
+    out.n = ncopy
+    if ncopy > 0:
+        out.f[:ncopy] = bumps.f[:ncopy]
+        out.a[:ncopy] = bumps.a[:ncopy]
+        out.sigma[:ncopy] = bumps.sigma[:ncopy]
+    return out
+
+
+def set_line_amplitude_prior_from_state(bayesline: BayesLineParams) -> None:
+    """Set log-uniform line-amplitude prior bounds from the current state."""
+
+    if bayesline.lines_x is None or bayesline.power is None or bayesline.Sbase is None:
+        raise RuntimeError("BayesLine state is incomplete")
+    if bayesline.Sgauss is None:
+        background = bayesline.Sbase
+    else:
+        background = bayesline.Sbase + bayesline.Sgauss
+
+    if bayesline.lines_x.n > 0:
+        amin = float(np.min(bayesline.lines_x.a[:bayesline.lines_x.n]))
+        amax = float(np.max(bayesline.lines_x.a[:bayesline.lines_x.n]))
+    else:
+        excess = np.maximum(bayesline.power - background, np.finfo(float).tiny)
+        amin = float(np.min(excess))
+        amax = float(np.max(excess))
+    bayesline.priors.LAmin = max(0.1 * amin, np.finfo(float).tiny)
+    bayesline.priors.LAmax = max(10.0 * amax, bayesline.priors.LAmin * 10.0)
+
+
+def adapt_context_target_model_caps(bayesline: BayesLineParams,
+                                    gaussian_enabled: bool = False) -> None:
+    """Set target-stage caps to twice the transferred context final dimensions."""
+
+    if bayesline.lines_x is None or bayesline.spline_x is None:
+        raise RuntimeError("BayesLine target state is incomplete")
+
+    initialized_lines = int(bayesline.lines_x.n)
+    initialized_knots = int(bayesline.spline_x.n)
+    line_cap = max(2, 2 * initialized_lines)
+    spline_cap = max(14, 2 * initialized_knots)
+
+    bayesline.lines_x = ensure_lorentzian_capacity(bayesline.lines_x, line_cap)
+    bayesline.maxBLLines = line_cap
+    bayesline.maxSplineKnots = spline_cap
+
+    if gaussian_enabled and bayesline.bumps_x is not None:
+        initialized_bumps = int(bayesline.bumps_x.n)
+        bump_cap = max(2, 2 * initialized_bumps)
+        bayesline.bumps_x = ensure_gaussian_bump_capacity(bayesline.bumps_x, bump_cap)
+        bayesline.maxBLBumps = bump_cap
+        print(
+            "Context-prior target caps: "
+            f"max lines {line_cap} (context {initialized_lines}), "
+            f"max spline knots {spline_cap} (context {initialized_knots}), "
+            f"max Gaussian bumps {bump_cap} (context {initialized_bumps})"
+        )
+    else:
+        print(
+            "Context-prior target caps: "
+            f"max lines {line_cap} (context {initialized_lines}), "
+            f"max spline knots {spline_cap} (context {initialized_knots})"
+        )
+
+
+def install_context_psd_prior(target: BayesLineParams,
+                              context_psd_samples: np.ndarray,
+                              context_spline_samples: np.ndarray,
+                              context_gaussian_samples: Optional[np.ndarray],
+                              sample_count: int,
+                              inflate: float,
+                              sigma_floor: float,
+                              output_psd_scale: float) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Build the target-stage Gaussian log-PSD prior from context PSD samples."""
+
+    if target.data is None or target.freq is None or target.Snf is None or target.Sbase is None:
+        raise RuntimeError("target BayesLine state is incomplete")
+    tiny = np.finfo(float).tiny
+    ncut = target.data.ncut
+
+    if sample_count > 0:
+        active_psd = np.maximum(context_psd_samples[:sample_count, :ncut], tiny)
+        log_samples = np.log(active_psd)
+        log_center = np.median(log_samples, axis=0)
+        if sample_count > 1:
+            log_sigma = np.std(log_samples, axis=0, ddof=1)
+        else:
+            log_sigma = np.zeros(ncut, dtype=np.float64)
+        prior_mean = np.exp(log_center)
+
+        smooth_samples = np.maximum(context_spline_samples[:sample_count, :ncut], tiny)
+        if context_gaussian_samples is not None:
+            gaussian_component_samples = np.maximum(context_gaussian_samples[:sample_count, :ncut], 0.0)
+        else:
+            gaussian_component_samples = np.zeros_like(smooth_samples)
+        line_component_samples = np.maximum(active_psd - smooth_samples - gaussian_component_samples, 0.0)
+
+        log_smooth_samples = np.log(smooth_samples)
+        smooth_log_center = np.median(log_smooth_samples, axis=0)
+        if sample_count > 1:
+            smooth_log_sigma = np.std(log_smooth_samples, axis=0, ddof=1)
+        else:
+            smooth_log_sigma = np.zeros(ncut, dtype=np.float64)
+        smooth_mean = np.exp(smooth_log_center)
+
+        line_log1p_samples = np.log1p(line_component_samples / np.maximum(smooth_mean[None, :], tiny))
+        line_log1p_mean = np.median(line_log1p_samples, axis=0)
+        if sample_count > 1:
+            line_log1p_sigma = np.std(line_log1p_samples, axis=0, ddof=1)
+        else:
+            line_log1p_sigma = np.zeros(ncut, dtype=np.float64)
+
+        gaussian_log1p_samples = np.log1p(gaussian_component_samples / np.maximum(smooth_mean[None, :], tiny))
+        gaussian_log1p_mean = np.median(gaussian_log1p_samples, axis=0)
+        if sample_count > 1:
+            gaussian_log1p_sigma = np.std(gaussian_log1p_samples, axis=0, ddof=1)
+        else:
+            gaussian_log1p_sigma = np.zeros(ncut, dtype=np.float64)
+
+        prior_background = smooth_mean + np.median(gaussian_component_samples, axis=0)
+    else:
+        print("WARNING: no context PSD samples were collected; using final context state as prior center")
+        prior_mean = np.maximum(target.Snf.copy(), tiny)
+        smooth_mean = np.maximum(target.Sbase.copy(), tiny)
+        smooth_log_sigma = np.zeros(ncut, dtype=np.float64)
+        if target.Sline is None:
+            line_component = np.zeros(ncut, dtype=np.float64)
+        else:
+            line_component = np.maximum(target.Sline.copy(), 0.0)
+        line_log1p_mean = np.log1p(line_component / np.maximum(smooth_mean, tiny))
+        line_log1p_sigma = np.zeros(ncut, dtype=np.float64)
+        if target.Sgauss is None:
+            gaussian_component = np.zeros(ncut, dtype=np.float64)
+        else:
+            gaussian_component = np.maximum(target.Sgauss.copy(), 0.0)
+        gaussian_log1p_mean = np.log1p(gaussian_component / np.maximum(smooth_mean, tiny))
+        gaussian_log1p_sigma = np.zeros(ncut, dtype=np.float64)
+        prior_background = np.maximum(smooth_mean + gaussian_component, tiny)
+        log_sigma = np.zeros(ncut, dtype=np.float64)
+
+    prior_sigma = np.maximum(log_sigma * inflate, sigma_floor)
+    target.priors.mean = prior_mean
+    target.priors.sigma = prior_sigma
+    # The Gaussian context prior is centered on the total PSD, but the spline
+    # birth/update proposals use ``priors.lower`` as their local amplitude scale.
+    # That proposal scale must follow the copied smooth spline itself, just
+    # like the ordinary startup path uses Sbase/10.  Near a loud line,
+    # total_psd/10 can sit above the smooth spline and cause every spline move to
+    # fail the proposal-bound check before the likelihood or context prior gets a
+    # vote.  The explicit log-PSD prior below still constrains the total model
+    # around prior_mean.
+    target.priors.lower = np.maximum(target.Sbase / 10.0, tiny)
+    target.priors.upper = np.maximum(prior_mean * 100.0, target.priors.lower * 100.0)
+    target.priors.use_context_psd_prior = False
+    target.priors.use_context_component_prior = True
+    target.priors.smooth_mean = smooth_mean
+    target.priors.smooth_sigma = np.maximum(smooth_log_sigma * inflate, sigma_floor)
+    target.priors.component_reference = smooth_mean
+    target.priors.line_log1p_mean = line_log1p_mean
+    target.priors.line_log1p_sigma = np.maximum(line_log1p_sigma * inflate, sigma_floor)
+    if context_gaussian_samples is not None:
+        target.priors.gaussian_log1p_mean = gaussian_log1p_mean
+        target.priors.gaussian_log1p_sigma = np.maximum(gaussian_log1p_sigma * inflate, sigma_floor)
+    else:
+        target.priors.gaussian_log1p_mean = None
+        target.priors.gaussian_log1p_sigma = None
+    set_line_amplitude_prior_from_state(target)
+
+    np.savetxt(
+        "context_psd_prior.dat",
+        np.column_stack((target.freq, output_psd_scale * prior_mean, prior_sigma)),
+        header="frequency context_prior_median_psd log_psd_sigma",
+    )
+    component_columns = [
+        target.freq,
+        output_psd_scale * smooth_mean,
+        target.priors.smooth_sigma,
+        line_log1p_mean,
+        target.priors.line_log1p_sigma,
+    ]
+    component_header = "frequency smooth_median_psd smooth_log_sigma line_log1p_mean line_log1p_sigma"
+    if context_gaussian_samples is not None:
+        component_columns.extend([
+            gaussian_log1p_mean,
+            target.priors.gaussian_log1p_sigma,
+        ])
+        component_header += " gaussian_log1p_mean gaussian_log1p_sigma"
+    np.savetxt(
+        "context_component_prior.dat",
+        np.column_stack(component_columns),
+        header=component_header,
+    )
+    print(
+        "Installed context component priors on target run: "
+        f"log-sigma floor {sigma_floor:g}, inflation {inflate:g}, "
+        f"samples {sample_count}"
+    )
+    print("Wrote context_psd_prior.dat")
+    print("Wrote context_component_prior.dat")
+    return prior_mean, prior_background, prior_sigma
+
+
+def build_context_line_proposal(target: BayesLineParams, fprop: np.ndarray,
+                                context_prior_mean: np.ndarray,
+                                context_background: np.ndarray) -> None:
+    """Construct the target-stage line proposal from the context posterior."""
+
+    if target.data is None or target.freq is None or target.lines_x is None:
+        raise RuntimeError("target BayesLine state is incomplete")
+    data = target.data
+    ncut = data.ncut
+    weights = np.ones(ncut, dtype=np.float64)
+    prior_source = np.ones(ncut, dtype=np.float64)
+    final_line_source = np.ones(ncut, dtype=np.float64)
+
+    if context_prior_mean.size >= ncut and context_background.size >= ncut:
+        ratio = context_prior_mean[:ncut] / np.maximum(context_background[:ncut], np.finfo(float).tiny)
+        prior_source[ratio > LINE_PROPOSAL_THRESH] = LINE_PROPOSAL_BOOST
+        weights = np.maximum(weights, prior_source)
+
+    for k in range(target.lines_x.n):
+        idx = int(round((float(target.lines_x.f[k]) - data.flow) * data.t_obs))
+        if 0 <= idx < ncut:
+            final_line_source[idx] = LINE_PROPOSAL_BOOST
+            weights[idx] = max(weights[idx], LINE_PROPOSAL_BOOST)
+
+    total = float(np.sum(weights))
+    if total <= 0.0:
+        weights[:] = 1.0 / max(1, ncut)
+        total = 1.0
+
+    fprop.fill(0.0)
+    fprop[:ncut] = weights / total
+    np.savetxt(
+        "line_proposal.dat",
+        np.column_stack((target.freq, fprop[:ncut], prior_source / total, final_line_source / total)),
+        header="frequency normalized_line_proposal context_psd_excess_scaled context_final_line_scaled",
+    )
+    print("Wrote line_proposal.dat for the target context-prior run")
 
 
 def decimation_factor_for_nyquist(data_nyquist: float, requested_nyquist: float) -> int:
@@ -4607,13 +5056,27 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--analysis-duration",
         type=float,
         default=None,
-        help="desired analysis duration in seconds for an existing input file when --expand > 1",
+        help="desired analysis duration in seconds for an existing input file",
     )
     parser.add_argument(
         "--expand",
         type=int,
         default=1,
-        help="power-of-two PSD-duration multiplier; default 1 keeps the original one-segment path",
+        help="power-of-two count of target-duration context chunks split before/after the target; default 1 keeps the original one-segment path",
+    )
+    parser.add_argument(
+        "--context_prior_inflate",
+        "--context-prior-inflate",
+        type=float,
+        default=None,
+        help="inflate the context log-PSD sample standard deviation by this factor; default sqrt(--expand)",
+    )
+    parser.add_argument(
+        "--context_prior_sigma_floor",
+        "--context-prior-sigma-floor",
+        type=float,
+        default=CONTEXT_PRIOR_LOG_SIGMA_FLOOR,
+        help="minimum log-PSD sigma for the --expand context prior, default %(default)g",
     )
     parser.add_argument(
         "--nyquist",
@@ -4675,6 +5138,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--writelinesubtime",
         action="store_true",
         help="write unwhitened no-lines diagnostics: freq_nolines.dat plus time-domain outputs before and after glitch cleaning",
+    )
+    parser.add_argument(
+        "--write_line_params",
+        "--write-line-params",
+        "--writelineparams",
+        action="store_true",
+        help="write final fair-draw Lorentzian parameters to line_parameters.dat",
     )
     parser.add_argument(
         "--write_glitch",
@@ -4787,6 +5257,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         action="store_true",
         help="print wall-clock timing for the main BWtest phases",
     )
+    parser.add_argument(
+        "--debug_acceptance",
+        "--debug-acceptance",
+        action="store_true",
+        help="print proposal attempt/valid/invalid/accepted counts for MCMC move labels",
+    )
     return parser.parse_args(argv[1:])
 
 
@@ -4890,6 +5366,14 @@ def main(argv: list[str]) -> int:
         print("warning: --expand must be a positive power of two")
         return 1
     args.expand = int(args.expand)
+    if args.context_prior_inflate is not None and (
+            not math.isfinite(args.context_prior_inflate) or args.context_prior_inflate <= 0.0):
+        print("warning: --context-prior-inflate must be positive and finite")
+        return 1
+    if (not math.isfinite(args.context_prior_sigma_floor)
+            or args.context_prior_sigma_floor <= 0.0):
+        print("warning: --context-prior-sigma-floor must be positive and finite")
+        return 1
     if not math.isfinite(args.fmin) or args.fmin <= 0.0 or args.fmin >= float(nyquist):
         print(f"warning: requested fmin {args.fmin:g} Hz must be finite and below Nyquist {nyquist:g} Hz")
         return 1
@@ -4912,6 +5396,9 @@ def main(argv: list[str]) -> int:
             or args.prior_recovery_plot_burnin < 0.0
             or args.prior_recovery_plot_burnin >= 1.0):
         print("warning: --prior-recovery-plot-burnin must be in the range [0, 1)")
+        return 1
+    if args.prior_recovery and args.expand > 1:
+        print("warning: --prior-recovery is only supported for --expand 1")
         return 1
     if not math.isfinite(args.feature_snr_thresh) or args.feature_snr_thresh < 0.0:
         print("warning: --feature-snr-thresh must be finite and non-negative")
@@ -4950,8 +5437,12 @@ def main(argv: list[str]) -> int:
     if segment_crop_requested:
         analysis_duration = float(input_spec.analysis_duration)
         psd_duration = analysis_duration * float(expand_factor)
-        if psd_duration > 256.0:
-            print(f"WARNING: PSD segment is {psd_duration:g} seconds, which exceeds 256 seconds")
+        context_before_chunks = expand_factor // 2 if expanded_psd else 0
+        context_after_chunks = expand_factor - context_before_chunks if expanded_psd else 0
+        context_before_duration = analysis_duration * float(context_before_chunks)
+        context_after_duration = analysis_duration * float(context_after_chunks)
+        if expanded_psd and psd_duration > 256.0:
+            print(f"WARNING: context/prior segment is {psd_duration:g} seconds, which exceeds 256 seconds")
 
         dt_in = infer_regular_dt(timeX)
         input_duration = dt_in * ND
@@ -4983,38 +5474,64 @@ def main(argv: list[str]) -> int:
             else:
                 print("Skipping Butterworth decimation; legacy integer downsampling factor is 1")
         else:
-            fmn = 1.0 / psd_duration
+            fmn = 1.0 / analysis_duration
             fmx = fmax
             dataX = bwbpf_numba(dataX, 1, 8, 1.0 / dt_in, fmx, fmn)
             dataX = bwbpf_numba(dataX, -1, 8, 1.0 / dt_in, fmx, fmn)
 
         full_times = timeX[::dec].copy()
         full_data = dataX[::dec].copy()
+        available_start = float(full_times[0])
+        full_dt = infer_regular_dt(full_times)
+        available_end = available_start + full_dt * full_times.size
         if input_spec.fetched_from_frame:
             if input_spec.trigger_time is None:
                 print("warning: fetched-data trigger time is missing")
                 return 1
             trigger_time = float(input_spec.trigger_time)
+            analysis_start, analysis_end = segment_bounds(trigger_time, analysis_duration)
         else:
-            # A plain file has no trigger metadata.  When the user supplies an
-            # analysis duration, treat the file center as the trigger so the
-            # analysis segment can keep the usual trigger+4 end time.
-            trigger_time = float(timeX[0]) + 0.5 * input_duration
-            print(
-                "WARNING: user-supplied analysis duration assumes the trigger "
-                f"is at the center of the provided data, GPS {trigger_time:.6f}"
-            )
+            if expanded_psd:
+                # A plain file has no trigger metadata or guaranteed naming
+                # convention.  For the two-stage symmetric context run, assume
+                # the target segment sits in the middle of the provided data
+                # with equal context duration before and after it.
+                target_center = available_start + 0.5 * input_duration
+                analysis_start = target_center - 0.5 * analysis_duration
+                analysis_end = analysis_start + analysis_duration
+                trigger_time = analysis_end - TRIGGER_OFFSET_FROM_END
+                print(
+                    "WARNING: user-supplied --expand input assumes the target "
+                    f"analysis segment is centered in the file with "
+                    f"{context_before_chunks} context chunks before and "
+                    f"{context_after_chunks} after (effective trigger GPS "
+                    f"{trigger_time:.6f})"
+                )
+            else:
+                # Keep the historical file+duration behavior for --expand 1:
+                # treat the file center as the trigger so the analysis segment
+                # keeps the usual trigger+4 end time.
+                trigger_time = float(timeX[0]) + 0.5 * input_duration
+                analysis_start, analysis_end = segment_bounds(trigger_time, analysis_duration)
+                print(
+                    "WARNING: user-supplied analysis duration assumes the trigger "
+                    f"is at the center of the provided data, GPS {trigger_time:.6f}"
+                )
 
-        analysis_start, analysis_end = segment_bounds(trigger_time, analysis_duration)
         if expanded_psd:
-            psd_start, psd_end = centered_segment_bounds(trigger_time, psd_duration)
+            context_before_start = analysis_start - context_before_duration
+            context_before_end = analysis_start
+            context_after_start = analysis_end
+            context_after_end = analysis_end + context_after_duration
+            psd_start = context_before_start
+            psd_end = context_after_end
         else:
+            context_before_start = context_after_start = analysis_start
+            context_before_end = context_after_end = analysis_end
             psd_start, psd_end = analysis_start, analysis_end
         needed_start = min(analysis_start, psd_start)
         needed_end = max(analysis_end, psd_end)
-        available_start = float(full_times[0])
-        available_end = available_start + infer_regular_dt(full_times) * full_times.size
-        tol = 0.5 * infer_regular_dt(full_times)
+        tol = 0.5 * full_dt
         if needed_start < available_start - tol or needed_end > available_end + tol:
             print(
                 "warning: not enough data provided for requested analysis/PSD segments; "
@@ -5026,7 +5543,8 @@ def main(argv: list[str]) -> int:
         if expanded_psd:
             print(
                 f"Using analysis segment [{analysis_start:.6f}, {analysis_end:.6f}] "
-                f"and expanded PSD segment [{psd_start:.6f}, {psd_end:.6f}]"
+                f"with context/prior before [{context_before_start:.6f}, {context_before_end:.6f}] "
+                f"and after [{context_after_start:.6f}, {context_after_end:.6f}]"
             )
         else:
             print(
@@ -5034,10 +5552,22 @@ def main(argv: list[str]) -> int:
                 f"analysis/PSD segment [{analysis_start:.6f}, {analysis_end:.6f}]"
             )
         try:
-            # The fit segment drives BayesLine PSD estimation.  With --expand
-            # it is longer and centered on the trigger; otherwise it is the
-            # same segment used for final products and ADtest-facing files.
-            fit_times_raw, fit_data_raw = crop_arrays_by_time(full_times, full_data, psd_start, psd_duration)
+            # The fit segment drives BayesLine initialization.  With --expand,
+            # the symmetric context is split into target-duration chunks; the
+            # nearest preceding chunk initializes the context sampler, and the
+            # averaged cleaned powers from all chunks replace the likelihood
+            # power before the context RJMCMC starts.
+            if expanded_psd:
+                before_times_raw, before_data_raw = crop_arrays_by_time(
+                    full_times, full_data, context_before_start, context_before_duration
+                )
+                after_times_raw, after_data_raw = crop_arrays_by_time(
+                    full_times, full_data, context_after_start, context_after_duration
+                )
+                context_times_raw = np.concatenate((before_times_raw, after_times_raw))
+                context_data_raw = np.concatenate((before_data_raw, after_data_raw))
+            else:
+                context_times_raw, context_data_raw = crop_arrays_by_time(full_times, full_data, psd_start, psd_duration)
             analysis_times_raw, analysis_data_raw = crop_arrays_by_time(
                 full_times, full_data, analysis_start, analysis_duration
             )
@@ -5046,9 +5576,32 @@ def main(argv: list[str]) -> int:
             return 1
 
         Tobs = analysis_duration
-        fit_Tobs = psd_duration
+        if expanded_psd:
+            if context_data_raw.size % expand_factor != 0:
+                print("warning: context segment cannot be split into equal target-duration chunks")
+                return 1
+            context_chunk_n = context_data_raw.size // expand_factor
+            if context_chunk_n != analysis_data_raw.size:
+                print(
+                    "warning: context chunk sample count does not match target analysis sample count "
+                    f"({context_chunk_n} != {analysis_data_raw.size})"
+                )
+                return 1
+            fit_times_raw = before_times_raw[-context_chunk_n:].copy()
+            fit_data_raw = before_data_raw[-context_chunk_n:].copy()
+            fit_Tobs = Tobs
+        else:
+            fit_times_raw = context_times_raw
+            fit_data_raw = context_data_raw
+            fit_Tobs = Tobs
         print(f"Number of points used in analysis = {analysis_data_raw.size}")
-        print(f"Number of points used for PSD estimation = {fit_data_raw.size}")
+        if expanded_psd:
+            print(
+                f"Number of points used in context/prior segment = {context_data_raw.size} "
+                f"({expand_factor} chunks of {fit_data_raw.size})"
+            )
+        else:
+            print(f"Number of points used for PSD estimation = {fit_data_raw.size}")
     else:
         print(f"Number of points in data = {ND}")
         dt = (timeX[-1] - timeX[0]) / ND
@@ -5100,6 +5653,8 @@ def main(argv: list[str]) -> int:
         analysis_data_raw = dataX[::dec][:N].copy()
         fit_times_raw = analysis_times_raw
         fit_data_raw = analysis_data_raw
+        context_times_raw = fit_times_raw
+        context_data_raw = fit_data_raw
         fit_Tobs = Tobs
 
     N = analysis_data_raw.size
@@ -5113,18 +5668,32 @@ def main(argv: list[str]) -> int:
     times, data, dataf_c, fdata, dt, alpha, window_power_correction = prepare_frequency_segment(
         analysis_times_raw, analysis_data_raw, Tobs, args.no_tukey
     )
+    context_average_power_full: Optional[np.ndarray] = None
+    context_raw_power_avg: Optional[np.ndarray] = None
     if expanded_psd:
-        # In the normal path, BayesLineBurnin wavelet-cleans fdata in place.  In
-        # the expanded path burn-in cleans the long PSD segment, so we perform
-        # the same wavelet-cleaning step separately for the analysis segment.
+        # In the normal path, BayesLineBurnin wavelet-cleans fdata in place. In
+        # the expanded path burn-in initializes from the nearest preceding
+        # context chunk, so we perform the same wavelet-cleaning step separately
+        # for the target analysis segment.
         fit_times, fit_data, fit_dataf_c, fit_fdata, fit_dt, fit_alpha, fit_window_power_correction = prepare_frequency_segment(
             fit_times_raw, fit_data_raw, fit_Tobs, args.no_tukey
         )
-        cleaned_analysis_time = bayesline_clean_time(data, dt)
-        cleaned_analysis_fft = np.fft.rfft(cleaned_analysis_time) * (dt / math.sqrt(2.0))
-        fdata.fill(0.0)
-        fdata[2:N:2] = cleaned_analysis_fft[1:N // 2].real
-        fdata[3:N + 1:2] = cleaned_analysis_fft[1:N // 2].imag
+        fdata = cleaned_scaled_fdata_from_windowed(data, dt)
+        print(
+            "Building same-grid context power from "
+            f"{context_before_chunks} chunks before and {context_after_chunks} after the target"
+        )
+        context_average_power_full, context_raw_power_avg, stack_dt, stack_alpha, stack_window_power_correction = (
+            build_same_grid_context_average_power(
+                context_times_raw, context_data_raw, Tobs, expand_factor, args.no_tukey
+            )
+        )
+        if (not math.isclose(stack_dt, fit_dt, rel_tol=1.0e-12, abs_tol=0.0)
+                or not math.isclose(stack_window_power_correction, fit_window_power_correction,
+                                    rel_tol=1.0e-12, abs_tol=0.0)
+                or not math.isclose(stack_alpha, fit_alpha, rel_tol=1.0e-12, abs_tol=0.0)):
+            print("warning: inconsistent context chunk preprocessing parameters")
+            return 1
     else:
         fit_times = times
         fit_data = data
@@ -5139,8 +5708,14 @@ def main(argv: list[str]) -> int:
     raw_power = 2.0 * dt * dt * window_power_correction * np.abs(dataf_c[1:N // 2]) ** 2 / Tobs
     np.savetxt("periodogram_raw.dat", np.column_stack((raw_freq, raw_power)))
     if expanded_psd:
-        fit_raw_freq = np.arange(1, fit_N // 2, dtype=np.float64) / fit_Tobs
-        fit_raw_power = 2.0 * fit_dt * fit_dt * fit_window_power_correction * np.abs(fit_dataf_c[1:fit_N // 2]) ** 2 / fit_Tobs
+        fit_raw_freq = np.arange(1, N // 2, dtype=np.float64) / Tobs
+        if context_raw_power_avg is None:
+            fit_raw_power = (
+                2.0 * fit_dt * fit_dt * fit_window_power_correction
+                * np.abs(fit_dataf_c[1:fit_N // 2]) ** 2 / fit_Tobs
+            )
+        else:
+            fit_raw_power = context_raw_power_avg
         np.savetxt("periodogram_raw_psd.dat", np.column_stack((fit_raw_freq, fit_raw_power)))
     timing_mark("preprocess_fft")
 
@@ -5156,30 +5731,23 @@ def main(argv: list[str]) -> int:
     BayesLineSetup(fit_bptr, fit_fdata, fmin, fmax, fit_dt, fit_Tobs)
     fit_bptr.gaussianSigmaMin = float(args.gaussian_bump_sigma_min)
     fit_bptr.gaussianSigmaMax = float(args.gaussian_bump_sigma_max)
-    projection_bptr: Optional[BayesLineParams] = None
-    projection_scale = 1.0
+    target_bptr: Optional[BayesLineParams] = None
     if expanded_psd:
-        projection_bptr = BayesLineParams()
-        # This setup loads/generates the requested-duration line lookup.  The
-        # sampled line parameters come from the long PSD segment, but output
-        # products must live on the shorter analysis segment.  A line is not
-        # downsampled from the long grid; it is rebuilt from the target lookup
-        # so the Tukey-windowed line shape matches the analysis duration.
-        BayesLineSetup(projection_bptr, fdata, fmin, fmax, dt, Tobs)
+        target_bptr = BayesLineParams()
+        # The target setup loads/generates the requested-duration line lookup.
+        # The expanded context run now uses same-duration chunks, so the context
+        # and target grids share the same lookup. The target container still
+        # holds the analysis-segment likelihood and receives the context state
+        # and posterior samples before its own RJMCMC stage.
+        BayesLineSetup(target_bptr, fdata, fmin, fmax, dt, Tobs)
+        set_power_from_scaled_frequency_data(target_bptr, fdata)
+        target_bptr.gaussianSigmaMin = float(args.gaussian_bump_sigma_min)
+        target_bptr.gaussianSigmaMax = float(args.gaussian_bump_sigma_max)
         assert fit_bptr.data is not None and fit_bptr.lines_x is not None
-        assert projection_bptr.data is not None and projection_bptr.lines_x is not None
-        attach_lorentzian_peak_lookup(fit_bptr.lines_x, fit_bptr.data)
-        attach_lorentzian_peak_lookup(projection_bptr.lines_x, projection_bptr.data)
-        # BayesLine samples PSDs in internal units.  The physical PSD written
-        # to file is internal * (4 * window_power_correction / Tobs).  To keep
-        # the physical PSD fixed when moving from the fit duration to the
-        # target duration, multiply internal amplitudes by the ratio below.
-        # Lorentzian line amplitudes receive an additional target_peak/fit_peak
-        # correction inside projected_line_amplitudes().
-        projection_scale = (fit_window_power_correction / fit_Tobs) / (window_power_correction / Tobs)
+        assert target_bptr.data is not None and target_bptr.lines_x is not None
         print(
-            f"Expanded PSD estimation: analysis T={Tobs:g} s, PSD T={fit_Tobs:g} s, "
-            f"projection internal scale={projection_scale:.6e}"
+            f"Expanded same-grid context-prior run: target T={Tobs:g} s, "
+            f"context chunks={expand_factor}, context likelihood multiplicity={expand_factor}"
         )
     print(f"BayesLine line array size = {fit_bptr.maxBLLines}")
     print(f"BayesLine startup linecut = {args.linecut:g}")
@@ -5197,6 +5765,19 @@ def main(argv: list[str]) -> int:
         linecut=args.linecut,
         startup_rng=startup_rng,
     )
+    if expanded_psd:
+        if context_average_power_full is None or fit_bptr.data is None:
+            print("warning: internal error, stacked context power was not built")
+            return 1
+        fit_bptr.power = context_average_power_full[fit_bptr.data.imin:fit_bptr.data.imax].copy()
+        fit_bptr.spow = fit_bptr.power.copy()
+        fit_bptr.power_multiplicity = float(expand_factor)
+        print(
+            "Context RJMCMC using averaged cleaned power from "
+            f"{expand_factor} same-duration chunks with multiplicity {fit_bptr.power_multiplicity:g}"
+        )
+    else:
+        fit_bptr.power_multiplicity = 1.0
     adapt_post_startup_model_caps(fit_bptr)
     timing_mark("BayesLineBurnin")
 
@@ -5204,23 +5785,23 @@ def main(argv: list[str]) -> int:
     imin = int(fit_bptr.data.fmin * fit_Tobs)
     startup_model_psd_scale = 0.5 * fit_output_psd_scale
     p_freq = np.arange(imin, fit_N // 2, dtype=np.float64) / fit_Tobs
-    p_pow = fit_output_psd_scale * 2.0 * (fit_fdata[2 * imin:fit_N:2] ** 2 +
-                                          fit_fdata[2 * imin + 1:fit_N + 1:2] ** 2)
+    if expanded_psd:
+        p_pow = 2.0 * fit_output_psd_scale * fit_bptr.power
+    else:
+        p_pow = fit_output_psd_scale * 2.0 * (fit_fdata[2 * imin:fit_N:2] ** 2 +
+                                              fit_fdata[2 * imin + 1:fit_N + 1:2] ** 2)
     model_len = p_freq.size
     np.savetxt("periodogram.dat", np.column_stack((p_freq, p_pow[:model_len],
                                                    startup_model_psd_scale * fit_bptr.Sbase[:model_len],
                                                    startup_model_psd_scale * fit_bptr.Snf[:model_len])))
-    fprop_freq = np.arange(fit_bptr.data.imin, fit_N // 2, dtype=np.float64) / fit_Tobs
-    np.savetxt("fprop.dat", np.column_stack((fprop_freq, fprop[:fprop_freq.size])))
+    if expanded_psd:
+        np.savetxt("fprop_context.dat", np.column_stack((fit_bptr.freq, fprop[:fit_bptr.data.ncut])))
+    else:
+        np.savetxt("fprop.dat", np.column_stack((fit_bptr.freq, fprop[:fit_bptr.data.ncut])))
     timing_mark("startup_diagnostics")
 
     rjmcmc_steps = args.rjmcmc_steps
-    sample_ncut = projection_bptr.data.ncut if projection_bptr is not None and projection_bptr.data is not None else fit_bptr.data.ncut
-    psd_samples = np.empty((args.psd_samples, sample_ncut), dtype=np.float64)
-    spline_samples = np.empty_like(psd_samples)
-    gaussian_samples = np.empty_like(psd_samples) if args.gaussian_bumps else None
     trace_columns = 4 if args.gaussian_bumps else 3
-    count_trace = np.empty((rjmcmc_steps, trace_columns), dtype=np.int64) if args.prior_recovery else None
     spline_prior_max = fit_bptr.maxSplineKnots
     prior_flag = 1
     line_trim_enabled = args.linetrim
@@ -5231,18 +5812,72 @@ def main(argv: list[str]) -> int:
         print("Prior recovery mode: RJMCMC likelihood is constant; soft PSD and line-count priors are disabled")
         if args.linetrim:
             print("Prior recovery mode: ignoring --linetrim so line counts are not exponentially biased")
-    collected_psd_samples = BayesLineRJMCMC(
-        fit_bptr, fit_fdata, psd, invpsd, splinePSD, N, rjmcmc_steps, 1.0, prior_flag, fprop, 1,
-        psd_samples=psd_samples, spline_samples=spline_samples,
-        gaussian_samples=gaussian_samples,
-        count_trace=count_trace,
-        line_trim=line_trim_enabled,
-        gaussian_bumps=args.gaussian_bumps,
-        projection_target=projection_bptr,
-        projection_scale=projection_scale
-    )
-    bptr = projection_bptr if projection_bptr is not None else fit_bptr
-    timing_mark("BayesLineRJMCMC")
+
+    if expanded_psd:
+        if target_bptr is None or target_bptr.data is None:
+            print("warning: internal error, target BayesLine state was not initialized")
+            return 1
+        context_sample_ncut = fit_bptr.data.ncut
+        context_psd_samples = np.empty((args.psd_samples, context_sample_ncut), dtype=np.float64)
+        context_spline_samples = np.empty_like(context_psd_samples)
+        context_gaussian_samples = np.empty_like(context_psd_samples) if args.gaussian_bumps else None
+        collected_context_samples = BayesLineRJMCMC(
+            fit_bptr, fit_fdata, psd, invpsd, splinePSD, N, rjmcmc_steps, 1.0, prior_flag, fprop, 1,
+            psd_samples=context_psd_samples, spline_samples=context_spline_samples,
+            gaussian_samples=context_gaussian_samples,
+            count_trace=None,
+            line_trim=line_trim_enabled,
+            gaussian_bumps=args.gaussian_bumps,
+            debug_acceptance=args.debug_acceptance
+        )
+        copy_context_state_to_target(fit_bptr, target_bptr, 1, args.gaussian_bumps)
+        timing_mark("context_RJMCMC")
+
+        context_prior_inflate = (math.sqrt(float(expand_factor))
+                                 if args.context_prior_inflate is None
+                                 else float(args.context_prior_inflate))
+        context_prior_mean, context_background, _context_prior_sigma = install_context_psd_prior(
+            target_bptr, context_psd_samples, context_spline_samples, context_gaussian_samples,
+            collected_context_samples, context_prior_inflate,
+            float(args.context_prior_sigma_floor), output_psd_scale
+        )
+        adapt_context_target_model_caps(target_bptr, args.gaussian_bumps)
+        target_fprop = np.zeros(N // 2, dtype=np.float64)
+        build_context_line_proposal(target_bptr, target_fprop, context_prior_mean, context_background)
+
+        psd_samples = np.empty((args.psd_samples, target_bptr.data.ncut), dtype=np.float64)
+        spline_samples = np.empty_like(psd_samples)
+        gaussian_samples = np.empty_like(psd_samples) if args.gaussian_bumps else None
+        collected_psd_samples = BayesLineRJMCMC(
+            target_bptr, fdata, psd, invpsd, splinePSD, N, rjmcmc_steps, 1.0, prior_flag, target_fprop, 1,
+            psd_samples=psd_samples, spline_samples=spline_samples,
+            gaussian_samples=gaussian_samples,
+            count_trace=None,
+            line_trim=line_trim_enabled,
+            gaussian_bumps=args.gaussian_bumps,
+            debug_acceptance=args.debug_acceptance
+        )
+        bptr = target_bptr
+        fprop = target_fprop
+        timing_mark("BayesLineRJMCMC")
+        count_trace = None
+    else:
+        sample_ncut = fit_bptr.data.ncut
+        psd_samples = np.empty((args.psd_samples, sample_ncut), dtype=np.float64)
+        spline_samples = np.empty_like(psd_samples)
+        gaussian_samples = np.empty_like(psd_samples) if args.gaussian_bumps else None
+        count_trace = np.empty((rjmcmc_steps, trace_columns), dtype=np.int64) if args.prior_recovery else None
+        collected_psd_samples = BayesLineRJMCMC(
+            fit_bptr, fit_fdata, psd, invpsd, splinePSD, N, rjmcmc_steps, 1.0, prior_flag, fprop, 1,
+            psd_samples=psd_samples, spline_samples=spline_samples,
+            gaussian_samples=gaussian_samples,
+            count_trace=count_trace,
+            line_trim=line_trim_enabled,
+            gaussian_bumps=args.gaussian_bumps,
+            debug_acceptance=args.debug_acceptance
+        )
+        bptr = fit_bptr
+        timing_mark("BayesLineRJMCMC")
     if count_trace is not None:
         np.savetxt(
             "prior_recovery_counts.dat",
@@ -5352,6 +5987,9 @@ def main(argv: list[str]) -> int:
             std_psd_out[0] = std_psd_out[1]
         np.savetxt("psd_range.dat", np.column_stack((bw_freq, mean_psd_out, std_psd_out)))
         print("Wrote psd_range.dat with MCMC-sample mean PSD and standard deviation")
+    if args.write_line_params:
+        line_params_filename = tagged_output_name("line_parameters.dat", input_spec)
+        write_final_line_parameters(bptr, psd_scale, line_params_filename)
     np.savetxt(frequency_data_filename, freq_out)
     if args.write_glitch:
         write_glitch_time_domain_files(times, data, fdata, median_psd_out, dt, window_power_correction)
