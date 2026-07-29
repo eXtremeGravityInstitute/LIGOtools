@@ -32,8 +32,10 @@ Usage examples:
         --nyquist 1024 --expand 4
 
         Here the requested analysis duration is 8 seconds. The target analysis
-        segment is still the usual [1126259458.4, 1126259466.4], ending 4 seconds
-        after the trigger.  With --expand 4, BWtest takes two 8-second chunks
+        segment is still the usual [1126259458.4, 1126259466.4], ending the
+        default 4 seconds after the trigger. Use --post-trigger X to place the
+        trigger X seconds before the target segment end. With --expand 4,
+        BWtest takes two 8-second chunks
         before the target and two 8-second chunks after it, wavelet-cleans each
         chunk independently, averages their powers on the 8-second frequency
         grid, and runs a context RJMCMC with the proper four-segment Welch
@@ -62,9 +64,9 @@ Usage examples:
         two. The default is 1, which keeps the original one-segment path.
 
         When N > 1, BWtest uses two segments:
-        * the requested analysis segment still ends 4 seconds after the trigger
-          and is used for frequency_data.dat, whitening, glitch/feature output,
-          and line-subtracted diagnostics;
+        * the requested analysis segment ends --post-trigger seconds after the
+          trigger, default 4, and is used for frequency_data.dat, whitening,
+          glitch/feature output, and line-subtracted diagnostics;
         * the context has N independent Tobs chunks split evenly before and
           after the target. Initialization uses the nearest preceding chunk.
           The context RJMCMC then uses the average cleaned power from all chunks
@@ -75,7 +77,10 @@ Usage examples:
           Gaussian-bump components use Gaussian priors in
           log1p(component/smooth). The standard deviations are inflated by
           --context-prior-inflate, default sqrt(N), and floored by
-          --context-prior-sigma-floor, default 0.5.
+          --context-prior-sigma-floor, default 0.5. The line component uses an
+          asymmetric width: the upper width keeps this inflated/floored value,
+          while the lower width is capped so the 2-sigma lower edge is zero
+          line height, not negative line power.
 
         The target run skips startup line/spline discovery and starts from the
         final same-grid context state. It uses the context components
@@ -91,7 +96,11 @@ Usage examples:
         target 8-second analysis segment is centered in the file, with two
         8-second context chunks before and two after. With --expand 1 the
         historical file behavior is unchanged: the file center is treated as the
-        trigger and the trigger+4 analysis segment is cropped.
+        trigger and the trigger+--post-trigger analysis segment is cropped.
+    --post-trigger X Sets the seconds of data retained after the trigger in the
+        target analysis segment. The default is 4, matching the historical
+        BWtest behavior. For example, duration 8 and --post-trigger 2 gives
+        [trigger-6, trigger+2].
     --linetrim Turns on the prior that exponentially supresses the number of lines.
         The C BayesLine sampler currently keeps this prior on, so use this flag
         when comparing Python BWtest output directly against BWtest.c.
@@ -109,6 +118,45 @@ Usage examples:
     --rjmcmc-steps N Sets the number of RJMCMC iterations, default 100000.
     --seed N Sets the random seed used by both the startup fit and RJMCMC,
         default 1234.
+    --wanderfit Runs the end-stage wandering-sinusoid line subtraction and
+        writes wanderfit.dat and freq_nowander.dat. The defaults are
+        intentionally small: --wander-steps 2000, --wander-initial-legendre 2,
+        and --wander-max-legendre 4. Within-model wandering-line proposal
+        widths are scaled down as 1/SNR for lines above SNR 10, matching the
+        expected high-SNR parameter uncertainty scaling.
+    --splinewanderfit Runs an alternative end-stage wandering-sinusoid line
+        subtraction with fixed Akima spline knots for the instantaneous
+        frequency and amplitude of each line. The default control-point time
+        spacing is Tspace=4 seconds, giving Tobs/Tspace+1 knots for the usual
+        power-of-two segment durations. Requested Tspace values are mapped to
+        the nearest power of two. The frequency-knot prior is an absolute
+        +/-0.1 Hz band around the best-fit sinusoid frequency, independent of
+        Tobs. Frequency-knot proposals use absolute Gaussian widths of
+        0.01 Hz, 0.001 Hz, and 0.0001 Hz by default. For lines with startup
+        SNR above 100, both frequency-knot and normalized-amplitude-knot jumps
+        are additionally multiplied by 100/SNR. Add --checkline FREQ to write
+        control-point and move diagnostics for the fitted line nearest FREQ.
+        The --spline-wander-steps value sets the nominal per-line proposal
+        budget. Line visits are a mixture: by default 20% uniform and 80%
+        proportional to the startup SNR, so loud lines get extra work without
+        starving lower-SNR lines. When --splinewanderfit is used, the
+        joint --powerfit mains-harmonic model is run first; splinewander then
+        starts from the powerfit residual and skips Lorentzian line candidates
+        whose frequencies are already covered by active powerfit harmonics.
+        Add --flat-amplitude to hold normalized amplitude knots fixed at 1
+        while still fitting the overall amplitude scale.
+    --powerfit Runs a specialized coherent subtraction for the mains-power
+        harmonics. It fits one shared Akima spline for the base mains frequency
+        evolution, one shared dimensionless amplitude-envelope spline, and
+        separate amplitude/constant phase parameters for each harmonic. The
+        default is five harmonics of 60 Hz. Use --powerfit-50hz, or set
+        --powerfit-base-frequency 50, for Virgo-style 50 Hz mains.
+    --oscillatorfit Runs the end-stage driven damped oscillator line
+        subtraction and writes oscillatorfit.dat and freq_nooscillator.dat.
+        This is an alternative to --sinefit that uses the same oscillator
+        denominator and nu convention as the Lorentzian line model. Because it
+        fits Fourier amplitudes, the Tukey response is coherent rather than the
+        squared-window convolution used for PSD line profiles.
     --gaussian-bumps Turns on an additional reversible-jump model component
         for broad Gaussian PSD excesses. The model starts with zero bumps; the
         sampler can add/delete/update bumps only in the RJMCMC stage.
@@ -148,6 +196,12 @@ Important output files:
         For fetched trigger-time data this is tagged in the same way as BWpsd,
         e.g. frequency_data_H1_1126259462.dat.
 
+    frequency_data_raw.dat
+        Optional with --print-raw/--print_raw: uncleaned complex frequency-domain
+        data in the same scaling as frequency_data.dat. This is the
+        Tukey-windowed analysis segment before BayesLine's wavelet cleaning. For
+        fetched trigger-time data this is tagged in the same way as BWpsd.
+
     BL_start.dat
         Optional startup diagnostic: frequency, periodogram, smooth PSD, line PSD.
         The PSD columns are scaled to the same physical one-sided convention as
@@ -161,13 +215,19 @@ Important output files:
         Median total, smooth, and line PSD components. With --gaussian-bumps,
         a fifth column gives the broad-Gaussian component.
 
+    BWWpsd.dat
+        Written for --expand > 1: two-column Welch/context PSD model,
+        frequency and total context median PSD. The scaling matches BWpsd.dat.
+        For fetched trigger-time data this is tagged in the same way as BWpsd.
+
     context_psd_prior.dat and context_component_prior.dat
         Written for --expand > 1. context_psd_prior.dat is a plotting diagnostic
         for the same-grid context PSD prior: frequency, total PSD center, and
         total log-PSD sigma. context_component_prior.dat records the active
         component priors used by the target run: smooth PSD center and log sigma,
         plus log1p(component/smooth) centers and sigmas for the line component
-        and, when enabled, Gaussian bumps.
+        and, when enabled, Gaussian bumps. The line component has separate
+        minus/plus sigmas because the lower side is capped at zero line height.
 
     line_parameters.dat
         Optional with --write-line-params: final fair-draw Lorentzian line
@@ -176,9 +236,10 @@ Important output files:
         same way as BWpsd.dat.
 
     psd_range.dat
-        Optional with --psd-range: frequency, MCMC-sample mean PSD, and
-        MCMC-sample standard deviation at each frequency. The scaling matches
-        BWpsd.dat, while BWpsd.dat itself stays two columns for compatibility.
+        Optional with --psd-range: frequency, MCMC-sample median PSD, and the
+        lower/upper boundaries of the equal-tail 90% PSD interval at each
+        frequency. The scaling matches BWpsd.dat, while BWpsd.dat itself stays
+        two columns for compatibility.
 
     BW_likelihood_summand.dat
         Frequency and Whittle log-likelihood summand for the arithmetic mean
@@ -200,8 +261,11 @@ Important output files:
         data. freq_nolines.dat and line_subtracted_time.dat are built from the
         original Tukey-windowed FFT with the final fair-draw Lorentzian line
         contribution subtracted; line_subtracted_noglitch_time.dat starts from
-        the wavelet-cleaned FFT used for PSD estimation. The time-domain files
-        retain the Tukey roll-off used before the FFT.
+        the wavelet-cleaned FFT used for PSD estimation. freq_nolines.dat uses
+        the same frequency-domain scaling convention as frequency_data.dat. The
+        first row is f=0 with zero real/imaginary entries, matching
+        frequency_data.dat. The time-domain files retain the Tukey roll-off used
+        before the FFT.
 
         WARNING: the Tukey window roll-off is not undone in these files. The
         endpoints are still tapered. This is intentional because dividing by
@@ -237,17 +301,130 @@ Important output files:
         with a best-fit pure sinusoid subtracted for each final line. The
         sinusoid frequency, amplitude, and phase are fitted against the local
         Fourier data with the final broadband non-line PSD as the noise
-        weighting. Columns
-        match freq_nolines.dat: frequency, real part, imaginary part, in
-        BayesWave's internal scaled Fourier convention.
+        weighting. Columns are frequency, real part, and imaginary part, using
+        the same frequency-domain scaling convention and zero-frequency row as
+        frequency_data.dat.
+
+    oscillatorfit.dat and freq_nooscillator.dat
+        Optional with --oscillatorfit: use the same line-by-line machinery as
+        --sinefit, but replace the plain sinusoid with a steady-state driven
+        damped oscillator response. The resonance frequency and damping width
+        are taken from the final Lorentzian line frequency and nu value, with
+        nu converted from Hz to angular frequency, matching the Lorentzian
+        denominator convention. Since this is a coherent amplitude fit, the
+        Tukey window is applied to the oscillator response in amplitude before
+        the FFT, not through the squared-window power convolution used by the
+        Lorentzian PSD lookup. The drive frequency is scanned locally and the
+        drive amplitude G0 is fitted analytically against the Fourier data.
+
+    wanderfit.dat and freq_nowander.dat
+        Optional with --wanderfit: after the main PSD inference is complete,
+        initialize each final Lorentzian line with its local maximum-likelihood
+        pure sinusoid, then run a lightweight line-only RJMCMC over slowly
+        wandering sinusoids. Frequency and amplitude are represented by a small
+        Legendre series and the smooth PSD is held fixed. The diagnostic file
+        wanderfit.dat reports the starting pure-sinusoid fit and final
+        wandering-sinusoid state for each fitted line. freq_nowander.dat has
+        the same columns and scaling convention as frequency_data.dat, but subtracts the
+        wandering-sinusoid models. Random-walk proposals for fixed-dimension
+        wandering parameters shrink as 1/SNR for high-SNR lines, while
+        reversible-jump birth/death draws remain prior draws.
+
+    splinewanderfit.dat, freq_nosplinewander.dat,
+    splinewanderfit_ml.dat, and freq_nosplinewander_ml.dat
+        Optional with --splinewanderfit: a fixed-dimension sibling of
+        --wanderfit. Each final Lorentzian line is initialized from the local
+        maximum-likelihood Tukeyed sinusoid, then its instantaneous frequency
+        and amplitude are represented by Akima spline knots. The frequency
+        spline is integrated to form the phase and an additional constant phase
+        is fitted. The amplitude is parameterized as an overall ML-scale factor
+        times a dimensionless Akima spline initialized at 1, matching the
+        FastSpec/BayesPower scaling logic. The default spline spacing is 4
+        seconds, so a 32-second segment uses 9 knots. Requested knot spacings
+        are canonicalized to a power-of-two Tspace before the count is formed.
+        This option is intended to test whether a FastSpec-like local spline
+        basis removes wandering instrumental lines better than the global
+        Legendre basis used by
+        --wanderfit. Frequency knots use an absolute prior range, defaulting
+        to +/-0.1 Hz around the best-fit sinusoid frequency rather than a
+        Tobs-dependent bin width. Frequency knot updates randomly choose among
+        three absolute proposal scales set by
+        --spline-wander-frequency-jump-hz. By default this gives 0.01 Hz,
+        0.001 Hz, and 0.0001 Hz. For lines above SNR 100, both frequency-knot
+        and normalized-amplitude-knot proposals are multiplied by 100/SNR.
+        Phase proposals are still sometimes scaled down as 1/SNR for lines
+        above SNR 10. The overall amplitude-scale proposal uses
+        sigma = amp_jump_fraction * amplitude * (10/SNR). The
+        --spline-wander-steps value sets the total proposal budget to this
+        value times the number of initialized lines; individual line visits
+        are then allocated with a 20% uniform /
+        80% startup-SNR-weighted mixture by default. The powerfit model is run
+        first whenever --splinewanderfit is requested. Its residual is used as
+        the splinewander input, and Lorentzian candidates near the fitted mains
+        harmonics are skipped so the two coherent line models do not refit the
+        same power-line features. Add --flat-amplitude to hold the normalized
+        amplitude spline fixed at 1, while still allowing the overall
+        amplitude scale to move.
+
+        freq_nosplinewander.dat and splinewanderfit.dat use the final fair
+        draw from the line-only MCMC. The *_ml.dat versions use, for each line,
+        the best local residual-likelihood state visited by that line's MCMC
+        updates. The freq_no*.dat files use the same scaling convention as
+        frequency_data.dat. This is a practical subtraction diagnostic rather
+        than a posterior draw.
+
+    splinewander_<FREQ>Hz_controls.dat,
+    splinewander_<FREQ>Hz_controls_ml.dat, and
+    splinewander_<FREQ>Hz_move_diagnostics.dat
+        Optional with --splinewanderfit --checkline FREQ: final Akima control
+        points and move diagnostics for the fitted spline-wandering line nearest
+        to the requested frequency. For example, --checkline 331 writes
+        splinewander_331Hz_controls.dat for the line nearest 331 Hz. The
+        untagged-in-state controls file uses the final fair draw; the *_ml.dat
+        controls file uses the best local-likelihood state. The columns are knot
+        time, frequency, raw amplitude, and the dimensionless amplitude-spline
+        value. Move diagnostics report proposed/accepted counts and acceptance
+        rates for frequency-knot, normalized-amplitude-knot,
+        overall-amplitude-scale, and phase moves.
+
+    powerfit.dat, freq_nopower.dat, powerfit_ml.dat, and freq_nopower_ml.dat
+        Optional with --powerfit: jointly fit the mains-power harmonics with a
+        FastSpec/BayesPower-style coherent spline model. The model uses a shared
+        Akima spline for the base mains frequency, integrates it to get the
+        phase evolution, scales that phase evolution by harmonic number, and
+        applies a separate constant phase and amplitude scale to each harmonic.
+        A second shared Akima spline gives the dimensionless amplitude envelope,
+        initialized at one. The *_ml.dat files use the best local-likelihood
+        state visited by the powerfit MCMC. The freq_no*.dat files use the same
+        scaling convention as frequency_data.dat.
+
+    powerfit_controls.dat and powerfit_controls_ml.dat
+        Optional with --powerfit: final shared control points for the base mains
+        frequency and normalized amplitude envelope. Columns are knot time,
+        base frequency, base-frequency offset from the nominal mains frequency,
+        and normalized amplitude. These are the closest Python analogue of
+        FastSpec/powermodel.dat for the specialized harmonic fit.
+
+    powerfit_spline.dat and powerfit_spline_ml.dat
+        Optional with --powerfit: the same shared frequency and amplitude
+        splines evaluated every 0.25 seconds by default. Columns begin with
+        time, base frequency, base-frequency offset, and shared normalized
+        amplitude. They are followed by per-harmonic physical frequency and raw
+        amplitude columns, so harmonic j has frequency j*f_base(t) and amplitude
+        A_j*a_shared(t). The *_ml.dat file uses the best local-likelihood state.
+
+    powerfit_move_diagnostics.dat
+        Optional with --powerfit: proposed/accepted counts for shared
+        frequency-knot, shared amplitude-envelope-knot, harmonic amplitude, and
+        harmonic phase updates.
 
     freq_nolines.dat
         Optional with --write-line-subtracted-time: Tukey-windowed original
         frequency-domain data with a final-state
         fair-draw Lorentzian line contribution subtracted. This uses the
         original analyzed data, not the wavelet-cleaned data used for PSD
-        estimation, and is written in BayesWave's internal scaled Fourier
-        convention.
+        estimation, and is written with the same grid and scaling convention as
+        frequency_data.dat.
 
 To run the functional whitening check used during development:
 
@@ -279,6 +456,13 @@ try:
 except Exception:  # pragma: no cover - exercised on systems without scipy
     fftconvolve = None
     SCIPY_AVAILABLE = False
+
+try:
+    from scipy.interpolate import CubicSpline
+    SCIPY_INTERPOLATE_AVAILABLE = True
+except Exception:  # pragma: no cover - exercised on systems without scipy
+    CubicSpline = None
+    SCIPY_INTERPOLATE_AVAILABLE = False
 
 try:
     from numba import njit
@@ -323,6 +507,45 @@ FEATURE_WARM = 5.0
 FEATURE_SNR_THRESH = 4.0
 FEATURE_QSCAN_SUBSCALE = 40
 SINEFIT_SCAN_POINTS = 41
+WANDERING_SINE_FFT_SIZE = 1024
+WANDERING_MCMC_STEPS = 2000
+WANDERING_INITIAL_LEGENDRE = 2
+WANDERING_MAX_LEGENDRE = 4
+WANDERING_PROPOSAL_REFERENCE_SNR = 10.0
+CONTEXT_LINE_LOWER_SIGMA_LEVEL = 2.0
+SPLINE_WANDERING_MCMC_STEPS = 5000
+SPLINE_WANDERING_KNOT_SPACING = 4.0
+SPLINE_WANDERING_FREQ_WIDTH_HZ = 0.1
+SPLINE_WANDERING_FREQ_JUMP_HZ = 0.01
+SPLINE_WANDERING_FREQ_JUMP_LADDER = (1.0, 0.1, 0.01)
+SPLINE_WANDERING_KNOT_REFERENCE_SNR = 100.0
+SPLINE_WANDERING_PHASE_JUMP = 0.1
+SPLINE_WANDERING_PHASE_SNR_SCALE_PROB = 0.5
+SPLINE_WANDERING_AMP_WIDTH_FRACTION = 0.5
+SPLINE_WANDERING_AMP_JUMP_FRACTION = 0.05
+SPLINE_WANDERING_UNIFORM_LINE_PROB = 0.2
+SPLINE_WANDERING_MOVE_LABELS = (
+    "frequency_knot",
+    "amplitude_shape_knot",
+    "amplitude_scale",
+    "phase",
+)
+POWERFIT_MCMC_STEPS = 50000
+POWERFIT_BASE_FREQUENCY = 60.0
+POWERFIT_HARMONICS = 5
+POWERFIT_KNOT_SPACING = SPLINE_WANDERING_KNOT_SPACING
+POWERFIT_FREQ_WIDTH_HZ = SPLINE_WANDERING_FREQ_WIDTH_HZ
+POWERFIT_FREQ_JUMP_HZ = SPLINE_WANDERING_FREQ_JUMP_HZ
+POWERFIT_AMP_WIDTH_FRACTION = SPLINE_WANDERING_AMP_WIDTH_FRACTION
+POWERFIT_AMP_JUMP_FRACTION = SPLINE_WANDERING_AMP_JUMP_FRACTION
+POWERFIT_PHASE_JUMP = SPLINE_WANDERING_PHASE_JUMP
+POWERFIT_SPLINE_OUTPUT_DT = 0.25
+POWERFIT_MOVE_LABELS = (
+    "shared_frequency_knot",
+    "shared_amplitude_envelope_knot",
+    "harmonic_amplitude_scale",
+    "harmonic_phase",
+)
 LINE_COUNT_PRIOR_ZETA = 0.5
 LINE_NU_MIN = 1.0e-5
 LINE_NU_MAX = 1.0e-1
@@ -440,6 +663,7 @@ class BayesLinePriors:
     smooth_sigma: Optional[np.ndarray] = None
     component_reference: Optional[np.ndarray] = None
     line_log1p_mean: Optional[np.ndarray] = None
+    line_log1p_sigma_minus: Optional[np.ndarray] = None
     line_log1p_sigma: Optional[np.ndarray] = None
     gaussian_log1p_mean: Optional[np.ndarray] = None
     gaussian_log1p_sigma: Optional[np.ndarray] = None
@@ -685,6 +909,31 @@ def logprior_ratio_component_numba(reference: np.ndarray, mean: np.ndarray,
 
 
 @njit(cache=True)
+def logprior_ratio_component_asym_numba(reference: np.ndarray, mean: np.ndarray,
+                                        sigma_minus: np.ndarray,
+                                        sigma_plus: np.ndarray,
+                                        component: np.ndarray) -> float:
+    """Asymmetric Gaussian prior for non-negative PSD components.
+
+    The variable is x=log1p(component/reference), so physical zero component is
+    x=0.  The lower-side sigma can therefore be capped without reducing the
+    upper-side freedom to add line power in the target segment.
+    """
+
+    val = 0.0
+    tiny = np.finfo(np.float64).tiny
+    for i in range(component.size):
+        ref = max(reference[i], tiny)
+        x = math.log1p(max(component[i], 0.0) / ref)
+        mu = mean[i]
+        sig = sigma_minus[i] if x < mu else sigma_plus[i]
+        sig = max(sig, 1.0e-12)
+        z = (x - mu) / sig
+        val -= 0.5 * z * z
+    return val
+
+
+@njit(cache=True)
 def positive_range_numba(sn: np.ndarray, ilow: int, ihigh: int) -> bool:
     """Check positivity only over bins touched by a local proposal."""
 
@@ -790,6 +1039,36 @@ def delta_logprior_ratio_component_range_numba(reference: np.ndarray, mean: np.n
         xnew = math.log1p(max(comp_new[i], 0.0) / ref)
         zold = (xold - mean[i]) / sig
         znew = (xnew - mean[i]) / sig
+        val += -0.5 * znew * znew + 0.5 * zold * zold
+    return val
+
+
+@njit(cache=True)
+def delta_logprior_ratio_component_asym_range_numba(reference: np.ndarray,
+                                                   mean: np.ndarray,
+                                                   sigma_minus: np.ndarray,
+                                                   sigma_plus: np.ndarray,
+                                                   comp_new: np.ndarray,
+                                                   comp_old: np.ndarray,
+                                                   ilow: int,
+                                                   ihigh: int) -> float:
+    """Local difference of the asymmetric non-negative component prior."""
+
+    val = 0.0
+    tiny = np.finfo(np.float64).tiny
+    lo = max(0, ilow)
+    hi = min(comp_new.size, ihigh)
+    for i in range(lo, hi):
+        ref = max(reference[i], tiny)
+        mu = mean[i]
+        xold = math.log1p(max(comp_old[i], 0.0) / ref)
+        xnew = math.log1p(max(comp_new[i], 0.0) / ref)
+        sigold = sigma_minus[i] if xold < mu else sigma_plus[i]
+        signew = sigma_minus[i] if xnew < mu else sigma_plus[i]
+        sigold = max(sigold, 1.0e-12)
+        signew = max(signew, 1.0e-12)
+        zold = (xold - mu) / sigold
+        znew = (xnew - mu) / signew
         val += -0.5 * znew * znew + 0.5 * zold * zold
     return val
 
@@ -1680,28 +1959,64 @@ def attach_lorentzian_lookup(lines: LorentzianParams, data: DataParams) -> None:
 # Fast initial line fit: lineget, Lpeak, cut_lorentz, lmcmc
 # ---------------------------------------------------------------------------
 #
-# The C startup line model is not a simple maximum-likelihood subtraction. It
+# The startup line model is not a simple maximum-likelihood subtraction. It
 # finds candidates in four threshold passes, refines them with the windowed
-# lookup table, prunes overlapping/weak lines, and uses lmcmc to avoid
-# over-subtracting the Fourier coefficients used to build the smooth spline.
+# lookup table, prunes overlapping/weak lines, and subtracts a fair draw from
+# the conditional Gaussian line posterior to avoid over-subtracting the Fourier
+# coefficients used to build the smooth spline.
 def lmcmc_sample(M: int, SM: float, SL: float, dr: float, di: float,
                  xr: float, xi: float, rng: np.random.Generator) -> Tuple[float, float]:
-    """Small MCMC line-subtraction step used inside C lorentzfit."""
+    """Draw the line contribution from the exact conditional posterior.
+
+    ``SM`` and ``SL`` are complex-bin powers in the same units as
+    ``dr**2 + di**2``.  Startup spectra built from ``2*|d|^2`` are converted
+    by the caller before reaching this helper.
+
+    The old Python port used the short random-walk MCMC retained below as
+    ``lmcmc_sample_mcmc_reference``.  For fixed smooth and line powers the
+    conditional posterior is Gaussian, so the active code draws it directly.
+    """
+
+    del M, xr, xi
+    total = SM + SL
+    if total <= 0.0:
+        return 0.0, 0.0
+    mean_frac = SL / total
+    sigma2 = 0.5 * SM * SL / max(total, np.finfo(float).tiny)
+    sigma = math.sqrt(max(sigma2, 0.0))
+    return (
+        mean_frac * dr + rng.normal(0.0, sigma),
+        mean_frac * di + rng.normal(0.0, sigma),
+    )
+
+
+def lmcmc_sample_mcmc_reference(M: int, SM: float, SL: float, dr: float, di: float,
+                                xr: float, xi: float,
+                                rng: np.random.Generator) -> Tuple[float, float]:
+    """Reference copy of the old short random-walk lmcmc implementation.
+
+    This is intentionally not used by the active Python line-subtraction path.
+    It is kept so we can compare against the historical C-style implementation
+    while testing the direct conditional draw.
+    """
 
     hrx = xr
     hix = xi
-    sigma2 = 0.25 * SM * SL / max(SM + SL, np.finfo(float).tiny)
+    # Proposal variance per real component.  For the Gaussian quadratic
+    # |d-h|^2/SM + |h|^2/SL, the real-coordinate Fisher is
+    # 2*(1/SM + 1/SL), so its inverse is 0.5*SM*SL/(SM+SL).
+    sigma2 = 0.5 * SM * SL / max(SM + SL, np.finfo(float).tiny)
     sigma = math.sqrt(max(sigma2, 0.0))
     x = dr - hrx
     y = di - hix
-    logLx = -2.0 * (x * x + y * y) / max(SM, np.finfo(float).tiny)
+    logLx = -(x * x + y * y) / max(SM, np.finfo(float).tiny)
 
     for _ in range(1, M):
         hry = hrx + rng.normal(0.0, sigma)
         hiy = hix + rng.normal(0.0, sigma)
         x = dr - hry
         y = di - hiy
-        logLy = -2.0 * (x * x + y * y) / max(SM, np.finfo(float).tiny)
+        logLy = -(x * x + y * y) / max(SM, np.finfo(float).tiny)
         if math.log(max(rng.random(), np.finfo(float).tiny)) < logLy - logLx:
             logLx = logLy
             hrx = hry
@@ -1711,16 +2026,33 @@ def lmcmc_sample(M: int, SM: float, SL: float, dr: float, di: float,
 
 def subtract_lines_lmcmc(data_fft: np.ndarray, smooth: np.ndarray, line_power: np.ndarray,
                          rng: np.random.Generator) -> np.ndarray:
-    """Subtract line contributions conservatively using lmcmc per frequency bin."""
+    """Subtract fair draws of line contributions in each active frequency bin."""
 
     seed = int(rng.integers(1, 2**31 - 1))
     return subtract_lines_lmcmc_numba(data_fft, smooth, line_power, seed)
 
 
 @njit(cache=True)
+def conditional_line_draw_numba(SM: float, SL: float, dr: float, di: float,
+                                tiny: float) -> Tuple[float, float]:
+    """Draw h from p(h|d, SM, SL) for one complex Fourier bin."""
+
+    total = SM + SL
+    if total <= 0.0:
+        return 0.0, 0.0
+    mean_frac = SL / max(total, tiny)
+    sigma2 = 0.5 * SM * SL / max(total, tiny)
+    sigma = math.sqrt(max(sigma2, 0.0))
+    return (
+        mean_frac * dr + sigma * np.random.normal(),
+        mean_frac * di + sigma * np.random.normal(),
+    )
+
+
+@njit(cache=True)
 def subtract_lines_lmcmc_numba(data_fft: np.ndarray, smooth: np.ndarray,
                                line_power: np.ndarray, seed: int) -> np.ndarray:
-    """Numba version of lmcmc subtraction, preserving the same MCMC update."""
+    """Numba version of analytic fair-draw line subtraction."""
 
     np.random.seed(seed)
     cleaned = data_fft.copy()
@@ -1736,24 +2068,7 @@ def subtract_lines_lmcmc_numba(data_fft: np.ndarray, smooth: np.ndarray,
         if frac > 1.0e-2:
             dr = data_fft[i].real
             di = data_fft[i].imag
-            hrx = frac * dr
-            hix = frac * di
-            sigma2 = 0.25 * SM * SL / max(total, tiny)
-            sigma = math.sqrt(max(sigma2, 0.0))
-            x = dr - hrx
-            y = di - hix
-            logLx = -2.0 * (x * x + y * y) / max(SM, tiny)
-            for _ in range(1, 1000):
-                hry = hrx + sigma * np.random.normal()
-                hiy = hix + sigma * np.random.normal()
-                x = dr - hry
-                y = di - hiy
-                logLy = -2.0 * (x * x + y * y) / max(SM, tiny)
-                alpha = math.log(max(np.random.random(), tiny))
-                if alpha < logLy - logLx:
-                    logLx = logLy
-                    hrx = hry
-                    hix = hiy
+            hrx, hix = conditional_line_draw_numba(SM, SL, dr, di, tiny)
             cleaned[i] = (dr - hrx) + 1j * (di - hix)
     return cleaned
 
@@ -1784,27 +2099,9 @@ def whiten_line_subtracted_numba(real_data: np.ndarray, imag_data: np.ndarray,
         hix = 0.0
         frac = sline[j] / max(snf[j], tiny)
         if frac > 1.0e-2:
-            SM = 2.0 * sbase[j]
-            SL = 2.0 * sline[j]
-            total = SM + SL
-            hrx = frac * dr
-            hix = frac * di
-            sigma2 = 0.25 * SM * SL / max(total, tiny)
-            sigma = math.sqrt(max(sigma2, 0.0))
-            x = dr - hrx
-            y = di - hix
-            logLx = -2.0 * (x * x + y * y) / max(SM, tiny)
-            for _ in range(1, 1000):
-                hry = hrx + sigma * np.random.normal()
-                hiy = hix + sigma * np.random.normal()
-                x = dr - hry
-                y = di - hiy
-                logLy = -2.0 * (x * x + y * y) / max(SM, tiny)
-                alpha = math.log(max(np.random.random(), tiny))
-                if alpha < logLy - logLx:
-                    logLx = logLy
-                    hrx = hry
-                    hix = hiy
+            SM = sbase[j]
+            SL = sline[j]
+            hrx, hix = conditional_line_draw_numba(SM, SL, dr, di, tiny)
 
         scale = math.sqrt(max(sbase[j], tiny))
         white[i - 1, 1] = (dr - hrx) / scale
@@ -1835,27 +2132,9 @@ def line_subtracted_scaled_numba(real_data: np.ndarray, imag_data: np.ndarray,
         hix = 0.0
         frac = sline[j] / max(snf[j], tiny)
         if frac > 1.0e-2:
-            SM = 2.0 * sbase[j]
-            SL = 2.0 * sline[j]
-            total = SM + SL
-            hrx = frac * dr
-            hix = frac * di
-            sigma2 = 0.25 * SM * SL / max(total, tiny)
-            sigma = math.sqrt(max(sigma2, 0.0))
-            x = dr - hrx
-            y = di - hix
-            logLx = -2.0 * (x * x + y * y) / max(SM, tiny)
-            for _ in range(1, 1000):
-                hry = hrx + sigma * np.random.normal()
-                hiy = hix + sigma * np.random.normal()
-                x = dr - hry
-                y = di - hiy
-                logLy = -2.0 * (x * x + y * y) / max(SM, tiny)
-                alpha = math.log(max(np.random.random(), tiny))
-                if alpha < logLy - logLx:
-                    logLx = logLy
-                    hrx = hry
-                    hix = hiy
+            SM = sbase[j]
+            SL = sline[j]
+            hrx, hix = conditional_line_draw_numba(SM, SL, dr, di, tiny)
 
         out_real[i] = dr - hrx
         out_imag[i] = di - hix
@@ -2268,9 +2547,44 @@ def write_time_domain_line_subtracted_files(bayesline: BayesLineParams,
     print("Wrote line_subtracted_noglitch_time.dat; WARNING: Tukey roll-off remains in the time-domain data")
 
 
+def frequency_data_output_scale(t_obs: float, window_power_correction: float) -> float:
+    """Scale internal BayesWave Fourier coefficients like frequency_data.dat."""
+
+    return math.sqrt(16.0 * window_power_correction / t_obs)
+
+
+def frequency_data_output_scale_from_alpha(n: int, t_obs: float, alpha: float) -> float:
+    """Return the frequency_data.dat scale for a Tukey alpha and FFT length."""
+
+    return frequency_data_output_scale(t_obs, tukey_power_correction(n, alpha))
+
+
+def write_scaled_frequency_domain_output(output_file: str, t_obs: float,
+                                         freq_scale: float,
+                                         real_data: np.ndarray,
+                                         imag_data: np.ndarray) -> None:
+    """Write complex data on the same frequency grid as frequency_data.dat."""
+
+    n_half = min(real_data.size, imag_data.size) - 1
+    out = np.zeros((n_half, 3), dtype=np.float64)
+    out[:, 0] = np.arange(n_half, dtype=np.float64) / t_obs
+    out[1:, 1] = freq_scale * real_data[1:n_half]
+    out[1:, 2] = freq_scale * imag_data[1:n_half]
+    np.savetxt(output_file, out)
+
+
+def write_scaled_complex_frequency_domain_output(output_file: str, t_obs: float,
+                                                 freq_scale: float,
+                                                 data: np.ndarray) -> None:
+    """Write complex data on the same frequency grid as frequency_data.dat."""
+
+    write_scaled_frequency_domain_output(output_file, t_obs, freq_scale, data.real, data.imag)
+
+
 def write_line_subtracted_frequency_file(bayesline: BayesLineParams,
                                          original_fft: np.ndarray,
                                          dt: float,
+                                         window_power_correction: float,
                                          rng: np.random.Generator,
                                          output_file: str = "freq_nolines.dat") -> None:
     """Write original tapered FFT data after final fair-draw Lorentzian subtraction."""
@@ -2292,8 +2606,8 @@ def write_line_subtracted_frequency_file(bayesline: BayesLineParams,
         data.imin, data.imax, seed
     )
 
-    freqs = np.arange(1, n_half, dtype=np.float64) / data.t_obs
-    np.savetxt(output_file, np.column_stack((freqs, out_real[1:n_half], out_imag[1:n_half])))
+    freq_scale = frequency_data_output_scale(data.t_obs, window_power_correction)
+    write_scaled_frequency_domain_output(output_file, data.t_obs, freq_scale, out_real, out_imag)
     print(f"Wrote {output_file} from original tapered data with final Lorentzian lines subtracted")
 
 
@@ -2400,14 +2714,17 @@ def tukey_window_dft_offsets(offsets: np.ndarray, n: int, alpha: float) -> np.nd
 
 def sinefit(bayesline: BayesLineParams, n: int, alpha: float,
             output_file: str = "sinefit.dat",
-            scan_points: int = SINEFIT_SCAN_POINTS) -> np.ndarray:
-    """Match each reconstructed Lorentzian line to a Tukey-windowed sinusoid.
+            scan_points: int = SINEFIT_SCAN_POINTS,
+            fit_model: str = "sinusoid") -> np.ndarray:
+    """Match each reconstructed Lorentzian line to a local coherent model.
 
     The comparison is intentionally model-only for this first pass: the
     reconstructed line is the same local windowed-Lorentzian power profile used
-    in the BayesLine line model, and the sinusoid is represented by the power
-    profile of a Tukey-windowed pure tone. Inner products use the final
-    broadband non-line PSD as the local noise model.
+    in the BayesLine line model.  ``fit_model="sinusoid"`` compares against the
+    power profile of a Tukey-windowed pure tone, while
+    ``fit_model="oscillator"`` uses the steady-state driven oscillator response
+    for a trial drive frequency. Inner products use the final broadband
+    non-line PSD as the local noise model.
     """
 
     if bayesline.data is None or bayesline.lines_x is None:
@@ -2419,16 +2736,19 @@ def sinefit(bayesline: BayesLineParams, n: int, alpha: float,
         raise RuntimeError("Lorentzian lookup table has not been loaded")
     if scan_points < 1:
         raise ValueError("scan_points must be positive")
+    if fit_model not in ("sinusoid", "oscillator"):
+        raise ValueError("fit_model must be 'sinusoid' or 'oscillator'")
 
     nlines = int(lines.n)
     rows = np.zeros((nlines, 6), dtype=np.float64)
+    frequency_column = "sinusoid_frequency" if fit_model == "sinusoid" else "oscillator_drive_frequency"
     if nlines == 0:
         np.savetxt(
             output_file,
             rows,
-            header="line_frequency line_width sinusoid_frequency line_SNR residual_SNR mismatch",
+            header=f"line_frequency line_width {frequency_column} line_SNR residual_SNR mismatch",
         )
-        print(f"Wrote {output_file} with 0 sinefit matches")
+        print(f"Wrote {output_file} with 0 {fit_model} matches")
         return rows
 
     data = bayesline.data
@@ -2482,12 +2802,18 @@ def sinefit(bayesline: BayesLineParams, n: int, alpha: float,
         for fs in f_line + half_scan * scan_axis:
             if fs <= 0.0 or fs >= n_half / t_obs:
                 continue
-            offsets = fs * t_obs - bins
-            sine_power = np.abs(tukey_window_dft_offsets(offsets, n, alpha)) ** 2
-            sine_norm = float(np.dot(weight * sine_power, sine_power))
-            if sine_norm <= 0.0:
+            if fit_model == "sinusoid":
+                offsets = fs * t_obs - bins
+                model_power = np.abs(tukey_window_dft_offsets(offsets, n, alpha)) ** 2
+            else:
+                model_template = tukeyed_driven_oscillator_scaled_template(
+                    float(fs), f_line, nu, bins, n, t_obs, alpha
+                )
+                model_power = np.abs(model_template) ** 2
+            model_norm = float(np.dot(weight * model_power, model_power))
+            if model_norm <= 0.0:
                 continue
-            match = float(np.dot(weight * lorentz, sine_power) / math.sqrt(lorentz_norm * sine_norm))
+            match = float(np.dot(weight * lorentz, model_power) / math.sqrt(lorentz_norm * model_norm))
             if match > best_match:
                 best_match = min(match, 1.0)
                 best_freq = float(fs)
@@ -2502,9 +2828,9 @@ def sinefit(bayesline: BayesLineParams, n: int, alpha: float,
     np.savetxt(
         output_file,
         rows,
-        header="line_frequency line_width sinusoid_frequency line_SNR residual_SNR mismatch",
+        header=f"line_frequency line_width {frequency_column} line_SNR residual_SNR mismatch",
     )
-    print(f"Wrote {output_file} with {nlines:d} sinefit matches")
+    print(f"Wrote {output_file} with {nlines:d} {fit_model} matches")
     return rows
 
 
@@ -2521,6 +2847,374 @@ def tukeyed_real_sinusoid_scaled_templates(frequency: float, bins: np.ndarray,
     cos_template = 0.5 * (wplus + wminus) * scale
     sin_template = (wplus - wminus) / (2.0j) * scale
     return cos_template, sin_template
+
+
+def oscillator_response_amplitude_phase(drive_frequency: float,
+                                        resonance_frequency: float,
+                                        width_hz: float) -> Tuple[float, float]:
+    """Return amplitude response and phase lag for a driven damped oscillator.
+
+    BWtest stores the Lorentzian width ``nu`` in Hz.  The oscillator equation
+    is written in angular frequency, so the damping coefficient used here is
+    ``Gamma = 2*pi*nu``.  The response is
+
+        cos(omega t - theta) /
+        sqrt((omega0^2 - omega^2)^2 + Gamma^2 omega^2),
+
+    with theta = atan2(Gamma*omega, omega0^2 - omega^2).
+    """
+
+    omega = TPI * float(drive_frequency)
+    omega0 = TPI * float(resonance_frequency)
+    gamma = TPI * float(width_hz)
+    real_part = omega0 * omega0 - omega * omega
+    imag_part = gamma * omega
+    denom = math.hypot(real_part, imag_part)
+    if denom <= np.finfo(float).tiny:
+        return 0.0, 0.0
+    return 1.0 / denom, math.atan2(imag_part, real_part)
+
+
+def tukeyed_driven_oscillator_scaled_template(drive_frequency: float,
+                                              resonance_frequency: float,
+                                              width_hz: float,
+                                              bins: np.ndarray,
+                                              n: int,
+                                              t_obs: float,
+                                              alpha: float) -> np.ndarray:
+    """Return the scaled rFFT template for unit-G0 oscillator response.
+
+    This is an amplitude-level model, so the Tukey window enters coherently
+    through the DFT of the windowed sinusoid.  That is deliberately different
+    from the Lorentzian PSD lookup, where the squared Tukey response is
+    convolved with a power profile.
+    """
+
+    cos_template, sin_template = tukeyed_real_sinusoid_scaled_templates(
+        drive_frequency, bins, n, t_obs, alpha
+    )
+    response, theta = oscillator_response_amplitude_phase(
+        drive_frequency, resonance_frequency, width_hz
+    )
+    return response * (math.cos(theta) * cos_template + math.sin(theta) * sin_template)
+
+
+def legendre_control_values(coefficients: np.ndarray, control_count: int) -> Tuple[np.ndarray, np.ndarray]:
+    """Evaluate a small Legendre series on control points over the observation.
+
+    The zeroth-order coefficient is the ordinary constant term.  Thus a pure
+    sinusoid can be represented by ``frequency_coefficients=[f0]`` and
+    ``amplitude_coefficients=[A]``; higher coefficients describe slow wandering
+    around those values.
+    """
+
+    coeff = np.asarray(coefficients, dtype=np.float64)
+    if coeff.ndim != 1 or coeff.size == 0:
+        raise ValueError("Legendre coefficient arrays must be one-dimensional and non-empty")
+    if control_count < coeff.size:
+        raise ValueError("control_count must be at least the number of Legendre coefficients")
+
+    x_control = np.linspace(-1.0, 1.0, int(control_count), dtype=np.float64)
+    design = np.polynomial.legendre.legvander(x_control, coeff.size - 1)
+    return x_control, design @ coeff
+
+
+def evaluate_wandering_controls(coefficients: np.ndarray, times: np.ndarray,
+                                t_obs: float, control_count: int,
+                                integrate: bool = False) -> np.ndarray:
+    """Spline Legendre control values onto a time grid.
+
+    FastSpec represented power-line frequency and amplitude by Legendre
+    coefficients on coarse control points, then used cubic splines for the
+    time-domain model.  This helper mirrors that structure.  If SciPy's cubic
+    spline is unavailable, it falls back to linear interpolation; the caller
+    still gets a valid forward model, just with a less faithful interpolation.
+    """
+
+    _x_control, values = legendre_control_values(np.asarray(coefficients, dtype=np.float64),
+                                                 control_count)
+    t_control = np.linspace(0.0, float(t_obs), int(control_count), dtype=np.float64)
+    times = np.asarray(times, dtype=np.float64)
+    if SCIPY_INTERPOLATE_AVAILABLE and CubicSpline is not None:
+        spline = CubicSpline(t_control, values, extrapolate=True)
+        if integrate:
+            anti = spline.antiderivative()
+            return np.asarray(anti(times) - anti(0.0), dtype=np.float64)
+        return np.asarray(spline(times), dtype=np.float64)
+
+    if integrate:
+        dense_values = np.interp(times, t_control, values)
+        out = np.zeros_like(times, dtype=np.float64)
+        if times.size > 1:
+            dt = np.diff(times)
+            out[1:] = np.cumsum(0.5 * (dense_values[:-1] + dense_values[1:]) * dt)
+        return out
+    return np.interp(times, t_control, values)
+
+
+def wandering_sinusoid_local_phase_amplitude(frequency_coefficients: np.ndarray,
+                                             amplitude_coefficients: np.ndarray,
+                                             phase: float,
+                                             t_obs: float,
+                                             local_fft_size: int = WANDERING_SINE_FFT_SIZE,
+                                             control_count: Optional[int] = None
+                                             ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Return local-grid time, instantaneous frequency, amplitude, and phase."""
+
+    m = int(local_fft_size)
+    if m < 8:
+        raise ValueError("local_fft_size must be at least 8")
+    fcoef = np.asarray(frequency_coefficients, dtype=np.float64)
+    acoef = np.asarray(amplitude_coefficients, dtype=np.float64)
+    if control_count is None:
+        control_count = max(8, 2 * max(fcoef.size, acoef.size))
+    control_count = int(control_count)
+    if control_count < max(fcoef.size, acoef.size):
+        raise ValueError("control_count must be at least the largest coefficient count")
+
+    times = np.arange(m, dtype=np.float64) * (float(t_obs) / float(m))
+    inst_freq = evaluate_wandering_controls(fcoef, times, t_obs, control_count, integrate=False)
+    amp = evaluate_wandering_controls(acoef, times, t_obs, control_count, integrate=False)
+    phase_integral = evaluate_wandering_controls(fcoef, times, t_obs, control_count, integrate=True)
+    phase_series = float(phase) + TPI * phase_integral
+    return times, inst_freq, amp, phase_series
+
+
+def wandering_sinusoid_frequency_model(frequency_coefficients: np.ndarray,
+                                       amplitude_coefficients: np.ndarray,
+                                       phase: float,
+                                       n: int,
+                                       t_obs: float,
+                                       alpha: float,
+                                       local_fft_size: int = WANDERING_SINE_FFT_SIZE,
+                                       control_count: Optional[int] = None,
+                                       anchor_fraction: float = 0.25
+                                       ) -> Tuple[np.ndarray, np.ndarray]:
+    """Efficient Fourier-domain model for a slowly wandering real sinusoid.
+
+    The model is built with the FastSpec heterodyning trick.  A short local
+    time series covering the full observation is generated after removing an
+    integer-bin carrier, Tukey-windowed, FFTed, and shifted back to the physical
+    frequency bins.  Returned values are in the same BayesWave-scaled units as
+    the sinefit templates, namely ``dt/sqrt(2)`` times the ordinary FFT
+    coefficients.
+    """
+
+    if n <= 0 or n % 2 != 0:
+        raise ValueError("n must be a positive even FFT length")
+    m = int(min(local_fft_size, n))
+    if m < 8:
+        raise ValueError("local_fft_size must be at least 8")
+    if not (0.0 <= alpha <= 1.0):
+        raise ValueError("alpha must be in [0, 1]")
+
+    times, inst_freq, amp, phase_series = wandering_sinusoid_local_phase_amplitude(
+        frequency_coefficients, amplitude_coefficients, phase, t_obs, m, control_count
+    )
+    center_frequency = float(np.mean(inst_freq))
+    anchor_bin = int(round(anchor_fraction * float(m)))
+    anchor_bin = min(max(anchor_bin, 1), m // 2 - 1)
+    center_bin = int(round(center_frequency * float(t_obs)))
+    heterodyne_bin = center_bin - anchor_bin
+    heterodyne_frequency = float(heterodyne_bin) / float(t_obs)
+
+    local_signal = amp * np.cos(phase_series - TPI * heterodyne_frequency * times)
+    local_signal = local_signal.copy()
+    tukey_inplace(local_signal, alpha)
+    local_fft = np.fft.rfft(local_signal)
+
+    local_bins = np.arange(local_fft.size, dtype=np.int64)
+    full_bins = local_bins + heterodyne_bin
+    valid = (local_bins > 0) & (local_bins < local_fft.size - 1)
+    valid &= (full_bins > 0) & (full_bins < n // 2)
+    scale = (float(t_obs) / float(m)) / math.sqrt(2.0)
+    return full_bins[valid].astype(np.int64), local_fft[valid] * scale
+
+
+def add_wandering_sinusoid_to_spectrum(spectrum: np.ndarray,
+                                       frequency_coefficients: np.ndarray,
+                                       amplitude_coefficients: np.ndarray,
+                                       phase: float,
+                                       t_obs: float,
+                                       alpha: float,
+                                       local_fft_size: int = WANDERING_SINE_FFT_SIZE,
+                                       control_count: Optional[int] = None,
+                                       sign: float = 1.0) -> None:
+    """Add a wandering-sinusoid model in-place to an rfft-like complex spectrum."""
+
+    bins, values = wandering_sinusoid_frequency_model(
+        frequency_coefficients, amplitude_coefficients, phase,
+        2 * (spectrum.size - 1), t_obs, alpha, local_fft_size, control_count
+    )
+    spectrum[bins] += float(sign) * values
+
+
+@dataclass
+class WanderingLineState:
+    """Current state for one end-stage wandering-sinusoid subtraction model."""
+
+    line_frequency: float
+    line_width: float
+    start_frequency: float
+    start_amplitude: float
+    start_phase: float
+    start_snr: float
+    nleg: int
+    fcoef: np.ndarray
+    acoef: np.ndarray
+    phase: float
+    f_center: float
+    a_center: float
+    f_width: float
+    a_width: float
+    band_half_bins: int
+    bins: np.ndarray
+    model: np.ndarray
+    accepted: int = 0
+    proposed: int = 0
+
+
+def wandering_model_for_state(state: WanderingLineState, n: int, t_obs: float,
+                              alpha: float, data: DataParams,
+                              local_fft_size: int) -> Tuple[np.ndarray, np.ndarray]:
+    """Build and analysis-band filter the Fourier model for one wandering line."""
+
+    bins, values = wandering_sinusoid_frequency_model(
+        state.fcoef[:state.nleg],
+        state.acoef[:state.nleg],
+        state.phase,
+        n,
+        t_obs,
+        alpha,
+        local_fft_size=local_fft_size,
+        control_count=max(8, 2 * state.nleg),
+    )
+    valid = (bins >= data.imin) & (bins < data.imax)
+    center_bin = int(round(state.line_frequency * t_obs))
+    valid &= np.abs(bins - center_bin) <= state.band_half_bins
+    return bins[valid], values[valid]
+
+
+def line_loglike_from_residual(residual: np.ndarray, bins: np.ndarray,
+                               smooth_full: np.ndarray) -> float:
+    """Fixed-PSD local Gaussian log likelihood for complex residual bins."""
+
+    if bins.size == 0:
+        return 0.0
+    weight = 1.0 / np.maximum(smooth_full[bins], np.finfo(float).tiny)
+    return -float(np.sum(weight * (residual.real * residual.real + residual.imag * residual.imag)))
+
+
+def merge_line_bins(old_bins: np.ndarray, old_model: np.ndarray,
+                    new_bins: np.ndarray, new_model: np.ndarray,
+                    residual: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Return union bins, current residual, residual without old model, and proposed residual."""
+
+    union = np.union1d(old_bins, new_bins).astype(np.int64)
+    current = residual[union].copy()
+    base = current.copy()
+    if old_bins.size > 0:
+        old_pos = np.searchsorted(union, old_bins)
+        base[old_pos] += old_model
+    proposed = base.copy()
+    if new_bins.size > 0:
+        new_pos = np.searchsorted(union, new_bins)
+        proposed[new_pos] -= new_model
+    return union, current, base, proposed
+
+
+def line_dimension_move_prob(nleg: int, min_legendre: int, max_legendre: int,
+                             birth: bool) -> float:
+    """Proposal probability for the RJ birth/death direction at a dimension."""
+
+    if max_legendre <= min_legendre:
+        return 0.0
+    if nleg <= min_legendre:
+        return 1.0 if birth else 0.0
+    if nleg >= max_legendre:
+        return 0.0 if birth else 1.0
+    return 0.5
+
+
+def wandering_jump_snr_scale(snr: float) -> float:
+    """Shrink wandering-line random-walk steps with the high-SNR error scale."""
+
+    reference = WANDERING_PROPOSAL_REFERENCE_SNR
+    if not np.isfinite(snr) or snr <= reference:
+        return 1.0
+    return reference / snr
+
+
+def wandering_jump_reference_snr_scale(snr: float) -> float:
+    """Scale selected jumps as reference_snr/SNR, without capping low-SNR lines."""
+
+    reference = WANDERING_PROPOSAL_REFERENCE_SNR
+    if not np.isfinite(snr) or snr <= 0.0:
+        return 1.0
+    return reference / snr
+
+
+def propose_wandering_state(state: WanderingLineState, rng: np.random.Generator,
+                            min_legendre: int, max_legendre: int) -> Tuple[WanderingLineState, float]:
+    """Propose a within-model or birth/death update for one wandering line."""
+
+    prop = WanderingLineState(
+        state.line_frequency, state.line_width, state.start_frequency,
+        state.start_amplitude, state.start_phase, state.start_snr,
+        state.nleg, state.fcoef.copy(), state.acoef.copy(), state.phase,
+        state.f_center, state.a_center, state.f_width, state.a_width,
+        state.band_half_bins, state.bins, state.model, state.accepted, state.proposed,
+    )
+    log_qratio = 0.0
+
+    do_dimension = max_legendre > min_legendre and rng.random() < 0.25
+    if do_dimension:
+        if prop.nleg <= min_legendre:
+            birth = True
+        elif prop.nleg >= max_legendre:
+            birth = False
+        else:
+            birth = bool(rng.random() < 0.5)
+
+        forward = line_dimension_move_prob(prop.nleg, min_legendre, max_legendre, birth)
+        if birth:
+            j = prop.nleg
+            prop.fcoef[j] = rng.uniform(-prop.f_width, prop.f_width)
+            prop.acoef[j] = rng.uniform(-prop.a_width, prop.a_width)
+            prop.nleg += 1
+            reverse = line_dimension_move_prob(prop.nleg, min_legendre, max_legendre, False)
+        else:
+            j = prop.nleg - 1
+            prop.fcoef[j] = 0.0
+            prop.acoef[j] = 0.0
+            prop.nleg -= 1
+            reverse = line_dimension_move_prob(prop.nleg, min_legendre, max_legendre, True)
+        if forward > 0.0 and reverse > 0.0:
+            log_qratio = math.log(reverse / forward)
+        return prop, log_qratio
+
+    snr_scale = wandering_jump_snr_scale(prop.start_snr)
+    nparams = 2 * prop.nleg + 1
+    choice = int(rng.integers(0, nparams))
+    if choice < prop.nleg:
+        j = choice
+        center = prop.f_center if j == 0 else 0.0
+        width = prop.f_width
+        prop.fcoef[j] += rng.normal(0.0, 0.2 * width * snr_scale)
+        if prop.fcoef[j] < center - width or prop.fcoef[j] > center + width:
+            prop.bins = np.empty(0, dtype=np.int64)
+            prop.model = np.empty(0, dtype=np.complex128)
+    elif choice < 2 * prop.nleg:
+        j = choice - prop.nleg
+        center = prop.a_center if j == 0 else 0.0
+        width = prop.a_width
+        prop.acoef[j] += rng.normal(0.0, 0.2 * width * snr_scale)
+        if prop.acoef[j] < center - width or prop.acoef[j] > center + width:
+            prop.bins = np.empty(0, dtype=np.int64)
+            prop.model = np.empty(0, dtype=np.complex128)
+    else:
+        prop.phase = (prop.phase + rng.normal(0.0, 0.25 * snr_scale)) % TPI
+    return prop, log_qratio
 
 
 def fit_tukeyed_sinusoid_to_band(data_band: np.ndarray, weight: np.ndarray,
@@ -2549,13 +3243,2095 @@ def fit_tukeyed_sinusoid_to_band(data_band: np.ndarray, weight: np.ndarray,
     return ccoef, scoef, model, snr2
 
 
+def fit_tukeyed_oscillator_to_band(data_band: np.ndarray, weight: np.ndarray,
+                                   drive_frequency: float,
+                                   resonance_frequency: float,
+                                   width_hz: float,
+                                   bins: np.ndarray,
+                                   n: int,
+                                   t_obs: float,
+                                   alpha: float) -> Tuple[float, np.ndarray, float]:
+    """Fit the driving amplitude G0 for a Tukey-windowed oscillator response."""
+
+    template = tukeyed_driven_oscillator_scaled_template(
+        drive_frequency, resonance_frequency, width_hz, bins, n, t_obs, alpha
+    )
+    tt = float(np.real(np.sum(weight * np.conj(template) * template)))
+    if tt <= np.finfo(float).tiny:
+        empty = np.zeros_like(data_band)
+        return 0.0, empty, 0.0
+
+    rt = float(np.real(np.sum(weight * np.conj(template) * data_band)))
+    g0 = rt / tt
+    model = g0 * template
+    snr2 = max(float(np.real(np.sum(weight * np.conj(model) * model))), 0.0)
+    return g0, model, snr2
+
+
+def wandering_state_in_prior(state: WanderingLineState) -> bool:
+    """Check uniform coefficient priors for one wandering-line state."""
+
+    if state.nleg < 1 or state.nleg > state.fcoef.size:
+        return False
+    if not (math.isfinite(state.phase) and math.isfinite(state.f_center) and math.isfinite(state.a_center)):
+        return False
+    for j in range(state.nleg):
+        f_center = state.f_center if j == 0 else 0.0
+        a_center = state.a_center if j == 0 else 0.0
+        if not (f_center - state.f_width <= state.fcoef[j] <= f_center + state.f_width):
+            return False
+        if not (a_center - state.a_width <= state.acoef[j] <= a_center + state.a_width):
+            return False
+    return True
+
+
+def initialize_wandering_line_states(bayesline: BayesLineParams,
+                                     residual: np.ndarray,
+                                     n: int,
+                                     alpha: float,
+                                     scan_points: int,
+                                     initial_legendre: int,
+                                     max_legendre: int,
+                                     local_fft_size: int
+                                     ) -> Tuple[list[WanderingLineState], np.ndarray]:
+    """Initialize wandering-line states from sequential pure-sinusoid ML fits."""
+
+    if bayesline.data is None or bayesline.lines_x is None:
+        raise RuntimeError("BayesLine state is not initialized")
+    if bayesline.Sbase is None:
+        raise RuntimeError("Smooth PSD is not available for wandering-line subtraction")
+    lines = bayesline.lines_x
+    data = bayesline.data
+    smooth_full = np.ones(residual.size, dtype=np.float64)
+    smooth_full[data.imin:data.imax] = np.maximum(
+        bayesline_background_psd(bayesline), np.finfo(float).tiny
+    )
+
+    scan_axis = np.array([0.0], dtype=np.float64)
+    if scan_points > 1:
+        scan_axis = np.linspace(-1.0, 1.0, scan_points, dtype=np.float64)
+    states: list[WanderingLineState] = []
+    n_half = n // 2
+    t_obs = data.t_obs
+    order = np.argsort(lines.f[:lines.n])
+    min_leg = max(1, min(initial_legendre, max_legendre))
+
+    for idx in order:
+        f_line = float(lines.f[idx])
+        nu = float(lines.nu[idx])
+        if not (math.isfinite(f_line) and math.isfinite(nu)) or f_line <= 0.0 or nu <= 0.0:
+            continue
+        k_center, _shape = local_lorentzian_template(
+            t_obs, lines.nf, lines.nnu, lines.wdth, lines.lnumin, lines.lnumax,
+            lines.ltemplate, f_line, 1.0, nu
+        )
+        band_half_bins = max(2, lines.wdth // 2)
+        start = k_center - band_half_bins
+        bins_all = start + np.arange(2 * band_half_bins + 1, dtype=np.int64)
+        valid = (
+            (bins_all > 0) & (bins_all < n_half)
+            & (bins_all >= data.imin) & (bins_all < data.imax)
+        )
+        if not np.any(valid):
+            continue
+        bins_int = bins_all[valid]
+        bins = bins_int.astype(np.float64)
+        weight = 1.0 / smooth_full[bins_int]
+        data_band = residual[bins_int]
+        best_freq = f_line
+        best_coeffs = (0.0, 0.0)
+        best_snr2 = -1.0
+        half_scan = 0.5 * nu
+        for fs in f_line + half_scan * scan_axis:
+            if fs <= 0.0 or fs >= n_half / t_obs:
+                continue
+            ccoef, scoef, _model, snr2 = fit_tukeyed_sinusoid_to_band(
+                data_band, weight, float(fs), bins, n, t_obs, alpha
+            )
+            if snr2 > best_snr2:
+                best_snr2 = snr2
+                best_freq = float(fs)
+                best_coeffs = (ccoef, scoef)
+        if best_snr2 <= 0.0:
+            continue
+
+        ccoef, scoef = best_coeffs
+        amplitude = math.hypot(ccoef, scoef)
+        if amplitude <= np.finfo(float).tiny:
+            continue
+        phase = math.atan2(-scoef, ccoef) % TPI
+        fcoef = np.zeros(max_legendre, dtype=np.float64)
+        acoef = np.zeros(max_legendre, dtype=np.float64)
+        fcoef[0] = best_freq
+        acoef[0] = amplitude
+        f_width = 0.5 / t_obs
+        a_width = max(0.1 * abs(amplitude), np.finfo(float).tiny)
+        state = WanderingLineState(
+            line_frequency=f_line,
+            line_width=nu,
+            start_frequency=best_freq,
+            start_amplitude=amplitude,
+            start_phase=phase,
+            start_snr=math.sqrt(max(best_snr2, 0.0)),
+            nleg=min_leg,
+            fcoef=fcoef,
+            acoef=acoef,
+            phase=phase,
+            f_center=best_freq,
+            a_center=amplitude,
+            f_width=f_width,
+            a_width=a_width,
+            band_half_bins=band_half_bins,
+            bins=np.empty(0, dtype=np.int64),
+            model=np.empty(0, dtype=np.complex128),
+        )
+        state.bins, state.model = wandering_model_for_state(state, n, t_obs, alpha, data, local_fft_size)
+        if state.bins.size == 0:
+            continue
+        residual[state.bins] -= state.model
+        states.append(state)
+
+    return states, smooth_full
+
+
+def run_wandering_line_mcmc(states: list[WanderingLineState],
+                            residual: np.ndarray,
+                            smooth_full: np.ndarray,
+                            n: int,
+                            t_obs: float,
+                            alpha: float,
+                            data: DataParams,
+                            rng: np.random.Generator,
+                            steps: int,
+                            initial_legendre: int,
+                            max_legendre: int,
+                            local_fft_size: int) -> None:
+    """Run a lightweight line-only RJMCMC over wandering-sinusoid subtractions."""
+
+    if not states or steps <= 0:
+        return
+    min_legendre = max(1, min(initial_legendre, max_legendre))
+    for _mc in range(int(steps)):
+        idx = int(rng.integers(0, len(states)))
+        state = states[idx]
+        state.proposed += 1
+        prop, log_qratio = propose_wandering_state(state, rng, min_legendre, max_legendre)
+        if not wandering_state_in_prior(prop):
+            continue
+        try:
+            prop.bins, prop.model = wandering_model_for_state(prop, n, t_obs, alpha, data, local_fft_size)
+        except ValueError:
+            continue
+        if prop.bins.size == 0:
+            continue
+
+        union, current_resid, _base_resid, proposed_resid = merge_line_bins(
+            state.bins, state.model, prop.bins, prop.model, residual
+        )
+        logLx = line_loglike_from_residual(current_resid, union, smooth_full)
+        logLy = line_loglike_from_residual(proposed_resid, union, smooth_full)
+        if math.log(max(rng.random(), np.finfo(float).tiny)) < (logLy - logLx + log_qratio):
+            residual[union] = proposed_resid
+            prop.accepted = state.accepted + 1
+            prop.proposed = state.proposed
+            states[idx] = prop
+
+
+def write_wandering_subtracted_frequency_file(bayesline: BayesLineParams,
+                                              original_fft: np.ndarray,
+                                              dt: float,
+                                              n: int,
+                                              alpha: float,
+                                              rng: np.random.Generator,
+                                              output_file: str = "freq_nowander.dat",
+                                              summary_file: str = "wanderfit.dat",
+                                              steps: int = WANDERING_MCMC_STEPS,
+                                              initial_legendre: int = WANDERING_INITIAL_LEGENDRE,
+                                              max_legendre: int = WANDERING_MAX_LEGENDRE,
+                                              local_fft_size: int = WANDERING_SINE_FFT_SIZE,
+                                              scan_points: int = SINEFIT_SCAN_POINTS) -> None:
+    """Subtract end-stage wandering-sinusoid line models from the original FFT."""
+
+    if bayesline.data is None:
+        raise RuntimeError("BayesLine state is not initialized")
+    if max_legendre < 1:
+        raise ValueError("max_legendre must be positive")
+    initial_legendre = max(1, min(int(initial_legendre), int(max_legendre)))
+    max_legendre = int(max_legendre)
+    local_fft_size = int(local_fft_size)
+    n_half = n // 2
+    t_obs = bayesline.data.t_obs
+    original_scaled = original_fft * (dt / math.sqrt(2.0))
+    residual = np.zeros(n_half + 1, dtype=np.complex128)
+    residual[1:n_half] = original_scaled[1:n_half]
+
+    states, smooth_full = initialize_wandering_line_states(
+        bayesline, residual, n, alpha, scan_points, initial_legendre,
+        max_legendre, local_fft_size
+    )
+    run_wandering_line_mcmc(
+        states, residual, smooth_full, n, t_obs, alpha, bayesline.data, rng,
+        steps, initial_legendre, max_legendre, local_fft_size
+    )
+
+    freq_scale = frequency_data_output_scale_from_alpha(n, t_obs, alpha)
+    write_scaled_complex_frequency_domain_output(output_file, t_obs, freq_scale, residual)
+
+    rows = np.zeros((len(states), 13), dtype=np.float64)
+    for i, state in enumerate(states):
+        final_snr2 = 0.0
+        if state.bins.size > 0:
+            weight = 1.0 / smooth_full[state.bins]
+            final_snr2 = float(np.sum(weight * (state.model.real * state.model.real + state.model.imag * state.model.imag)))
+        rows[i] = (
+            state.line_frequency,
+            state.line_width,
+            state.start_frequency,
+            state.start_amplitude,
+            state.start_phase,
+            state.start_snr,
+            float(state.nleg),
+            state.fcoef[0],
+            state.acoef[0],
+            state.phase,
+            math.sqrt(max(final_snr2, 0.0)),
+            float(state.accepted),
+            float(state.proposed),
+        )
+    np.savetxt(
+        summary_file,
+        rows,
+        header=(
+            "line_frequency line_width start_frequency start_amplitude start_phase "
+            "start_snr final_nleg final_frequency final_amplitude final_phase "
+            "final_snr accepted_updates proposed_updates"
+        ),
+    )
+    print(
+        f"Wrote {output_file} and {summary_file} after wandering-sinusoid "
+        f"subtraction for {len(states):d} lines"
+    )
+
+
+def nearest_power_of_two_spacing(value: float) -> float:
+    """Map a positive spacing to the nearest power of two in seconds."""
+
+    if not math.isfinite(value) or value <= 0.0:
+        raise ValueError("spline control-point spacing must be positive")
+    exponent = int(math.floor(math.log2(float(value)) + 0.5))
+    return math.ldexp(1.0, exponent)
+
+
+def canonical_spline_knot_spacing(t_obs: float, knot_spacing: float) -> float:
+    """Return the power-of-two Tspace used for spline-wander/powerfit knots."""
+
+    if not math.isfinite(t_obs) or t_obs <= 0.0:
+        raise ValueError("Tobs must be positive")
+    if not math.isfinite(knot_spacing) or knot_spacing <= 0.0:
+        raise ValueError("spline control-point spacing must be positive")
+
+    spacing = nearest_power_of_two_spacing(float(knot_spacing))
+    # Akima interpolation needs at least three knots.  If the requested spacing
+    # would leave fewer than two intervals, use the largest power-of-two spacing
+    # that gives at least three control points across the segment.
+    max_spacing = 0.5 * float(t_obs)
+    if spacing > max_spacing:
+        spacing = math.ldexp(1.0, int(math.floor(math.log2(max_spacing))))
+    return max(spacing, np.finfo(float).tiny)
+
+
+def announce_canonical_spline_knot_spacing(label: str, t_obs: float,
+                                           knot_spacing: float) -> float:
+    """Print the effective power-of-two Tspace if it differs from the request."""
+
+    spacing = canonical_spline_knot_spacing(t_obs, knot_spacing)
+    if not math.isclose(spacing, float(knot_spacing), rel_tol=1.0e-12, abs_tol=1.0e-12):
+        print(f"{label}: requested Tspace {float(knot_spacing):g} s mapped to {spacing:g} s")
+    return spacing
+
+
+def spline_wandering_knot_count(t_obs: float, knot_spacing: float) -> int:
+    """Fixed spline dimension from the power-of-two control-point spacing."""
+
+    spacing = canonical_spline_knot_spacing(t_obs, knot_spacing)
+    intervals = max(2, int(math.floor(float(t_obs) / spacing + 0.5)))
+    return intervals + 1
+
+
+def spline_wandering_knot_times(t_obs: float, knot_spacing: float) -> np.ndarray:
+    """Return endpoint-inclusive control times for a canonical Tspace."""
+
+    count = spline_wandering_knot_count(t_obs, knot_spacing)
+    return np.linspace(0.0, float(t_obs), count, dtype=np.float64)
+
+
+def smooth_wandering_edges(values: np.ndarray) -> None:
+    """Tie endpoint knots to their nearest interior neighbors when possible."""
+
+    if values.size >= 5:
+        values[0] = values[1]
+        values[-1] = values[-2]
+
+
+def spline_wandering_local_phase_amplitude(freq_knots: np.ndarray,
+                                           amp_knots: np.ndarray,
+                                           phase: float,
+                                           knot_times: np.ndarray,
+                                           t_obs: float,
+                                           local_fft_size: int
+                                           ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Evaluate Akima frequency/amplitude splines and integrate frequency."""
+
+    m = int(local_fft_size)
+    if m < 8:
+        raise ValueError("local_fft_size must be at least 8")
+    freq_knots = np.asarray(freq_knots, dtype=np.float64)
+    amp_knots = np.asarray(amp_knots, dtype=np.float64)
+    knot_times = np.asarray(knot_times, dtype=np.float64)
+    if freq_knots.size != amp_knots.size or freq_knots.size != knot_times.size:
+        raise ValueError("spline wandering knot arrays must have matching sizes")
+    if freq_knots.size < 3:
+        raise ValueError("spline wandering model needs at least three knots")
+
+    times = np.arange(m, dtype=np.float64) * (float(t_obs) / float(m))
+    inst_freq = akima_eval_array(knot_times, freq_knots, freq_knots.size, times)
+    amp = akima_eval_array(knot_times, amp_knots, amp_knots.size, times)
+    phase_integral = np.zeros_like(times)
+    if times.size > 1:
+        dt_local = float(t_obs) / float(m)
+        phase_integral[1:] = np.cumsum(0.5 * (inst_freq[:-1] + inst_freq[1:]) * dt_local)
+    phase_series = float(phase) + TPI * phase_integral
+    return times, inst_freq, amp, phase_series
+
+
+def spline_wandering_frequency_model(freq_knots: np.ndarray,
+                                     amp_knots: np.ndarray,
+                                     phase: float,
+                                     knot_times: np.ndarray,
+                                     n: int,
+                                     t_obs: float,
+                                     alpha: float,
+                                     local_fft_size: int = WANDERING_SINE_FFT_SIZE,
+                                     anchor_fraction: float = 0.25
+                                     ) -> Tuple[np.ndarray, np.ndarray]:
+    """Fourier-domain model for a sinusoid with Akima-splined wander.
+
+    This is the per-line version of the FastSpec power-line idea: the
+    instantaneous frequency is splined, integrated into phase, multiplied by a
+    splined amplitude, Tukey-windowed, FFTed locally, and shifted back to the
+    full frequency grid.
+    """
+
+    if n <= 0 or n % 2 != 0:
+        raise ValueError("n must be a positive even FFT length")
+    m = int(min(local_fft_size, n))
+    times, inst_freq, amp, phase_series = spline_wandering_local_phase_amplitude(
+        freq_knots, amp_knots, phase, knot_times, t_obs, m
+    )
+    center_frequency = float(np.mean(inst_freq))
+    anchor_bin = int(round(anchor_fraction * float(m)))
+    anchor_bin = min(max(anchor_bin, 1), m // 2 - 1)
+    center_bin = int(round(center_frequency * float(t_obs)))
+    heterodyne_bin = center_bin - anchor_bin
+    heterodyne_frequency = float(heterodyne_bin) / float(t_obs)
+
+    local_signal = amp * np.cos(phase_series - TPI * heterodyne_frequency * times)
+    local_signal = local_signal.copy()
+    tukey_inplace(local_signal, alpha)
+    local_fft = np.fft.rfft(local_signal)
+
+    local_bins = np.arange(local_fft.size, dtype=np.int64)
+    full_bins = local_bins + heterodyne_bin
+    valid = (local_bins > 0) & (local_bins < local_fft.size - 1)
+    valid &= (full_bins > 0) & (full_bins < n // 2)
+    scale = (float(t_obs) / float(m)) / math.sqrt(2.0)
+    return full_bins[valid].astype(np.int64), local_fft[valid] * scale
+
+
+@dataclass
+class SplineWanderingLineState:
+    """Current state for one fixed-knot spline wandering-sinusoid line."""
+
+    line_frequency: float
+    line_width: float
+    start_frequency: float
+    start_amplitude: float
+    start_phase: float
+    start_snr: float
+    knot_times: np.ndarray
+    freq_knots: np.ndarray
+    amp_knots: np.ndarray
+    amplitude_scale: float
+    phase: float
+    f_center: float
+    a_center: float
+    scale_center: float
+    f_width: float
+    a_width: float
+    scale_width: float
+    freq_jump: float
+    amp_jump: float
+    scale_jump: float
+    band_half_bins: int
+    bins: np.ndarray
+    model: np.ndarray
+    accepted: int = 0
+    proposed: int = 0
+    move_proposed: np.ndarray = field(
+        default_factory=lambda: np.zeros(len(SPLINE_WANDERING_MOVE_LABELS), dtype=np.int64)
+    )
+    move_accepted: np.ndarray = field(
+        default_factory=lambda: np.zeros(len(SPLINE_WANDERING_MOVE_LABELS), dtype=np.int64)
+    )
+    best_loglike: float = -math.inf
+    best_freq_knots: Optional[np.ndarray] = None
+    best_amp_knots: Optional[np.ndarray] = None
+    best_amplitude_scale: float = 0.0
+    best_phase: float = 0.0
+    best_bins: Optional[np.ndarray] = None
+    best_model: Optional[np.ndarray] = None
+
+
+def copy_spline_wandering_state(state: SplineWanderingLineState) -> SplineWanderingLineState:
+    """Copy a spline wandering state while sharing immutable knot times."""
+
+    copied = SplineWanderingLineState(
+        state.line_frequency, state.line_width, state.start_frequency,
+        state.start_amplitude, state.start_phase, state.start_snr,
+        state.knot_times, state.freq_knots.copy(), state.amp_knots.copy(),
+        state.amplitude_scale, state.phase, state.f_center, state.a_center,
+        state.scale_center, state.f_width, state.a_width, state.scale_width,
+        state.freq_jump, state.amp_jump, state.scale_jump,
+        state.band_half_bins, state.bins, state.model, state.accepted,
+        state.proposed,
+    )
+    copied.move_proposed = state.move_proposed.copy()
+    copied.move_accepted = state.move_accepted.copy()
+    copied.best_loglike = state.best_loglike
+    copied.best_freq_knots = None if state.best_freq_knots is None else state.best_freq_knots.copy()
+    copied.best_amp_knots = None if state.best_amp_knots is None else state.best_amp_knots.copy()
+    copied.best_amplitude_scale = state.best_amplitude_scale
+    copied.best_phase = state.best_phase
+    copied.best_bins = None if state.best_bins is None else state.best_bins.copy()
+    copied.best_model = None if state.best_model is None else state.best_model.copy()
+    return copied
+
+
+def spline_wandering_snr_scale(state: SplineWanderingLineState) -> float:
+    """High-SNR proposal shrink factor shared with the Legendre wander model."""
+
+    return wandering_jump_snr_scale(state.start_snr)
+
+
+def spline_wandering_knot_jump_scale(state: SplineWanderingLineState) -> float:
+    """Shrink spline-knot proposal widths for very loud lines."""
+
+    reference = SPLINE_WANDERING_KNOT_REFERENCE_SNR
+    snr = float(state.start_snr)
+    if not math.isfinite(snr) or snr <= reference:
+        return 1.0
+    return reference / snr
+
+
+def spline_wandering_frequency_jump_sigma(state: SplineWanderingLineState,
+                                          rng: np.random.Generator) -> float:
+    """Draw an absolute-Hz frequency-knot proposal width."""
+
+    rung = SPLINE_WANDERING_FREQ_JUMP_LADDER[
+        int(rng.integers(0, len(SPLINE_WANDERING_FREQ_JUMP_LADDER)))
+    ]
+    sigma = state.freq_jump * float(rung) * spline_wandering_knot_jump_scale(state)
+    return max(sigma, np.finfo(float).tiny)
+
+
+def spline_wandering_phase_jump_sigma(state: SplineWanderingLineState,
+                                      rng: np.random.Generator) -> float:
+    """Draw a mixed absolute/SNR-scaled phase proposal width."""
+
+    sigma = SPLINE_WANDERING_PHASE_JUMP
+    if rng.random() < SPLINE_WANDERING_PHASE_SNR_SCALE_PROB:
+        sigma *= spline_wandering_snr_scale(state)
+    return max(sigma, np.finfo(float).tiny)
+
+
+def spline_wandering_model_for_state(state: SplineWanderingLineState,
+                                     n: int, t_obs: float, alpha: float,
+                                     data: DataParams,
+                                     local_fft_size: int) -> Tuple[np.ndarray, np.ndarray]:
+    """Build and analysis-band filter the Fourier model for one spline line."""
+
+    bins, values = spline_wandering_frequency_model(
+        state.freq_knots, state.amplitude_scale * state.amp_knots,
+        state.phase, state.knot_times,
+        n, t_obs, alpha, local_fft_size=local_fft_size
+    )
+    valid = (bins >= data.imin) & (bins < data.imax)
+    center_bin = int(round(state.line_frequency * t_obs))
+    valid &= np.abs(bins - center_bin) <= state.band_half_bins
+    return bins[valid], values[valid]
+
+
+def snapshot_spline_wandering_best_state(state: SplineWanderingLineState,
+                                         loglike: float) -> None:
+    """Store the current spline-wandering state as this line's best state."""
+
+    state.best_loglike = float(loglike)
+    state.best_freq_knots = state.freq_knots.copy()
+    state.best_amp_knots = state.amp_knots.copy()
+    state.best_amplitude_scale = float(state.amplitude_scale)
+    state.best_phase = float(state.phase)
+    state.best_bins = state.bins.copy()
+    state.best_model = state.model.copy()
+
+
+def spline_wandering_state_view(state: SplineWanderingLineState,
+                                use_best: bool = False
+                                ) -> Tuple[np.ndarray, np.ndarray, float, float,
+                                           np.ndarray, np.ndarray, float]:
+    """Return arrays/parameters for either the final draw or stored ML state."""
+
+    if use_best and state.best_freq_knots is not None and state.best_amp_knots is not None:
+        bins = state.best_bins if state.best_bins is not None else state.bins
+        model = state.best_model if state.best_model is not None else state.model
+        return (
+            state.best_freq_knots,
+            state.best_amp_knots,
+            state.best_amplitude_scale,
+            state.best_phase,
+            bins,
+            model,
+            state.best_loglike,
+        )
+    return (
+        state.freq_knots,
+        state.amp_knots,
+        state.amplitude_scale,
+        state.phase,
+        state.bins,
+        state.model,
+        math.nan,
+    )
+
+
+def spline_wandering_state_in_prior(state: SplineWanderingLineState,
+                                    n_half: int, t_obs: float) -> bool:
+    """Check simple uniform bounds for one spline wandering line."""
+
+    if not math.isfinite(state.phase):
+        return False
+    fmin = state.f_center - state.f_width
+    fmax = state.f_center + state.f_width
+    amin = max(np.finfo(float).tiny, state.a_center - state.a_width)
+    amax = state.a_center + state.a_width
+    smin = max(np.finfo(float).tiny, state.scale_center - state.scale_width)
+    smax = state.scale_center + state.scale_width
+    nyquist = float(n_half) / float(t_obs)
+    if amax <= amin or smax <= smin:
+        return False
+    if (not math.isfinite(state.amplitude_scale)
+            or state.amplitude_scale < smin
+            or state.amplitude_scale > smax):
+        return False
+    for value in state.freq_knots:
+        if not math.isfinite(float(value)) or value <= 0.0 or value >= nyquist:
+            return False
+        if value < fmin or value > fmax:
+            return False
+    for value in state.amp_knots:
+        if not math.isfinite(float(value)) or value < amin or value > amax:
+            return False
+    return True
+
+
+def propose_spline_wandering_state(state: SplineWanderingLineState,
+                                   rng: np.random.Generator,
+                                   flat_amplitude: bool = False
+                                   ) -> Tuple[SplineWanderingLineState, int]:
+    """Propose a local knot or phase update for one fixed-dimension spline line."""
+
+    prop = copy_spline_wandering_state(state)
+    nk = prop.freq_knots.size
+    alpha_move = rng.random()
+    if flat_amplitude:
+        # Remove normalized-amplitude-knot moves while preserving the relative
+        # weights of the remaining original move probabilities: 0.45:0.10:0.10.
+        if alpha_move < (0.45 / 0.65):
+            move_index = 0
+        elif alpha_move < (0.55 / 0.65):
+            move_index = 2
+        else:
+            move_index = 3
+    elif alpha_move < 0.45:
+        move_index = 0
+    elif alpha_move < 0.8:
+        move_index = 1
+    elif alpha_move < 0.9:
+        move_index = 2
+    else:
+        move_index = 3
+
+    if move_index == 0:
+        if nk >= 5:
+            j = int(rng.integers(1, nk - 1))
+        else:
+            j = int(rng.integers(0, nk))
+        prop.freq_knots[j] += rng.normal(0.0, spline_wandering_frequency_jump_sigma(prop, rng))
+        smooth_wandering_edges(prop.freq_knots)
+    elif move_index == 1:
+        if nk >= 5:
+            j = int(rng.integers(1, nk - 1))
+        else:
+            j = int(rng.integers(0, nk))
+        sigma = prop.amp_jump * spline_wandering_knot_jump_scale(prop)
+        prop.amp_knots[j] += rng.normal(0.0, max(sigma, np.finfo(float).tiny))
+        smooth_wandering_edges(prop.amp_knots)
+    elif move_index == 2:
+        sigma = prop.scale_jump * wandering_jump_reference_snr_scale(prop.start_snr)
+        prop.amplitude_scale += rng.normal(0.0, max(sigma, np.finfo(float).tiny))
+    else:
+        prop.phase = (prop.phase + rng.normal(0.0, spline_wandering_phase_jump_sigma(prop, rng))) % TPI
+    return prop, move_index
+
+
+def frequency_in_ranges(frequency: float, ranges: Optional[np.ndarray]) -> bool:
+    """Return True when a frequency lies inside one of the supplied intervals."""
+
+    if ranges is None or ranges.size == 0:
+        return False
+    f = float(frequency)
+    return bool(np.any((f >= ranges[:, 0]) & (f <= ranges[:, 1])))
+
+
+def initialize_spline_wandering_line_states(bayesline: BayesLineParams,
+                                            residual: np.ndarray,
+                                            n: int,
+                                            alpha: float,
+                                            scan_points: int,
+                                            knot_spacing: float,
+                                            freq_width_hz: float,
+                                            freq_jump_hz: float,
+                                            amp_width_fraction: float,
+                                            amp_jump_fraction: float,
+                                            local_fft_size: int,
+                                            skip_frequency_ranges: Optional[np.ndarray] = None,
+                                            ) -> Tuple[list[SplineWanderingLineState], np.ndarray, int]:
+    """Initialize fixed-knot spline line states from pure-sinusoid ML fits."""
+
+    if bayesline.data is None or bayesline.lines_x is None:
+        raise RuntimeError("BayesLine state is not initialized")
+    if bayesline.Sbase is None:
+        raise RuntimeError("Smooth PSD is not available for spline wandering subtraction")
+    lines = bayesline.lines_x
+    data = bayesline.data
+    smooth_full = np.ones(residual.size, dtype=np.float64)
+    smooth_full[data.imin:data.imax] = np.maximum(
+        bayesline_background_psd(bayesline), np.finfo(float).tiny
+    )
+
+    scan_axis = np.array([0.0], dtype=np.float64)
+    if scan_points > 1:
+        scan_axis = np.linspace(-1.0, 1.0, scan_points, dtype=np.float64)
+    states: list[SplineWanderingLineState] = []
+    n_half = n // 2
+    t_obs = data.t_obs
+    knot_times = spline_wandering_knot_times(t_obs, knot_spacing)
+    knot_count = knot_times.size
+    order = np.argsort(lines.f[:lines.n])
+    skipped = 0
+
+    for idx in order:
+        f_line = float(lines.f[idx])
+        nu = float(lines.nu[idx])
+        if not (math.isfinite(f_line) and math.isfinite(nu)) or f_line <= 0.0 or nu <= 0.0:
+            continue
+        if frequency_in_ranges(f_line, skip_frequency_ranges):
+            skipped += 1
+            continue
+        k_center, _shape = local_lorentzian_template(
+            t_obs, lines.nf, lines.nnu, lines.wdth, lines.lnumin, lines.lnumax,
+            lines.ltemplate, f_line, 1.0, nu
+        )
+        band_half_bins = max(2, lines.wdth // 2)
+        start = k_center - band_half_bins
+        bins_all = start + np.arange(2 * band_half_bins + 1, dtype=np.int64)
+        valid = (
+            (bins_all > 0) & (bins_all < n_half)
+            & (bins_all >= data.imin) & (bins_all < data.imax)
+        )
+        if not np.any(valid):
+            continue
+        bins_int = bins_all[valid]
+        bins = bins_int.astype(np.float64)
+        weight = 1.0 / smooth_full[bins_int]
+        data_band = residual[bins_int]
+        best_freq = f_line
+        best_coeffs = (0.0, 0.0)
+        best_snr2 = -1.0
+        half_scan = 0.5 * nu
+        for fs in f_line + half_scan * scan_axis:
+            if fs <= 0.0 or fs >= n_half / t_obs:
+                continue
+            ccoef, scoef, _model, snr2 = fit_tukeyed_sinusoid_to_band(
+                data_band, weight, float(fs), bins, n, t_obs, alpha
+            )
+            if snr2 > best_snr2:
+                best_snr2 = snr2
+                best_freq = float(fs)
+                best_coeffs = (ccoef, scoef)
+        if best_snr2 <= 0.0:
+            continue
+
+        ccoef, scoef = best_coeffs
+        amplitude = math.hypot(ccoef, scoef)
+        if amplitude <= np.finfo(float).tiny:
+            continue
+        phase = math.atan2(-scoef, ccoef) % TPI
+        freq_knots = np.full(knot_count, best_freq, dtype=np.float64)
+        amp_knots = np.ones(knot_count, dtype=np.float64)
+        f_width = max(float(freq_width_hz), np.finfo(float).tiny)
+        a_width = max(float(amp_width_fraction), np.finfo(float).tiny)
+        scale_width = max(float(amp_width_fraction) * abs(amplitude), np.finfo(float).tiny)
+        state = SplineWanderingLineState(
+            line_frequency=f_line,
+            line_width=nu,
+            start_frequency=best_freq,
+            start_amplitude=amplitude,
+            start_phase=phase,
+            start_snr=math.sqrt(max(best_snr2, 0.0)),
+            knot_times=knot_times,
+            freq_knots=freq_knots,
+            amp_knots=amp_knots,
+            amplitude_scale=amplitude,
+            phase=phase,
+            f_center=best_freq,
+            a_center=1.0,
+            scale_center=amplitude,
+            f_width=f_width,
+            a_width=a_width,
+            scale_width=scale_width,
+            freq_jump=max(float(freq_jump_hz), np.finfo(float).tiny),
+            amp_jump=max(float(amp_jump_fraction), np.finfo(float).tiny),
+            scale_jump=max(float(amp_jump_fraction) * abs(amplitude), np.finfo(float).tiny),
+            band_half_bins=band_half_bins,
+            bins=np.empty(0, dtype=np.int64),
+            model=np.empty(0, dtype=np.complex128),
+        )
+        state.bins, state.model = spline_wandering_model_for_state(
+            state, n, t_obs, alpha, data, local_fft_size
+        )
+        if state.bins.size == 0:
+            continue
+        residual[state.bins] -= state.model
+        start_loglike = line_loglike_from_residual(residual[state.bins], state.bins, smooth_full)
+        snapshot_spline_wandering_best_state(state, start_loglike)
+        states.append(state)
+
+    return states, smooth_full, skipped
+
+
+def spline_wandering_snr_selection_cdf(states: list[SplineWanderingLineState]) -> Optional[np.ndarray]:
+    """Cumulative startup-SNR weights used only to allocate line-update effort."""
+
+    if not states:
+        return None
+    weights = np.array(
+        [
+            float(state.start_snr)
+            if np.isfinite(state.start_snr) and state.start_snr > 0.0
+            else 0.0
+            for state in states
+        ],
+        dtype=np.float64,
+    )
+    total = float(np.sum(weights))
+    if total <= 0.0:
+        return None
+    cdf = np.cumsum(weights / total)
+    cdf[-1] = 1.0
+    return cdf
+
+
+def choose_spline_wandering_line_index(states: list[SplineWanderingLineState],
+                                       rng: np.random.Generator,
+                                       snr_cdf: Optional[np.ndarray],
+                                       uniform_line_prob: float) -> int:
+    """Choose a splinewander line using a uniform/SNR-weighted mixture."""
+
+    nstate = len(states)
+    if nstate <= 1:
+        return 0
+    uniform_prob = min(max(float(uniform_line_prob), 0.0), 1.0)
+    if snr_cdf is None or rng.random() < uniform_prob:
+        return int(rng.integers(0, nstate))
+    return int(np.searchsorted(snr_cdf, rng.random(), side="right"))
+
+
+def run_spline_wandering_line_mcmc(states: list[SplineWanderingLineState],
+                                   residual: np.ndarray,
+                                   smooth_full: np.ndarray,
+                                   n: int,
+                                   t_obs: float,
+                                   alpha: float,
+                                   data: DataParams,
+                                   rng: np.random.Generator,
+                                   steps: int,
+                                   local_fft_size: int,
+                                   uniform_line_prob: float,
+                                   flat_amplitude: bool = False) -> None:
+    """Run fixed-dimension MCMC updates over spline-wandering line models."""
+
+    if not states or steps <= 0:
+        return
+    n_half = n // 2
+    snr_cdf = spline_wandering_snr_selection_cdf(states)
+    for _mc in range(int(steps)):
+        idx = choose_spline_wandering_line_index(states, rng, snr_cdf, uniform_line_prob)
+        state = states[idx]
+        state.proposed += 1
+        prop, move_index = propose_spline_wandering_state(state, rng, flat_amplitude)
+        state.move_proposed[move_index] += 1
+        if not spline_wandering_state_in_prior(prop, n_half, t_obs):
+            continue
+        try:
+            prop.bins, prop.model = spline_wandering_model_for_state(
+                prop, n, t_obs, alpha, data, local_fft_size
+            )
+        except ValueError:
+            continue
+        if prop.bins.size == 0:
+            continue
+
+        union, current_resid, _base_resid, proposed_resid = merge_line_bins(
+            state.bins, state.model, prop.bins, prop.model, residual
+        )
+        logLx = line_loglike_from_residual(current_resid, union, smooth_full)
+        logLy = line_loglike_from_residual(proposed_resid, union, smooth_full)
+        if math.log(max(rng.random(), np.finfo(float).tiny)) < (logLy - logLx):
+            residual[union] = proposed_resid
+            prop.accepted = state.accepted + 1
+            prop.proposed = state.proposed
+            prop.move_proposed = state.move_proposed.copy()
+            prop.move_accepted = state.move_accepted.copy()
+            prop.move_accepted[move_index] += 1
+            accepted_loglike = line_loglike_from_residual(residual[prop.bins], prop.bins, smooth_full)
+            if accepted_loglike > prop.best_loglike:
+                snapshot_spline_wandering_best_state(prop, accepted_loglike)
+            states[idx] = prop
+
+
+def select_spline_wandering_state_near(
+    states: list[SplineWanderingLineState],
+    target_frequency: float,
+    tolerance: Optional[float] = None,
+) -> Optional[SplineWanderingLineState]:
+    """Return the spline-wandering line closest to target_frequency."""
+
+    if not states:
+        return None
+    distances = np.array(
+        [abs(float(state.line_frequency) - float(target_frequency)) for state in states],
+        dtype=np.float64,
+    )
+    idx = int(np.argmin(distances))
+    if tolerance is not None and distances[idx] > float(tolerance):
+        return None
+    return states[idx]
+
+
+def spline_wandering_checkline_tag(target_frequency: float) -> str:
+    """Return a filesystem-friendly tag for checkline diagnostic files."""
+
+    text = f"{float(target_frequency):.9g}"
+    text = text.replace("-", "m").replace("+", "").replace(".", "p")
+    return f"{text}Hz"
+
+
+def write_spline_wandering_controls(
+    states: list[SplineWanderingLineState],
+    output_file: str,
+    target_frequency: float,
+    tolerance: Optional[float] = None,
+    use_best: bool = False,
+) -> None:
+    """Write final frequency/amplitude spline knots near a target line."""
+
+    state = select_spline_wandering_state_near(states, target_frequency, tolerance)
+    if state is None:
+        print(
+            f"warning: no spline-wandering line found near {target_frequency:g} Hz; "
+            f"not writing {output_file}"
+        )
+        return
+
+    freq_knots, amp_knots, amplitude_scale, _phase, _bins, _model, loglike = spline_wandering_state_view(
+        state, use_best=use_best
+    )
+    raw_amplitude = amplitude_scale * amp_knots
+    extra = f", best_local_loglike={loglike:.12e}" if use_best and math.isfinite(loglike) else ""
+    delta = state.line_frequency - float(target_frequency)
+    np.savetxt(
+        output_file,
+        np.column_stack((state.knot_times, freq_knots, raw_amplitude, amp_knots)),
+        header=(
+            "time frequency raw_amplitude normalized_amplitude "
+            f"(requested_frequency={float(target_frequency):.12g} Hz, "
+            f"selected_line_frequency={state.line_frequency:.12g} Hz, "
+            f"selected_minus_requested={delta:.12e} Hz, "
+            f"amplitude_scale={amplitude_scale:.12e}{extra})"
+        ),
+    )
+    print(
+        f"Wrote {output_file} for spline-wandering line at "
+        f"{state.line_frequency:.9g} Hz nearest requested {float(target_frequency):.9g} Hz"
+    )
+
+
+def write_spline_wandering_move_diagnostics(
+    states: list[SplineWanderingLineState],
+    output_file: str,
+    target_frequency: float,
+    tolerance: Optional[float] = None,
+) -> None:
+    """Write per-move acceptance rates for the selected checkline."""
+
+    state = select_spline_wandering_state_near(states, target_frequency, tolerance)
+    with open(output_file, "w", encoding="utf-8") as handle:
+        handle.write(
+            "# requested_frequency selected_line_frequency selected_minus_requested "
+            "start_snr move proposed accepted acceptance_rate\n"
+        )
+        if state is None:
+            handle.write(f"# no spline-wandering line found near {float(target_frequency):.12g} Hz\n")
+            print(
+                f"warning: no spline-wandering line found near {float(target_frequency):g} Hz "
+                f"for {output_file}"
+            )
+            return
+        delta = state.line_frequency - float(target_frequency)
+        for i, label in enumerate(SPLINE_WANDERING_MOVE_LABELS):
+            proposed = int(state.move_proposed[i])
+            accepted = int(state.move_accepted[i])
+            rate = accepted / proposed if proposed > 0 else 0.0
+            handle.write(
+                f"{float(target_frequency):.9g} {state.line_frequency:.12e} "
+                f"{delta:.12e} {state.start_snr:.12e} "
+                f"{label} {proposed:d} {accepted:d} {rate:.12e}\n"
+            )
+        total_rate = state.accepted / state.proposed if state.proposed > 0 else 0.0
+        handle.write(
+            f"{float(target_frequency):.9g} {state.line_frequency:.12e} "
+            f"{delta:.12e} {state.start_snr:.12e} "
+            f"total {int(state.proposed):d} {int(state.accepted):d} {total_rate:.12e}\n"
+        )
+    print(
+        f"Wrote {output_file} for spline-wandering line at "
+        f"{state.line_frequency:.9g} Hz nearest requested {float(target_frequency):.9g} Hz"
+    )
+
+
+def spline_wandering_summary_rows(states: list[SplineWanderingLineState],
+                                  smooth_full: np.ndarray,
+                                  use_best: bool = False
+                                  ) -> np.ndarray:
+    """Build summary rows for final fair-draw or stored ML spline states."""
+
+    ncol = 22 if use_best else 21
+    rows = np.zeros((len(states), ncol), dtype=np.float64)
+    for i, state in enumerate(states):
+        freq_knots, amp_knots, amplitude_scale, phase, bins, model, best_loglike = (
+            spline_wandering_state_view(state, use_best=use_best)
+        )
+        final_snr2 = 0.0
+        if bins.size > 0:
+            weight = 1.0 / smooth_full[bins]
+            final_snr2 = float(np.sum(weight * (model.real * model.real + model.imag * model.imag)))
+        raw_amp = amplitude_scale * amp_knots
+        base_row = (
+            state.line_frequency,
+            state.line_width,
+            state.start_frequency,
+            state.start_amplitude,
+            state.start_phase,
+            state.start_snr,
+            float(freq_knots.size),
+            float(np.mean(freq_knots)),
+            float(np.min(freq_knots)),
+            float(np.max(freq_knots)),
+            amplitude_scale,
+            float(np.mean(amp_knots)),
+            float(np.min(amp_knots)),
+            float(np.max(amp_knots)),
+            float(np.mean(raw_amp)),
+            float(np.min(raw_amp)),
+            float(np.max(raw_amp)),
+            phase,
+            math.sqrt(max(final_snr2, 0.0)),
+            float(state.accepted),
+            float(state.proposed),
+        )
+        if use_best:
+            rows[i] = base_row + (best_loglike,)
+        else:
+            rows[i] = base_row
+    return rows
+
+
+def write_spline_wandering_summary(states: list[SplineWanderingLineState],
+                                   smooth_full: np.ndarray,
+                                   output_file: str,
+                                   use_best: bool = False) -> None:
+    """Write spline-wandering parameter summary for fair-draw or ML states."""
+
+    header = (
+        "line_frequency line_width start_frequency start_amplitude start_phase "
+        "start_snr knot_count final_frequency_mean final_frequency_min "
+        "final_frequency_max final_amplitude_scale "
+        "final_normalized_amplitude_mean final_normalized_amplitude_min "
+        "final_normalized_amplitude_max final_raw_amplitude_mean "
+        "final_raw_amplitude_min final_raw_amplitude_max final_phase "
+        "final_snr accepted_updates proposed_updates"
+    )
+    if use_best:
+        header += " best_local_loglike"
+    np.savetxt(output_file, spline_wandering_summary_rows(states, smooth_full, use_best), header=header)
+
+
+def write_spline_wandering_residual_from_states(original_scaled: np.ndarray,
+                                                states: list[SplineWanderingLineState],
+                                                t_obs: float,
+                                                output_file: str,
+                                                freq_scale: float,
+                                                use_best: bool = False,
+                                                prefit_powerfit_state: Optional[PowerFitState] = None) -> None:
+    """Write no-line frequency data reconstructed from selected spline states."""
+
+    n_half = original_scaled.size - 1
+    residual = np.zeros(n_half + 1, dtype=np.complex128)
+    residual[1:n_half] = original_scaled[1:n_half]
+    if prefit_powerfit_state is not None:
+        _fk, _ak, _scales, _phases, bins, model, _loglike = powerfit_state_view(
+            prefit_powerfit_state, use_best=use_best
+        )
+        if bins.size > 0:
+            residual[bins] -= model
+    for state in states:
+        _freq_knots, _amp_knots, _amplitude_scale, _phase, bins, model, _loglike = (
+            spline_wandering_state_view(state, use_best=use_best)
+        )
+        if bins.size > 0:
+            residual[bins] -= model
+    write_scaled_complex_frequency_domain_output(output_file, t_obs, freq_scale, residual)
+
+
+def write_spline_wandering_subtracted_frequency_file(
+    bayesline: BayesLineParams,
+    original_fft: np.ndarray,
+    dt: float,
+    n: int,
+    alpha: float,
+    rng: np.random.Generator,
+    output_file: str = "freq_nosplinewander.dat",
+    summary_file: str = "splinewanderfit.dat",
+    steps: int = SPLINE_WANDERING_MCMC_STEPS,
+    knot_spacing: float = SPLINE_WANDERING_KNOT_SPACING,
+    freq_width_hz: float = SPLINE_WANDERING_FREQ_WIDTH_HZ,
+    freq_jump_hz: float = SPLINE_WANDERING_FREQ_JUMP_HZ,
+    amp_width_fraction: float = SPLINE_WANDERING_AMP_WIDTH_FRACTION,
+    amp_jump_fraction: float = SPLINE_WANDERING_AMP_JUMP_FRACTION,
+    uniform_line_prob: float = SPLINE_WANDERING_UNIFORM_LINE_PROB,
+    flat_amplitude: bool = False,
+    local_fft_size: int = WANDERING_SINE_FFT_SIZE,
+    scan_points: int = SINEFIT_SCAN_POINTS,
+    checkline_frequency: Optional[float] = None,
+    prefit_residual: Optional[np.ndarray] = None,
+    prefit_powerfit_state: Optional[PowerFitState] = None,
+    skip_frequency_ranges: Optional[np.ndarray] = None,
+) -> None:
+    """Subtract fixed-knot spline-wandering sinusoid models from the FFT."""
+
+    if bayesline.data is None:
+        raise RuntimeError("BayesLine state is not initialized")
+    n_half = n // 2
+    t_obs = bayesline.data.t_obs
+    local_fft_size = int(local_fft_size)
+    knot_spacing = announce_canonical_spline_knot_spacing(
+        "--spline-wander-knot-spacing", t_obs, knot_spacing
+    )
+    original_scaled = original_fft * (dt / math.sqrt(2.0))
+    if prefit_residual is None:
+        residual = np.zeros(n_half + 1, dtype=np.complex128)
+        residual[1:n_half] = original_scaled[1:n_half]
+    else:
+        residual = np.asarray(prefit_residual, dtype=np.complex128).copy()
+        if residual.size != n_half + 1:
+            raise ValueError("prefit residual has the wrong FFT length for splinewander")
+
+    states, smooth_full, skipped_by_prefit = initialize_spline_wandering_line_states(
+        bayesline, residual, n, alpha, scan_points, knot_spacing,
+        freq_width_hz, freq_jump_hz, amp_width_fraction,
+        amp_jump_fraction, local_fft_size, skip_frequency_ranges
+    )
+    steps_per_line = max(0, int(steps))
+    total_steps = steps_per_line * len(states)
+    run_spline_wandering_line_mcmc(
+        states, residual, smooth_full, n, t_obs, alpha, bayesline.data,
+        rng, total_steps, local_fft_size, uniform_line_prob, flat_amplitude
+    )
+
+    freq_scale = frequency_data_output_scale_from_alpha(n, t_obs, alpha)
+    write_scaled_complex_frequency_domain_output(output_file, t_obs, freq_scale, residual)
+    write_spline_wandering_summary(states, smooth_full, summary_file, use_best=False)
+    write_spline_wandering_residual_from_states(
+        original_scaled, states, t_obs, "freq_nosplinewander_ml.dat", freq_scale, use_best=True,
+        prefit_powerfit_state=prefit_powerfit_state
+    )
+    write_spline_wandering_summary(states, smooth_full, "splinewanderfit_ml.dat", use_best=True)
+    checkline_msg = ""
+    flat_msg = " with flat normalized-amplitude knots" if flat_amplitude else ""
+    if checkline_frequency is not None:
+        tag = spline_wandering_checkline_tag(float(checkline_frequency))
+        write_spline_wandering_controls(
+            states, f"splinewander_{tag}_controls.dat",
+            target_frequency=float(checkline_frequency), use_best=False
+        )
+        write_spline_wandering_controls(
+            states, f"splinewander_{tag}_controls_ml.dat",
+            target_frequency=float(checkline_frequency), use_best=True
+        )
+        write_spline_wandering_move_diagnostics(
+            states, f"splinewander_{tag}_move_diagnostics.dat",
+            target_frequency=float(checkline_frequency)
+        )
+        checkline_msg = f" and checkline diagnostics near {float(checkline_frequency):g} Hz"
+    print(
+        f"Wrote {output_file}, freq_nosplinewander_ml.dat, {summary_file}, "
+        f"and splinewanderfit_ml.dat after spline-wandering "
+        f"subtraction for {len(states):d} lines with "
+        f"{spline_wandering_knot_count(t_obs, knot_spacing):d} knots per line "
+        f"and {steps_per_line:d} nominal MCMC steps per line "
+        f"({100.0 * float(uniform_line_prob):.1f}% uniform line selection)"
+        f"; skipped {skipped_by_prefit:d} powerfit-covered lines"
+        f"{flat_msg}"
+        f"{checkline_msg}"
+    )
+
+
+@dataclass
+class PowerFitState:
+    """Joint coherent model for mains-power harmonics."""
+
+    base_frequency_nominal: float
+    harmonics: np.ndarray
+    knot_times: np.ndarray
+    freq_knots: np.ndarray
+    amp_knots: np.ndarray
+    harmonic_scales: np.ndarray
+    harmonic_phases: np.ndarray
+    start_frequencies: np.ndarray
+    start_amplitudes: np.ndarray
+    start_phases: np.ndarray
+    start_snr: np.ndarray
+    f_center: float
+    f_width: float
+    a_center: float
+    a_width: float
+    scale_center: np.ndarray
+    scale_width: np.ndarray
+    freq_jump: float
+    amp_jump: float
+    scale_jump: np.ndarray
+    band_half_bins: int
+    bins: np.ndarray
+    model: np.ndarray
+    accepted: int = 0
+    proposed: int = 0
+    move_proposed: np.ndarray = field(
+        default_factory=lambda: np.zeros(len(POWERFIT_MOVE_LABELS), dtype=np.int64)
+    )
+    move_accepted: np.ndarray = field(
+        default_factory=lambda: np.zeros(len(POWERFIT_MOVE_LABELS), dtype=np.int64)
+    )
+    best_loglike: float = -math.inf
+    best_freq_knots: Optional[np.ndarray] = None
+    best_amp_knots: Optional[np.ndarray] = None
+    best_harmonic_scales: Optional[np.ndarray] = None
+    best_harmonic_phases: Optional[np.ndarray] = None
+    best_bins: Optional[np.ndarray] = None
+    best_model: Optional[np.ndarray] = None
+
+
+def copy_powerfit_state(state: PowerFitState) -> PowerFitState:
+    """Copy a powerfit state while preserving the current best-state snapshot."""
+
+    copied = PowerFitState(
+        base_frequency_nominal=state.base_frequency_nominal,
+        harmonics=state.harmonics.copy(),
+        knot_times=state.knot_times,
+        freq_knots=state.freq_knots.copy(),
+        amp_knots=state.amp_knots.copy(),
+        harmonic_scales=state.harmonic_scales.copy(),
+        harmonic_phases=state.harmonic_phases.copy(),
+        start_frequencies=state.start_frequencies.copy(),
+        start_amplitudes=state.start_amplitudes.copy(),
+        start_phases=state.start_phases.copy(),
+        start_snr=state.start_snr.copy(),
+        f_center=state.f_center,
+        f_width=state.f_width,
+        a_center=state.a_center,
+        a_width=state.a_width,
+        scale_center=state.scale_center.copy(),
+        scale_width=state.scale_width.copy(),
+        freq_jump=state.freq_jump,
+        amp_jump=state.amp_jump,
+        scale_jump=state.scale_jump.copy(),
+        band_half_bins=state.band_half_bins,
+        bins=state.bins,
+        model=state.model,
+        accepted=state.accepted,
+        proposed=state.proposed,
+    )
+    copied.move_proposed = state.move_proposed.copy()
+    copied.move_accepted = state.move_accepted.copy()
+    copied.best_loglike = state.best_loglike
+    copied.best_freq_knots = None if state.best_freq_knots is None else state.best_freq_knots.copy()
+    copied.best_amp_knots = None if state.best_amp_knots is None else state.best_amp_knots.copy()
+    copied.best_harmonic_scales = (
+        None if state.best_harmonic_scales is None else state.best_harmonic_scales.copy()
+    )
+    copied.best_harmonic_phases = (
+        None if state.best_harmonic_phases is None else state.best_harmonic_phases.copy()
+    )
+    copied.best_bins = None if state.best_bins is None else state.best_bins.copy()
+    copied.best_model = None if state.best_model is None else state.best_model.copy()
+    return copied
+
+
+def powerfit_state_view(state: PowerFitState,
+                        use_best: bool = False
+                        ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray,
+                                   np.ndarray, np.ndarray, float]:
+    """Return either the current fair draw or stored best local-likelihood state."""
+
+    if (use_best and state.best_freq_knots is not None and state.best_amp_knots is not None
+            and state.best_harmonic_scales is not None and state.best_harmonic_phases is not None):
+        bins = state.best_bins if state.best_bins is not None else state.bins
+        model = state.best_model if state.best_model is not None else state.model
+        return (
+            state.best_freq_knots,
+            state.best_amp_knots,
+            state.best_harmonic_scales,
+            state.best_harmonic_phases,
+            bins,
+            model,
+            state.best_loglike,
+        )
+    return (
+        state.freq_knots,
+        state.amp_knots,
+        state.harmonic_scales,
+        state.harmonic_phases,
+        state.bins,
+        state.model,
+        math.nan,
+    )
+
+
+def powerfit_splinewander_skip_ranges(state: Optional[PowerFitState],
+                                      t_obs: float,
+                                      use_best: bool = False) -> np.ndarray:
+    """Frequency ranges for Lorentzian lines already covered by powerfit.
+
+    The powerfit local FFT bands are intentionally broad.  For deciding which
+    Lorentzian startup lines splinewander should skip, use a narrower physical
+    harmonic interval based on the fitted base frequency and its prior range,
+    padded by a couple of target-segment frequency bins for short Tobs runs.
+    """
+
+    if state is None or state.harmonics.size == 0:
+        return np.zeros((0, 2), dtype=np.float64)
+    freq_knots, _amp_knots, _scales, _phases, _bins, _model, _loglike = (
+        powerfit_state_view(state, use_best=use_best)
+    )
+    if freq_knots.size == 0:
+        return np.zeros((0, 2), dtype=np.float64)
+    base_center = float(np.mean(freq_knots))
+    bin_pad = 2.0 / float(t_obs) if t_obs > 0.0 else 0.0
+    ranges = np.zeros((state.harmonics.size, 2), dtype=np.float64)
+    for i, harmonic in enumerate(state.harmonics):
+        h = float(harmonic)
+        center = h * base_center
+        half_width = max(h * float(state.f_width), bin_pad)
+        ranges[i, 0] = max(0.0, center - half_width)
+        ranges[i, 1] = center + half_width
+    return ranges
+
+
+def snapshot_powerfit_best_state(state: PowerFitState, loglike: float) -> None:
+    """Store the current joint harmonic state as the best local-likelihood state."""
+
+    state.best_loglike = float(loglike)
+    state.best_freq_knots = state.freq_knots.copy()
+    state.best_amp_knots = state.amp_knots.copy()
+    state.best_harmonic_scales = state.harmonic_scales.copy()
+    state.best_harmonic_phases = state.harmonic_phases.copy()
+    state.best_bins = state.bins.copy()
+    state.best_model = state.model.copy()
+
+
+def powerfit_harmonic_band(base_frequency: float, harmonic: int, data: DataParams,
+                           n: int, local_fft_size: int) -> Tuple[np.ndarray, int]:
+    """Return the local frequency-bin band used for one mains harmonic."""
+
+    n_half = n // 2
+    m = int(min(local_fft_size, n))
+    band_half_bins = max(2, m // 4)
+    center_bin = int(round(float(harmonic) * float(base_frequency) * data.t_obs))
+    bins_all = center_bin + np.arange(-band_half_bins, band_half_bins + 1, dtype=np.int64)
+    valid = (
+        (bins_all > 0) & (bins_all < n_half)
+        & (bins_all >= data.imin) & (bins_all < data.imax)
+    )
+    return bins_all[valid].astype(np.int64), band_half_bins
+
+
+def powerfit_harmonic_frequency_model(freq_knots: np.ndarray,
+                                      amp_knots: np.ndarray,
+                                      harmonic_scale: float,
+                                      harmonic_phase: float,
+                                      harmonic: int,
+                                      knot_times: np.ndarray,
+                                      n: int,
+                                      t_obs: float,
+                                      alpha: float,
+                                      local_fft_size: int = WANDERING_SINE_FFT_SIZE,
+                                      anchor_fraction: float = 0.25
+                                      ) -> Tuple[np.ndarray, np.ndarray]:
+    """Fourier-domain template for one member of the shared power-harmonic model.
+
+    The base mains frequency is Akima-splined and integrated once. Harmonic ``j``
+    uses ``j`` times that phase evolution, matching the FastSpec/BayesPower
+    convention. The Tukey window is applied coherently in amplitude before the
+    local FFT, since this is a coherent subtraction model rather than a PSD
+    convolution.
+    """
+
+    if n <= 0 or n % 2 != 0:
+        raise ValueError("n must be a positive even FFT length")
+    m = int(min(local_fft_size, n))
+    if m < 8:
+        raise ValueError("local_fft_size must be at least 8")
+    freq_knots = np.asarray(freq_knots, dtype=np.float64)
+    amp_knots = np.asarray(amp_knots, dtype=np.float64)
+    knot_times = np.asarray(knot_times, dtype=np.float64)
+    if freq_knots.size != amp_knots.size or freq_knots.size != knot_times.size:
+        raise ValueError("powerfit knot arrays must have matching sizes")
+    if freq_knots.size < 3:
+        raise ValueError("powerfit model needs at least three knots")
+
+    times = np.arange(m, dtype=np.float64) * (float(t_obs) / float(m))
+    inst_base = akima_eval_array(knot_times, freq_knots, freq_knots.size, times)
+    amp_env = akima_eval_array(knot_times, amp_knots, amp_knots.size, times)
+    phase_integral = np.zeros_like(times)
+    if times.size > 1:
+        dt_local = float(t_obs) / float(m)
+        phase_integral[1:] = np.cumsum(0.5 * (inst_base[:-1] + inst_base[1:]) * dt_local)
+    phase_series = float(harmonic) * TPI * phase_integral + float(harmonic_phase)
+
+    center_frequency = float(harmonic) * float(np.mean(inst_base))
+    anchor_bin = int(round(anchor_fraction * float(m)))
+    anchor_bin = min(max(anchor_bin, 1), m // 2 - 1)
+    center_bin = int(round(center_frequency * float(t_obs)))
+    heterodyne_bin = center_bin - anchor_bin
+    heterodyne_frequency = float(heterodyne_bin) / float(t_obs)
+
+    local_signal = float(harmonic_scale) * amp_env * np.cos(
+        phase_series - TPI * heterodyne_frequency * times
+    )
+    local_signal = local_signal.copy()
+    tukey_inplace(local_signal, alpha)
+    local_fft = np.fft.rfft(local_signal)
+
+    local_bins = np.arange(local_fft.size, dtype=np.int64)
+    full_bins = local_bins + heterodyne_bin
+    valid = (local_bins > 0) & (local_bins < local_fft.size - 1)
+    valid &= (full_bins > 0) & (full_bins < n // 2)
+    scale = (float(t_obs) / float(m)) / math.sqrt(2.0)
+    return full_bins[valid].astype(np.int64), local_fft[valid] * scale
+
+
+def powerfit_harmonic_model_from_values(
+    freq_knots: np.ndarray,
+    amp_knots: np.ndarray,
+    harmonic_scale: float,
+    harmonic_phase: float,
+    harmonic: int,
+    base_frequency: float,
+    band_half_bins: int,
+    knot_times: np.ndarray,
+    n: int,
+    t_obs: float,
+    alpha: float,
+    data: DataParams,
+    local_fft_size: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Build one harmonic and restrict it to the local analysis band."""
+
+    bins, values = powerfit_harmonic_frequency_model(
+        freq_knots, amp_knots, harmonic_scale, harmonic_phase, harmonic,
+        knot_times, n, t_obs, alpha, local_fft_size=local_fft_size
+    )
+    center_bin = int(round(float(harmonic) * float(base_frequency) * t_obs))
+    valid = (bins >= data.imin) & (bins < data.imax)
+    valid &= np.abs(bins - center_bin) <= int(band_half_bins)
+    return bins[valid], values[valid]
+
+
+def powerfit_model_from_values(freq_knots: np.ndarray,
+                               amp_knots: np.ndarray,
+                               harmonic_scales: np.ndarray,
+                               harmonic_phases: np.ndarray,
+                               harmonics: np.ndarray,
+                               base_frequency: float,
+                               band_half_bins: int,
+                               knot_times: np.ndarray,
+                               n: int,
+                               t_obs: float,
+                               alpha: float,
+                               data: DataParams,
+                               local_fft_size: int) -> Tuple[np.ndarray, np.ndarray]:
+    """Build the summed model for all active mains harmonics."""
+
+    n_half = n // 2
+    combined = np.zeros(n_half + 1, dtype=np.complex128)
+    mask = np.zeros(n_half + 1, dtype=bool)
+    for i, harmonic in enumerate(harmonics):
+        bins, values = powerfit_harmonic_model_from_values(
+            freq_knots, amp_knots, harmonic_scales[i], harmonic_phases[i],
+            int(harmonic), base_frequency, band_half_bins, knot_times, n,
+            t_obs, alpha, data, local_fft_size
+        )
+        if bins.size > 0:
+            combined[bins] += values
+            mask[bins] = True
+    bins = np.nonzero(mask)[0].astype(np.int64)
+    return bins, combined[bins]
+
+
+def powerfit_model_for_state(state: PowerFitState, n: int, t_obs: float,
+                             alpha: float, data: DataParams,
+                             local_fft_size: int) -> Tuple[np.ndarray, np.ndarray]:
+    """Build and analysis-band filter the summed powerfit model."""
+
+    return powerfit_model_from_values(
+        state.freq_knots, state.amp_knots, state.harmonic_scales,
+        state.harmonic_phases, state.harmonics, state.f_center,
+        state.band_half_bins, state.knot_times, n, t_obs, alpha, data,
+        local_fft_size
+    )
+
+
+def powerfit_state_in_prior(state: PowerFitState, n_half: int, t_obs: float) -> bool:
+    """Check fixed-dimension uniform priors for the specialized power-line fit."""
+
+    if not math.isfinite(state.f_center) or state.f_center <= 0.0:
+        return False
+    fmin = state.f_center - state.f_width
+    fmax = state.f_center + state.f_width
+    amin = max(np.finfo(float).tiny, state.a_center - state.a_width)
+    amax = state.a_center + state.a_width
+    nyquist = float(n_half) / float(t_obs)
+    if fmax <= fmin or amax <= amin:
+        return False
+    if state.harmonics.size == 0:
+        return False
+    max_harmonic = float(np.max(state.harmonics))
+    for value in state.freq_knots:
+        if not math.isfinite(float(value)) or value < fmin or value > fmax:
+            return False
+        if value <= 0.0 or max_harmonic * value >= nyquist:
+            return False
+    for value in state.amp_knots:
+        if not math.isfinite(float(value)) or value < amin or value > amax:
+            return False
+    for value, center, width in zip(state.harmonic_scales, state.scale_center, state.scale_width):
+        smin = max(np.finfo(float).tiny, float(center) - float(width))
+        smax = float(center) + float(width)
+        if smax <= smin or not math.isfinite(float(value)) or value < smin or value > smax:
+            return False
+    for value in state.harmonic_phases:
+        if not math.isfinite(float(value)):
+            return False
+    return True
+
+
+def powerfit_frequency_jump_sigma(state: PowerFitState, rng: np.random.Generator) -> float:
+    """Draw an absolute-Hz proposal width for shared frequency knots."""
+
+    rung = SPLINE_WANDERING_FREQ_JUMP_LADDER[
+        int(rng.integers(0, len(SPLINE_WANDERING_FREQ_JUMP_LADDER)))
+    ]
+    sigma = state.freq_jump * float(rung)
+    return max(sigma, np.finfo(float).tiny)
+
+
+def powerfit_phase_jump_sigma(state: PowerFitState, harmonic_index: int,
+                              rng: np.random.Generator) -> float:
+    """Draw a mixed absolute/SNR-scaled proposal width for one harmonic phase."""
+
+    sigma = POWERFIT_PHASE_JUMP
+    if rng.random() < SPLINE_WANDERING_PHASE_SNR_SCALE_PROB:
+        sigma *= wandering_jump_snr_scale(float(state.start_snr[harmonic_index]))
+    return max(sigma, np.finfo(float).tiny)
+
+
+def propose_powerfit_state(state: PowerFitState,
+                           rng: np.random.Generator) -> Tuple[PowerFitState, int]:
+    """Propose one fixed-dimension update of the joint power-harmonic model."""
+
+    prop = copy_powerfit_state(state)
+    nk = prop.freq_knots.size
+    nh = prop.harmonics.size
+    alpha_move = rng.random()
+    if alpha_move < 0.6:
+        move_index = 0
+        j = int(rng.integers(1, nk - 1)) if nk >= 5 else int(rng.integers(0, nk))
+        prop.freq_knots[j] += rng.normal(0.0, powerfit_frequency_jump_sigma(prop, rng))
+        smooth_wandering_edges(prop.freq_knots)
+    elif alpha_move < 0.8:
+        move_index = 1
+        j = int(rng.integers(1, nk - 1)) if nk >= 5 else int(rng.integers(0, nk))
+        prop.amp_knots[j] += rng.normal(0.0, prop.amp_jump)
+        smooth_wandering_edges(prop.amp_knots)
+    elif alpha_move < 0.9:
+        move_index = 2
+        j = int(rng.integers(0, nh))
+        scale = wandering_jump_reference_snr_scale(float(prop.start_snr[j]))
+        prop.harmonic_scales[j] += rng.normal(0.0, prop.scale_jump[j] * scale)
+    else:
+        move_index = 3
+        j = int(rng.integers(0, nh))
+        prop.harmonic_phases[j] = (
+            prop.harmonic_phases[j] + rng.normal(0.0, powerfit_phase_jump_sigma(prop, j, rng))
+        ) % TPI
+    return prop, move_index
+
+
+def initialize_powerfit_state(
+    bayesline: BayesLineParams,
+    residual: np.ndarray,
+    n: int,
+    alpha: float,
+    scan_points: int,
+    knot_spacing: float,
+    base_frequency: float,
+    harmonic_count: int,
+    freq_width_hz: float,
+    freq_jump_hz: float,
+    amp_width_fraction: float,
+    amp_jump_fraction: float,
+    local_fft_size: int,
+) -> Tuple[Optional[PowerFitState], np.ndarray]:
+    """Initialize the joint mains-harmonic model from pure-sinusoid ML fits."""
+
+    if bayesline.data is None:
+        raise RuntimeError("BayesLine state is not initialized")
+    if bayesline.Sbase is None:
+        raise RuntimeError("Smooth PSD is not available for powerfit subtraction")
+    data = bayesline.data
+    t_obs = data.t_obs
+    n_half = n // 2
+    smooth_full = np.ones(residual.size, dtype=np.float64)
+    smooth_full[data.imin:data.imax] = np.maximum(
+        bayesline_background_psd(bayesline), np.finfo(float).tiny
+    )
+
+    scan_axis = np.array([0.0], dtype=np.float64)
+    if scan_points > 1:
+        scan_axis = np.linspace(-1.0, 1.0, scan_points, dtype=np.float64)
+    base_width = max(float(freq_width_hz), np.finfo(float).tiny)
+    active_harmonics: list[int] = []
+    preliminary: list[Tuple[float, float, float, float, float, np.ndarray]] = []
+    band_half_bins = max(2, int(min(local_fft_size, n)) // 4)
+
+    for harmonic in range(1, int(harmonic_count) + 1):
+        nominal = float(harmonic) * float(base_frequency)
+        bins_int, band_half_bins = powerfit_harmonic_band(base_frequency, harmonic, data, n, local_fft_size)
+        if bins_int.size == 0 or nominal <= 0.0 or nominal >= n_half / t_obs:
+            continue
+        bins = bins_int.astype(np.float64)
+        weight = 1.0 / smooth_full[bins_int]
+        data_band = residual[bins_int]
+        best_freq = nominal
+        best_coeffs = (0.0, 0.0)
+        best_model = np.zeros_like(data_band)
+        best_snr2 = -1.0
+        for base_trial in float(base_frequency) + base_width * scan_axis:
+            fs = float(harmonic) * float(base_trial)
+            if fs <= 0.0 or fs >= n_half / t_obs:
+                continue
+            ccoef, scoef, model, snr2 = fit_tukeyed_sinusoid_to_band(
+                data_band, weight, fs, bins, n, t_obs, alpha
+            )
+            if snr2 > best_snr2:
+                best_snr2 = snr2
+                best_freq = fs
+                best_coeffs = (ccoef, scoef)
+                best_model = model
+        if best_snr2 <= 0.0:
+            best_snr2 = 0.0
+        active_harmonics.append(harmonic)
+        preliminary.append((best_freq, best_coeffs[0], best_coeffs[1], best_snr2, nominal, best_model))
+
+    if not active_harmonics:
+        return None, smooth_full
+
+    weights = np.array([max(item[3], 0.0) for item in preliminary], dtype=np.float64)
+    base_estimates = np.array(
+        [item[0] / float(harmonic) for item, harmonic in zip(preliminary, active_harmonics)],
+        dtype=np.float64,
+    )
+    if float(np.sum(weights)) > 0.0:
+        base_start = float(np.sum(weights * base_estimates) / np.sum(weights))
+    else:
+        base_start = float(base_frequency)
+
+    start_frequencies = np.zeros(len(active_harmonics), dtype=np.float64)
+    start_amplitudes = np.zeros(len(active_harmonics), dtype=np.float64)
+    start_phases = np.zeros(len(active_harmonics), dtype=np.float64)
+    start_snr = np.zeros(len(active_harmonics), dtype=np.float64)
+
+    for i, harmonic in enumerate(active_harmonics):
+        bins_int, band_half_bins = powerfit_harmonic_band(base_start, harmonic, data, n, local_fft_size)
+        if bins_int.size == 0:
+            continue
+        bins = bins_int.astype(np.float64)
+        weight = 1.0 / smooth_full[bins_int]
+        data_band = residual[bins_int]
+        fs = float(harmonic) * base_start
+        ccoef, scoef, _model, snr2 = fit_tukeyed_sinusoid_to_band(
+            data_band, weight, fs, bins, n, t_obs, alpha
+        )
+        amplitude = math.hypot(ccoef, scoef)
+        phase = math.atan2(-scoef, ccoef) % TPI
+        start_frequencies[i] = fs
+        start_amplitudes[i] = max(amplitude, np.finfo(float).tiny)
+        start_phases[i] = phase
+        start_snr[i] = math.sqrt(max(snr2, 0.0))
+
+    knot_times = spline_wandering_knot_times(t_obs, knot_spacing)
+    knot_count = knot_times.size
+    freq_knots = np.full(knot_count, base_start, dtype=np.float64)
+    amp_knots = np.ones(knot_count, dtype=np.float64)
+    scale_width = np.maximum(
+        float(amp_width_fraction) * np.abs(start_amplitudes),
+        np.finfo(float).tiny,
+    )
+    state = PowerFitState(
+        base_frequency_nominal=float(base_frequency),
+        harmonics=np.asarray(active_harmonics, dtype=np.int64),
+        knot_times=knot_times,
+        freq_knots=freq_knots,
+        amp_knots=amp_knots,
+        harmonic_scales=start_amplitudes.copy(),
+        harmonic_phases=start_phases.copy(),
+        start_frequencies=start_frequencies,
+        start_amplitudes=start_amplitudes,
+        start_phases=start_phases,
+        start_snr=start_snr,
+        f_center=base_start,
+        f_width=base_width,
+        a_center=1.0,
+        a_width=max(float(amp_width_fraction), np.finfo(float).tiny),
+        scale_center=start_amplitudes.copy(),
+        scale_width=scale_width,
+        freq_jump=max(float(freq_jump_hz), np.finfo(float).tiny),
+        amp_jump=max(float(amp_jump_fraction), np.finfo(float).tiny),
+        scale_jump=np.maximum(float(amp_jump_fraction) * np.abs(start_amplitudes), np.finfo(float).tiny),
+        band_half_bins=band_half_bins,
+        bins=np.empty(0, dtype=np.int64),
+        model=np.empty(0, dtype=np.complex128),
+    )
+    state.bins, state.model = powerfit_model_for_state(
+        state, n, t_obs, alpha, data, local_fft_size
+    )
+    if state.bins.size == 0:
+        return None, smooth_full
+    residual[state.bins] -= state.model
+    start_loglike = line_loglike_from_residual(residual[state.bins], state.bins, smooth_full)
+    snapshot_powerfit_best_state(state, start_loglike)
+    return state, smooth_full
+
+
+def run_powerfit_mcmc(state: Optional[PowerFitState],
+                      residual: np.ndarray,
+                      smooth_full: np.ndarray,
+                      n: int,
+                      t_obs: float,
+                      alpha: float,
+                      data: DataParams,
+                      rng: np.random.Generator,
+                      steps: int,
+                      local_fft_size: int) -> Optional[PowerFitState]:
+    """Run the fixed-dimension joint MCMC for the mains-harmonic powerfit."""
+
+    if state is None or steps <= 0:
+        return state
+    n_half = n // 2
+    for _mc in range(int(steps)):
+        state.proposed += 1
+        prop, move_index = propose_powerfit_state(state, rng)
+        state.move_proposed[move_index] += 1
+        if not powerfit_state_in_prior(prop, n_half, t_obs):
+            continue
+        try:
+            prop.bins, prop.model = powerfit_model_for_state(
+                prop, n, t_obs, alpha, data, local_fft_size
+            )
+        except ValueError:
+            continue
+        if prop.bins.size == 0:
+            continue
+
+        union, current_resid, _base_resid, proposed_resid = merge_line_bins(
+            state.bins, state.model, prop.bins, prop.model, residual
+        )
+        logLx = line_loglike_from_residual(current_resid, union, smooth_full)
+        logLy = line_loglike_from_residual(proposed_resid, union, smooth_full)
+        if math.log(max(rng.random(), np.finfo(float).tiny)) < (logLy - logLx):
+            residual[union] = proposed_resid
+            prop.accepted = state.accepted + 1
+            prop.proposed = state.proposed
+            prop.move_proposed = state.move_proposed.copy()
+            prop.move_accepted = state.move_accepted.copy()
+            prop.move_accepted[move_index] += 1
+            accepted_loglike = line_loglike_from_residual(residual[prop.bins], prop.bins, smooth_full)
+            if accepted_loglike > prop.best_loglike:
+                snapshot_powerfit_best_state(prop, accepted_loglike)
+            state = prop
+    return state
+
+
+def write_powerfit_residual_from_state(original_scaled: np.ndarray,
+                                       state: Optional[PowerFitState],
+                                       t_obs: float,
+                                       output_file: str,
+                                       freq_scale: float,
+                                       use_best: bool = False) -> None:
+    """Write original scaled frequency data with the selected powerfit state removed."""
+
+    n_half = original_scaled.size - 1
+    residual = np.zeros(n_half + 1, dtype=np.complex128)
+    residual[1:n_half] = original_scaled[1:n_half]
+    if state is not None:
+        _fk, _ak, _scales, _phases, bins, model, _loglike = powerfit_state_view(state, use_best=use_best)
+        if bins.size > 0:
+            residual[bins] -= model
+    write_scaled_complex_frequency_domain_output(output_file, t_obs, freq_scale, residual)
+
+
+def powerfit_summary_rows(state: Optional[PowerFitState], smooth_full: np.ndarray,
+                          n: int, t_obs: float, alpha: float, data: DataParams,
+                          local_fft_size: int, use_best: bool = False) -> np.ndarray:
+    """Build one diagnostic row per active power harmonic."""
+
+    ncol = 16 if use_best else 15
+    if state is None:
+        return np.zeros((0, ncol), dtype=np.float64)
+    freq_knots, amp_knots, scales, phases, _bins, _model, best_loglike = (
+        powerfit_state_view(state, use_best=use_best)
+    )
+    rows = np.zeros((state.harmonics.size, ncol), dtype=np.float64)
+    base_mean = float(np.mean(freq_knots))
+    base_min = float(np.min(freq_knots))
+    base_max = float(np.max(freq_knots))
+    total_snr2 = 0.0
+    harmonic_snr = np.zeros(state.harmonics.size, dtype=np.float64)
+    for i, harmonic in enumerate(state.harmonics):
+        bins, model = powerfit_harmonic_model_from_values(
+            freq_knots, amp_knots, scales[i], phases[i], int(harmonic),
+            state.f_center, state.band_half_bins, state.knot_times, n, t_obs,
+            alpha, data, local_fft_size
+        )
+        snr2 = 0.0
+        if bins.size > 0:
+            weight = 1.0 / np.maximum(smooth_full[bins], np.finfo(float).tiny)
+            snr2 = float(np.sum(weight * (model.real * model.real + model.imag * model.imag)))
+        harmonic_snr[i] = math.sqrt(max(snr2, 0.0))
+        total_snr2 += max(snr2, 0.0)
+    total_snr = math.sqrt(max(total_snr2, 0.0))
+    loglike_value = best_loglike if use_best and math.isfinite(best_loglike) else math.nan
+    for i, harmonic in enumerate(state.harmonics):
+        base_row = (
+            float(harmonic),
+            float(harmonic) * state.base_frequency_nominal,
+            state.start_frequencies[i],
+            state.start_amplitudes[i],
+            state.start_phases[i],
+            state.start_snr[i],
+            base_mean,
+            base_min,
+            base_max,
+            scales[i],
+            phases[i],
+            harmonic_snr[i],
+            total_snr,
+            float(state.accepted),
+            float(state.proposed),
+        )
+        if use_best:
+            rows[i] = base_row + (loglike_value,)
+        else:
+            rows[i] = base_row
+    return rows
+
+
+def write_powerfit_summary(state: Optional[PowerFitState], smooth_full: np.ndarray,
+                           n: int, t_obs: float, alpha: float, data: DataParams,
+                           local_fft_size: int, output_file: str,
+                           use_best: bool = False) -> None:
+    """Write one-row-per-harmonic diagnostics for powerfit."""
+
+    header = (
+        "harmonic nominal_frequency start_frequency start_amplitude start_phase "
+        "start_snr final_base_frequency_mean final_base_frequency_min "
+        "final_base_frequency_max final_harmonic_amplitude final_harmonic_phase "
+        "final_harmonic_snr final_total_snr accepted_updates proposed_updates"
+    )
+    if use_best:
+        header += " best_local_loglike"
+    np.savetxt(
+        output_file,
+        powerfit_summary_rows(state, smooth_full, n, t_obs, alpha, data, local_fft_size, use_best),
+        header=header,
+    )
+
+
+def write_powerfit_controls(state: Optional[PowerFitState], output_file: str,
+                            use_best: bool = False) -> None:
+    """Write shared base-frequency and amplitude-envelope spline controls."""
+
+    if state is None:
+        np.savetxt(
+            output_file,
+            np.zeros((0, 4), dtype=np.float64),
+            header="time base_frequency base_frequency_offset normalized_amplitude",
+        )
+        return
+    freq_knots, amp_knots, _scales, _phases, _bins, _model, loglike = (
+        powerfit_state_view(state, use_best=use_best)
+    )
+    extra = f", best_local_loglike={loglike:.12e}" if use_best and math.isfinite(loglike) else ""
+    np.savetxt(
+        output_file,
+        np.column_stack((
+            state.knot_times,
+            freq_knots,
+            freq_knots - state.base_frequency_nominal,
+            amp_knots,
+        )),
+        header=(
+            "time base_frequency base_frequency_offset normalized_amplitude "
+            f"(nominal_base_frequency={state.base_frequency_nominal:.12g} Hz{extra})"
+        ),
+    )
+
+
+def write_powerfit_spline_trace(state: Optional[PowerFitState], output_file: str,
+                                t_obs: float, dt_out: float = POWERFIT_SPLINE_OUTPUT_DT,
+                                use_best: bool = False) -> None:
+    """Write the powerfit splines evaluated on a regular time grid.
+
+    The control-point files are compact, but this trace is easier to compare
+    directly with FastSpec diagnostics and with time-domain intuition.  The
+    shared base frequency is evaluated first; harmonic frequencies and raw
+    amplitudes are then deterministic multiples/scalings of that shared model.
+    """
+
+    base_header = (
+        "time base_frequency base_frequency_offset normalized_amplitude"
+    )
+    if state is None:
+        np.savetxt(output_file, np.zeros((0, 4), dtype=np.float64), header=base_header)
+        return
+    if not math.isfinite(dt_out) or dt_out <= 0.0:
+        raise ValueError("powerfit spline output cadence must be positive and finite")
+
+    freq_knots, amp_knots, scales, _phases, _bins, _model, loglike = (
+        powerfit_state_view(state, use_best=use_best)
+    )
+    nstep = max(2, int(math.floor(float(t_obs) / float(dt_out))) + 1)
+    times = np.linspace(0.0, float(t_obs), nstep, dtype=np.float64)
+    base_freq = akima_eval_array(state.knot_times, freq_knots, freq_knots.size, times)
+    amp_env = akima_eval_array(state.knot_times, amp_knots, amp_knots.size, times)
+
+    columns = [
+        times,
+        base_freq,
+        base_freq - state.base_frequency_nominal,
+        amp_env,
+    ]
+    header_parts = [base_header]
+    for i, harmonic in enumerate(state.harmonics):
+        label = int(harmonic)
+        columns.append(float(label) * base_freq)
+        columns.append(float(scales[i]) * amp_env)
+        header_parts.append(f"harmonic_{label}_frequency harmonic_{label}_amplitude")
+
+    extra = f" best_local_loglike={loglike:.12e}" if use_best and math.isfinite(loglike) else ""
+    header = " ".join(header_parts) + (
+        f" (nominal_base_frequency={state.base_frequency_nominal:.12g} Hz, "
+        f"dt={float(dt_out):.12g} s{extra})"
+    )
+    np.savetxt(output_file, np.column_stack(columns), header=header)
+
+
+def write_powerfit_move_diagnostics(state: Optional[PowerFitState],
+                                    output_file: str = "powerfit_move_diagnostics.dat") -> None:
+    """Write proposal/acceptance counts for the joint powerfit MCMC."""
+
+    with open(output_file, "w", encoding="utf-8") as handle:
+        handle.write("# move proposed accepted acceptance_rate\n")
+        if state is None:
+            handle.write("# no active power harmonics in analysis band\n")
+            return
+        for i, label in enumerate(POWERFIT_MOVE_LABELS):
+            proposed = int(state.move_proposed[i])
+            accepted = int(state.move_accepted[i])
+            rate = accepted / proposed if proposed > 0 else 0.0
+            handle.write(f"{label} {proposed:d} {accepted:d} {rate:.12e}\n")
+        total_rate = state.accepted / state.proposed if state.proposed > 0 else 0.0
+        handle.write(f"total {int(state.proposed):d} {int(state.accepted):d} {total_rate:.12e}\n")
+
+
+def run_powerfit_subtraction(
+    bayesline: BayesLineParams,
+    original_fft: np.ndarray,
+    dt: float,
+    n: int,
+    alpha: float,
+    rng: np.random.Generator,
+    steps: int = POWERFIT_MCMC_STEPS,
+    base_frequency: float = POWERFIT_BASE_FREQUENCY,
+    harmonic_count: int = POWERFIT_HARMONICS,
+    knot_spacing: float = POWERFIT_KNOT_SPACING,
+    freq_width_hz: float = POWERFIT_FREQ_WIDTH_HZ,
+    freq_jump_hz: float = POWERFIT_FREQ_JUMP_HZ,
+    amp_width_fraction: float = POWERFIT_AMP_WIDTH_FRACTION,
+    amp_jump_fraction: float = POWERFIT_AMP_JUMP_FRACTION,
+    local_fft_size: int = WANDERING_SINE_FFT_SIZE,
+    scan_points: int = SINEFIT_SCAN_POINTS,
+) -> Tuple[Optional[PowerFitState], np.ndarray, np.ndarray, np.ndarray]:
+    """Run the joint mains-harmonic fit and return state, PSD, original, residual."""
+
+    if bayesline.data is None:
+        raise RuntimeError("BayesLine state is not initialized")
+    n_half = n // 2
+    t_obs = bayesline.data.t_obs
+    local_fft_size = int(local_fft_size)
+    knot_spacing = announce_canonical_spline_knot_spacing(
+        "--powerfit-knot-spacing", t_obs, knot_spacing
+    )
+    original_scaled = original_fft * (dt / math.sqrt(2.0))
+    residual = np.zeros(n_half + 1, dtype=np.complex128)
+    residual[1:n_half] = original_scaled[1:n_half]
+
+    state, smooth_full = initialize_powerfit_state(
+        bayesline, residual, n, alpha, scan_points, knot_spacing,
+        base_frequency, harmonic_count, freq_width_hz, freq_jump_hz,
+        amp_width_fraction, amp_jump_fraction, local_fft_size
+    )
+    if state is None:
+        print(
+            f"warning: no active {base_frequency:g} Hz power harmonics in the "
+            "analysis band; writing unsubtracted powerfit diagnostics"
+        )
+    state = run_powerfit_mcmc(
+        state, residual, smooth_full, n, t_obs, alpha, bayesline.data,
+        rng, steps, local_fft_size
+    )
+    return state, smooth_full, original_scaled, residual
+
+
+def write_powerfit_subtracted_frequency_file(
+    bayesline: BayesLineParams,
+    original_fft: np.ndarray,
+    dt: float,
+    n: int,
+    alpha: float,
+    rng: np.random.Generator,
+    output_file: str = "freq_nopower.dat",
+    summary_file: str = "powerfit.dat",
+    steps: int = POWERFIT_MCMC_STEPS,
+    base_frequency: float = POWERFIT_BASE_FREQUENCY,
+    harmonic_count: int = POWERFIT_HARMONICS,
+    knot_spacing: float = POWERFIT_KNOT_SPACING,
+    freq_width_hz: float = POWERFIT_FREQ_WIDTH_HZ,
+    freq_jump_hz: float = POWERFIT_FREQ_JUMP_HZ,
+    amp_width_fraction: float = POWERFIT_AMP_WIDTH_FRACTION,
+    amp_jump_fraction: float = POWERFIT_AMP_JUMP_FRACTION,
+    local_fft_size: int = WANDERING_SINE_FFT_SIZE,
+    scan_points: int = SINEFIT_SCAN_POINTS,
+) -> Tuple[Optional[PowerFitState], np.ndarray, np.ndarray, np.ndarray]:
+    """Subtract a joint FastSpec-like mains-harmonic spline model."""
+
+    if bayesline.data is None:
+        raise RuntimeError("BayesLine state is not initialized")
+    n_half = n // 2
+    t_obs = bayesline.data.t_obs
+    local_fft_size = int(local_fft_size)
+    state, smooth_full, original_scaled, residual = run_powerfit_subtraction(
+        bayesline, original_fft, dt, n, alpha, rng,
+        steps=steps,
+        base_frequency=base_frequency,
+        harmonic_count=harmonic_count,
+        knot_spacing=knot_spacing,
+        freq_width_hz=freq_width_hz,
+        freq_jump_hz=freq_jump_hz,
+        amp_width_fraction=amp_width_fraction,
+        amp_jump_fraction=amp_jump_fraction,
+        local_fft_size=local_fft_size,
+        scan_points=scan_points,
+    )
+
+    freq_scale = frequency_data_output_scale_from_alpha(n, t_obs, alpha)
+    write_scaled_complex_frequency_domain_output(output_file, t_obs, freq_scale, residual)
+    write_powerfit_summary(
+        state, smooth_full, n, t_obs, alpha, bayesline.data, local_fft_size,
+        summary_file, use_best=False
+    )
+    write_powerfit_residual_from_state(
+        original_scaled, state, t_obs, "freq_nopower_ml.dat", freq_scale, use_best=True
+    )
+    write_powerfit_summary(
+        state, smooth_full, n, t_obs, alpha, bayesline.data, local_fft_size,
+        "powerfit_ml.dat", use_best=True
+    )
+    write_powerfit_controls(state, "powerfit_controls.dat", use_best=False)
+    write_powerfit_controls(state, "powerfit_controls_ml.dat", use_best=True)
+    write_powerfit_spline_trace(
+        state, "powerfit_spline.dat", t_obs, POWERFIT_SPLINE_OUTPUT_DT, use_best=False
+    )
+    write_powerfit_spline_trace(
+        state, "powerfit_spline_ml.dat", t_obs, POWERFIT_SPLINE_OUTPUT_DT, use_best=True
+    )
+    write_powerfit_move_diagnostics(state)
+    active_count = 0 if state is None else int(state.harmonics.size)
+    print(
+        f"Wrote {output_file}, freq_nopower_ml.dat, {summary_file}, "
+        f"powerfit_ml.dat, and powerfit_spline_ml.dat after joint "
+        f"{base_frequency:g} Hz powerfit for {active_count:d} harmonics"
+    )
+    return state, smooth_full, original_scaled, residual
+
+
 def write_sine_subtracted_frequency_file(bayesline: BayesLineParams,
                                          original_fft: np.ndarray,
                                          dt: float,
                                          n: int, alpha: float,
                                          output_file: str = "freq_nosine.dat",
-                                         scan_points: int = SINEFIT_SCAN_POINTS) -> None:
-    """Write original tapered FFT data with best-fit Tukeyed sinusoids subtracted."""
+                                         scan_points: int = SINEFIT_SCAN_POINTS,
+                                         fit_model: str = "sinusoid") -> None:
+    """Write original tapered FFT data with best-fit coherent lines subtracted."""
 
     if bayesline.data is None or bayesline.lines_x is None:
         raise RuntimeError("BayesLine state is not initialized")
@@ -2564,6 +5340,8 @@ def write_sine_subtracted_frequency_file(bayesline: BayesLineParams,
     lines = bayesline.lines_x
     if lines.ltemplate is None:
         raise RuntimeError("Lorentzian lookup table has not been loaded")
+    if fit_model not in ("sinusoid", "oscillator"):
+        raise ValueError("fit_model must be 'sinusoid' or 'oscillator'")
 
     data = bayesline.data
     t_obs = data.t_obs
@@ -2608,9 +5386,14 @@ def write_sine_subtracted_frequency_file(bayesline: BayesLineParams,
         for fs in f_line + half_scan * scan_axis:
             if fs <= 0.0 or fs >= n_half / t_obs:
                 continue
-            _ccoef, _scoef, model, snr2 = fit_tukeyed_sinusoid_to_band(
-                data_band, weight, float(fs), bins, n, t_obs, alpha
-            )
+            if fit_model == "sinusoid":
+                _ccoef, _scoef, model, snr2 = fit_tukeyed_sinusoid_to_band(
+                    data_band, weight, float(fs), bins, n, t_obs, alpha
+                )
+            else:
+                _g0, model, snr2 = fit_tukeyed_oscillator_to_band(
+                    data_band, weight, float(fs), f_line, nu, bins, n, t_obs, alpha
+                )
             if snr2 > best_snr2:
                 best_snr2 = snr2
                 best_model = model
@@ -2619,9 +5402,10 @@ def write_sine_subtracted_frequency_file(bayesline: BayesLineParams,
             residual[bins_int] -= best_model
             nfit += 1
 
-    freqs = np.arange(1, n_half, dtype=np.float64) / t_obs
-    np.savetxt(output_file, np.column_stack((freqs, residual[1:n_half].real, residual[1:n_half].imag)))
-    print(f"Wrote {output_file} after subtracting {nfit:d} fitted Tukeyed sinusoids")
+    freq_scale = frequency_data_output_scale_from_alpha(n, t_obs, alpha)
+    write_scaled_complex_frequency_domain_output(output_file, t_obs, freq_scale, residual)
+    label = "Tukeyed sinusoids" if fit_model == "sinusoid" else "Tukeyed driven oscillators"
+    print(f"Wrote {output_file} after subtracting {nfit:d} fitted {label}")
 
 
 def lineget_candidates(power: np.ndarray, smooth: np.ndarray, freqs: np.ndarray,
@@ -2942,7 +5726,10 @@ def lorentzfit_four_pass(line: LorentzianParams, data_fft: np.ndarray, freqs: np
             lf, lnu, lamp, lgL = new_lf, new_lnu, new_lamp, new_lgL
             nltotal = kept
 
-        cleaned = subtract_lines_lmcmc(dhold[:n2], SM, line_model, rng)
+        # medspecspline/Lpeak work with the startup one-sided power 2*|d|^2.
+        # The analytic line draw works in complex-bin power units, matching
+        # |d|^2, so convert the smooth and line spectra by 1/2 here.
+        cleaned = subtract_lines_lmcmc(dhold[:n2], 0.5 * SM, 0.5 * line_model, rng)
         dprime = dhold.copy()
         dprime[:n2] = cleaned
 
@@ -3082,10 +5869,17 @@ def logprior_model(priors: BayesLinePriors, sn: np.ndarray,
         if (priors.component_reference is not None
                 and priors.line_log1p_mean is not None
                 and priors.line_log1p_sigma is not None):
-            val += float(logprior_ratio_component_numba(
-                priors.component_reference, priors.line_log1p_mean,
-                priors.line_log1p_sigma, sline
-            ))
+            if priors.line_log1p_sigma_minus is not None:
+                val += float(logprior_ratio_component_asym_numba(
+                    priors.component_reference, priors.line_log1p_mean,
+                    priors.line_log1p_sigma_minus, priors.line_log1p_sigma,
+                    sline
+                ))
+            else:
+                val += float(logprior_ratio_component_numba(
+                    priors.component_reference, priors.line_log1p_mean,
+                    priors.line_log1p_sigma, sline
+                ))
         if (priors.component_reference is not None
                 and priors.gaussian_log1p_mean is not None
                 and priors.gaussian_log1p_sigma is not None):
@@ -3130,10 +5924,17 @@ def delta_logprior_range(priors: BayesLinePriors,
         if (priors.component_reference is not None
                 and priors.line_log1p_mean is not None
                 and priors.line_log1p_sigma is not None):
-            val += float(delta_logprior_ratio_component_range_numba(
-                priors.component_reference, priors.line_log1p_mean,
-                priors.line_log1p_sigma, sline_new, sline_old, ilow, ihigh
-            ))
+            if priors.line_log1p_sigma_minus is not None:
+                val += float(delta_logprior_ratio_component_asym_range_numba(
+                    priors.component_reference, priors.line_log1p_mean,
+                    priors.line_log1p_sigma_minus, priors.line_log1p_sigma,
+                    sline_new, sline_old, ilow, ihigh
+                ))
+            else:
+                val += float(delta_logprior_ratio_component_range_numba(
+                    priors.component_reference, priors.line_log1p_mean,
+                    priors.line_log1p_sigma, sline_new, sline_old, ilow, ihigh
+                ))
         if (priors.component_reference is not None
                 and priors.gaussian_log1p_mean is not None
                 and priors.gaussian_log1p_sigma is not None):
@@ -4167,17 +6968,20 @@ def valid_power_of_two_frequency(value: float) -> Tuple[bool, int]:
     return True, nearest
 
 
-def segment_bounds(trigger_time: float, duration: float) -> Tuple[float, float]:
-    end = trigger_time + TRIGGER_OFFSET_FROM_END
+def segment_bounds(trigger_time: float, duration: float,
+                   post_trigger: float = TRIGGER_OFFSET_FROM_END) -> Tuple[float, float]:
+    """Return the target analysis bounds with ``post_trigger`` seconds after the trigger."""
+
+    end = trigger_time + post_trigger
     start = end - duration
     return start, end
 
 
 def expanded_fetch_bounds(trigger_time: float, analysis_duration: float,
-                          expand: int) -> Tuple[float, float]:
+                          expand: int, post_trigger: float) -> Tuple[float, float]:
     """Return the union needed for the target segment and symmetric context."""
 
-    analysis_start, analysis_end = segment_bounds(trigger_time, analysis_duration)
+    analysis_start, analysis_end = segment_bounds(trigger_time, analysis_duration, post_trigger)
     before_chunks = expand // 2
     after_chunks = expand - before_chunks
     context_start = analysis_start - analysis_duration * float(before_chunks)
@@ -4336,11 +7140,12 @@ def fetch_ligo_data_bounds(start: float, end: float, ifo: str, source: str,
 
 def fetch_ligo_data(trigger_time: float, duration: float, ifo: str, source: str,
                     channel: Optional[str], output_file: Optional[str],
-                    target_rate: float, padding: float, resampler: str) -> str:
+                    target_rate: float, padding: float, resampler: str,
+                    post_trigger: float) -> str:
     """Fetch, resample, crop, and save the standard trigger-offset analysis segment."""
 
-    start, end = segment_bounds(trigger_time, duration)
-    print(f"Trigger time {trigger_time:.6f} is {TRIGGER_OFFSET_FROM_END:.1f} seconds before segment end")
+    start, end = segment_bounds(trigger_time, duration, post_trigger)
+    print(f"Trigger time {trigger_time:.6f} is {post_trigger:.1f} seconds before segment end")
     return fetch_ligo_data_bounds(
         start, end, ifo, source, channel, output_file,
         target_rate, padding, resampler, trigger_time=trigger_time
@@ -4665,7 +7470,7 @@ def set_line_amplitude_prior_from_state(bayesline: BayesLineParams) -> None:
 
 def adapt_context_target_model_caps(bayesline: BayesLineParams,
                                     gaussian_enabled: bool = False) -> None:
-    """Set target-stage caps to twice the transferred context final dimensions."""
+    """Set target-stage caps after copying the final context state."""
 
     if bayesline.lines_x is None or bayesline.spline_x is None:
         raise RuntimeError("BayesLine target state is incomplete")
@@ -4681,7 +7486,8 @@ def adapt_context_target_model_caps(bayesline: BayesLineParams,
 
     if gaussian_enabled and bayesline.bumps_x is not None:
         initialized_bumps = int(bayesline.bumps_x.n)
-        bump_cap = max(2, 2 * initialized_bumps)
+        default_bump_cap = gaussian_bump_array_size_for_duration(bayesline.data.t_obs)
+        bump_cap = max(default_bump_cap, 2 * initialized_bumps)
         bayesline.bumps_x = ensure_gaussian_bump_capacity(bayesline.bumps_x, bump_cap)
         bayesline.maxBLBumps = bump_cap
         print(
@@ -4792,7 +7598,18 @@ def install_context_psd_prior(target: BayesLineParams,
     target.priors.smooth_sigma = np.maximum(smooth_log_sigma * inflate, sigma_floor)
     target.priors.component_reference = smooth_mean
     target.priors.line_log1p_mean = line_log1p_mean
-    target.priors.line_log1p_sigma = np.maximum(line_log1p_sigma * inflate, sigma_floor)
+    line_log1p_sigma_plus = np.maximum(line_log1p_sigma * inflate, sigma_floor)
+    # The line component is parameterized by x=log1p(Sline/Ssmooth), whose
+    # physical lower limit is x=0.  Use an asymmetric prior: keep the ordinary
+    # inflated/floored width for upward line power, but cap the lower-side width
+    # so that the nominal 2-sigma lower edge reaches zero line height instead
+    # of extrapolating to negative line power.
+    line_log1p_sigma_minus = np.minimum(
+        line_log1p_sigma_plus,
+        np.maximum(line_log1p_mean / CONTEXT_LINE_LOWER_SIGMA_LEVEL, 0.0),
+    )
+    target.priors.line_log1p_sigma_minus = line_log1p_sigma_minus
+    target.priors.line_log1p_sigma = line_log1p_sigma_plus
     if context_gaussian_samples is not None:
         target.priors.gaussian_log1p_mean = gaussian_log1p_mean
         target.priors.gaussian_log1p_sigma = np.maximum(gaussian_log1p_sigma * inflate, sigma_floor)
@@ -4811,9 +7628,13 @@ def install_context_psd_prior(target: BayesLineParams,
         output_psd_scale * smooth_mean,
         target.priors.smooth_sigma,
         line_log1p_mean,
+        target.priors.line_log1p_sigma_minus,
         target.priors.line_log1p_sigma,
     ]
-    component_header = "frequency smooth_median_psd smooth_log_sigma line_log1p_mean line_log1p_sigma"
+    component_header = (
+        "frequency smooth_median_psd smooth_log_sigma line_log1p_mean "
+        "line_log1p_sigma_minus line_log1p_sigma_plus"
+    )
     if context_gaussian_samples is not None:
         component_columns.extend([
             gaussian_log1p_mean,
@@ -5027,6 +7848,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog=Path(argv[0]).name,
         description="Fetch a LIGO strain segment by trigger time, or run BWtest on an existing two-column strain file.",
+        allow_abbrev=False,
     )
     parser.add_argument(
         "inputs",
@@ -5057,6 +7879,18 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         type=float,
         default=None,
         help="desired analysis duration in seconds for an existing input file",
+    )
+    parser.add_argument(
+        "--post_trigger",
+        "--post-trigger",
+        "--trigger-offset",
+        "--trigger-offset-from-end",
+        type=float,
+        default=TRIGGER_OFFSET_FROM_END,
+        help=(
+            "seconds between the trigger and the end of the target analysis "
+            f"segment, default {TRIGGER_OFFSET_FROM_END:g}"
+        ),
     )
     parser.add_argument(
         "--expand",
@@ -5127,6 +7961,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help=f"write BayesLine startup diagnostic to {BL_START_FILENAME}",
     )
     parser.add_argument(
+        "--print_raw",
+        "--print-raw",
+        action="store_true",
+        help="write frequency_data_raw.dat with the uncleaned Tukey-windowed FFT in the same scaling as frequency_data.dat",
+    )
+    parser.add_argument(
         "--writewhite",
         "--write-white",
         action="store_true",
@@ -5170,6 +8010,282 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--sine-fit",
         action="store_true",
         help="write sinefit.dat and freq_nosine.dat for Tukeyed-sinusoid line diagnostics/subtraction",
+    )
+    parser.add_argument(
+        "--oscillatorfit",
+        "--oscillator-fit",
+        action="store_true",
+        help="write oscillatorfit.dat and freq_nooscillator.dat for driven damped oscillator line diagnostics/subtraction",
+    )
+    parser.add_argument(
+        "--wanderfit",
+        "--wander-fit",
+        action="store_true",
+        help="write wanderfit.dat and freq_nowander.dat using end-stage wandering-sinusoid line subtraction",
+    )
+    parser.add_argument(
+        "--wander_steps",
+        "--wander-steps",
+        type=int,
+        default=WANDERING_MCMC_STEPS,
+        help="number of lightweight wandering-sinusoid MCMC line updates, default %(default)d",
+    )
+    parser.add_argument(
+        "--wander_initial_legendre",
+        "--wander-initial-legendre",
+        type=int,
+        default=WANDERING_INITIAL_LEGENDRE,
+        help="initial number of Legendre terms in each wandering-sinusoid line, default %(default)d",
+    )
+    parser.add_argument(
+        "--wander_max_legendre",
+        "--wander-max-legendre",
+        type=int,
+        default=WANDERING_MAX_LEGENDRE,
+        help="maximum number of Legendre terms in each wandering-sinusoid line, default %(default)d",
+    )
+    parser.add_argument(
+        "--wander_local_fft_size",
+        "--wander-local-fft-size",
+        type=int,
+        default=WANDERING_SINE_FFT_SIZE,
+        help="local heterodyned FFT length for wandering-sinusoid templates, default %(default)d",
+    )
+    parser.add_argument(
+        "--splinewanderfit",
+        "--spline-wanderfit",
+        "--spline-wander-fit",
+        action="store_true",
+        help="write splinewanderfit.dat and freq_nosplinewander.dat using fixed-knot Akima spline wandering-line subtraction",
+    )
+    parser.add_argument(
+        "--checkline",
+        "--check-line",
+        type=float,
+        default=None,
+        help=(
+            "with --splinewanderfit, write controls and move diagnostics for "
+            "the fitted spline-wandering line nearest this frequency in Hz"
+        ),
+    )
+    parser.add_argument(
+        "--spline_wander_steps",
+        "--spline-wander-steps",
+        type=int,
+        default=SPLINE_WANDERING_MCMC_STEPS,
+        help="number of fixed-dimension spline-wandering MCMC updates per line, default %(default)d",
+    )
+    parser.add_argument(
+        "--spline_wander_knot_spacing",
+        "--spline-wander-knot-spacing",
+        "--spline_wander_tspace",
+        "--spline-wander-tspace",
+        type=float,
+        default=SPLINE_WANDERING_KNOT_SPACING,
+        help=(
+            "requested control-point time spacing Tspace in seconds; mapped to "
+            "the nearest power of two before using Tobs/Tspace+1 knots, "
+            "default %(default)g"
+        ),
+    )
+    parser.add_argument(
+        "--spline_wander_frequency_width_hz",
+        "--spline-wander-frequency-width-hz",
+        dest="spline_wander_frequency_width_hz",
+        type=float,
+        default=SPLINE_WANDERING_FREQ_WIDTH_HZ,
+        help="uniform half-width in Hz for each frequency knot, default %(default)g",
+    )
+    parser.add_argument(
+        "--spline_wander_frequency_width_bins",
+        "--spline-wander-frequency-width-bins",
+        dest="spline_wander_frequency_width_hz",
+        type=float,
+        default=argparse.SUPPRESS,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--spline_wander_frequency_jump_hz",
+        "--spline-wander-frequency-jump-hz",
+        dest="spline_wander_frequency_jump_hz",
+        type=float,
+        default=SPLINE_WANDERING_FREQ_JUMP_HZ,
+        help=(
+            "largest frequency-knot proposal sigma in Hz before the optional "
+            "100/SNR shrink for lines above SNR 100; the sampler randomly "
+            "also uses 0.1x and 0.01x this value, "
+            "default %(default)g"
+        ),
+    )
+    parser.add_argument(
+        "--spline_wander_frequency_jump_bins",
+        "--spline-wander-frequency-jump-bins",
+        dest="spline_wander_frequency_jump_hz",
+        type=float,
+        default=argparse.SUPPRESS,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--spline_wander_amplitude_width_fraction",
+        "--spline-wander-amplitude-width-fraction",
+        type=float,
+        default=SPLINE_WANDERING_AMP_WIDTH_FRACTION,
+        help=(
+            "uniform half-width for dimensionless amplitude knots around 1, "
+            "and fractional half-width for the overall amplitude scale around "
+            "the ML amplitude, default %(default)g"
+        ),
+    )
+    parser.add_argument(
+        "--spline_wander_amplitude_jump_fraction",
+        "--spline-wander-amplitude-jump-fraction",
+        type=float,
+        default=SPLINE_WANDERING_AMP_JUMP_FRACTION,
+        help=(
+            "Gaussian proposal width for dimensionless amplitude knots before "
+            "the optional 100/SNR shrink for lines above SNR 100, and "
+            "reference fractional proposal width for the overall amplitude "
+            "scale before multiplying by 10/SNR, "
+            "default %(default)g"
+        ),
+    )
+    parser.add_argument(
+        "--spline_wander_uniform_line_prob",
+        "--spline-wander-uniform-line-prob",
+        type=float,
+        default=SPLINE_WANDERING_UNIFORM_LINE_PROB,
+        help=(
+            "fraction of splinewander line selections drawn uniformly; the "
+            "remaining selections are proportional to startup line SNR, "
+            "default %(default)g"
+        ),
+    )
+    parser.add_argument(
+        "--flat_amplitude",
+        "--flat-amplitude",
+        action="store_true",
+        help=(
+            "with --splinewanderfit, hold normalized amplitude spline knots "
+            "fixed at 1 while still fitting the overall amplitude scale"
+        ),
+    )
+    parser.add_argument(
+        "--spline_wander_local_fft_size",
+        "--spline-wander-local-fft-size",
+        type=int,
+        default=WANDERING_SINE_FFT_SIZE,
+        help="local heterodyned FFT length for spline-wandering templates, default %(default)d",
+    )
+    parser.add_argument(
+        "--powerfit",
+        "--power-fit",
+        action="store_true",
+        help="write powerfit.dat and freq_nopower.dat using a joint spline model for mains-power harmonics",
+    )
+    parser.add_argument(
+        "--powerfit_steps",
+        "--powerfit-steps",
+        "--power-steps",
+        type=int,
+        default=POWERFIT_MCMC_STEPS,
+        help="number of joint mains-harmonic MCMC updates, default %(default)d",
+    )
+    parser.add_argument(
+        "--powerfit_base_frequency",
+        "--powerfit-base-frequency",
+        "--powerfit-base",
+        "--power-mains-frequency",
+        "--mains-frequency",
+        dest="powerfit_base_frequency",
+        type=float,
+        default=POWERFIT_BASE_FREQUENCY,
+        help="mains fundamental frequency in Hz for --powerfit, default %(default)g",
+    )
+    parser.add_argument(
+        "--powerfit-50hz",
+        "--powerfit-50Hz",
+        dest="powerfit_base_frequency",
+        action="store_const",
+        const=50.0,
+        help="shortcut for --powerfit-base-frequency 50, useful for Virgo data",
+    )
+    parser.add_argument(
+        "--powerfit_harmonics",
+        "--powerfit-harmonics",
+        "--power-harmonics",
+        type=int,
+        default=POWERFIT_HARMONICS,
+        help="number of mains harmonics included in --powerfit, default %(default)d",
+    )
+    parser.add_argument(
+        "--powerfit_knot_spacing",
+        "--powerfit-knot-spacing",
+        "--powerfit_tspace",
+        "--powerfit-tspace",
+        type=float,
+        default=POWERFIT_KNOT_SPACING,
+        help=(
+            "requested shared control-point time spacing Tspace in seconds; "
+            "mapped to the nearest power of two before using Tobs/Tspace+1 "
+            "knots, default %(default)g"
+        ),
+    )
+    parser.add_argument(
+        "--powerfit_frequency_width_hz",
+        "--powerfit-frequency-width-hz",
+        dest="powerfit_frequency_width_hz",
+        type=float,
+        default=POWERFIT_FREQ_WIDTH_HZ,
+        help="uniform half-width in Hz for the shared base-frequency knots, default %(default)g",
+    )
+    parser.add_argument(
+        "--powerfit_frequency_width_bins",
+        "--powerfit-frequency-width-bins",
+        dest="powerfit_frequency_width_hz",
+        type=float,
+        default=argparse.SUPPRESS,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--powerfit_frequency_jump_hz",
+        "--powerfit-frequency-jump-hz",
+        dest="powerfit_frequency_jump_hz",
+        type=float,
+        default=POWERFIT_FREQ_JUMP_HZ,
+        help="largest base-frequency-knot proposal sigma in Hz, default %(default)g",
+    )
+    parser.add_argument(
+        "--powerfit_frequency_jump_bins",
+        "--powerfit-frequency-jump-bins",
+        dest="powerfit_frequency_jump_hz",
+        type=float,
+        default=argparse.SUPPRESS,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--powerfit_amplitude_width_fraction",
+        "--powerfit-amplitude-width-fraction",
+        type=float,
+        default=POWERFIT_AMP_WIDTH_FRACTION,
+        help="uniform half-width for the shared envelope and harmonic amplitude scales, default %(default)g",
+    )
+    parser.add_argument(
+        "--powerfit_amplitude_jump_fraction",
+        "--powerfit-amplitude-jump-fraction",
+        type=float,
+        default=POWERFIT_AMP_JUMP_FRACTION,
+        help=(
+            "Gaussian proposal width for the shared envelope, and reference "
+            "fractional proposal width for harmonic amplitude scales before "
+            "multiplying by 10/SNR, default %(default)g"
+        ),
+    )
+    parser.add_argument(
+        "--powerfit_local_fft_size",
+        "--powerfit-local-fft-size",
+        type=int,
+        default=WANDERING_SINE_FFT_SIZE,
+        help="local heterodyned FFT length for powerfit harmonic templates, default %(default)d",
     )
     parser.add_argument(
         "--linetrim",
@@ -5250,7 +8366,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--psd-range",
         "--write-psd-range",
         action="store_true",
-        help="write psd_range.dat with frequency, MCMC-sample mean PSD, and PSD standard deviation",
+        help="write psd_range.dat with frequency, median PSD, and equal-tail 90%% PSD interval",
     )
     parser.add_argument(
         "--timing",
@@ -5314,11 +8430,13 @@ def resolve_input_file(args: argparse.Namespace, nyquist: int) -> InputSpec:
             raise ValueError("positional inputs must be either one file name or trigger_time duration") from exc
         if duration <= 0.0:
             raise ValueError("segment duration must be positive")
+        if args.post_trigger > duration:
+            raise ValueError("--post-trigger must not exceed the analysis duration")
         if args.padding < 0.0:
             raise ValueError("padding must be non-negative")
         target_rate = 2.0 * float(nyquist)
         if args.expand > 1:
-            start, end = expanded_fetch_bounds(trigger_time, duration, args.expand)
+            start, end = expanded_fetch_bounds(trigger_time, duration, args.expand, args.post_trigger)
             filename = fetch_ligo_data_bounds(
                 start, end, args.ifo, args.source, args.channel,
                 args.output, target_rate, args.padding, args.resampler,
@@ -5327,7 +8445,8 @@ def resolve_input_file(args: argparse.Namespace, nyquist: int) -> InputSpec:
         else:
             filename = fetch_ligo_data(
                 trigger_time, duration, args.ifo, args.source, args.channel,
-                args.output, target_rate, args.padding, args.resampler
+                args.output, target_rate, args.padding, args.resampler,
+                args.post_trigger
             )
         trigger_label = int(math.floor(trigger_time + 0.5))
         output_tag = f"{detector_label_from_args(args)}_{trigger_label}"
@@ -5380,6 +8499,9 @@ def main(argv: list[str]) -> int:
     if args.duration is not None and (not math.isfinite(args.duration) or args.duration <= 0.0):
         print("warning: --duration must be positive and finite")
         return 1
+    if not math.isfinite(args.post_trigger) or args.post_trigger < 0.0:
+        print("warning: --post-trigger must be finite and non-negative")
+        return 1
     if args.psd_samples < 1:
         print("warning: --psd-samples must be at least 1")
         return 1
@@ -5402,6 +8524,90 @@ def main(argv: list[str]) -> int:
         return 1
     if not math.isfinite(args.feature_snr_thresh) or args.feature_snr_thresh < 0.0:
         print("warning: --feature-snr-thresh must be finite and non-negative")
+        return 1
+    if args.wander_steps < 0:
+        print("warning: --wander-steps must be non-negative")
+        return 1
+    if args.wander_max_legendre < 1:
+        print("warning: --wander-max-legendre must be at least 1")
+        return 1
+    if args.wander_initial_legendre < 1 or args.wander_initial_legendre > args.wander_max_legendre:
+        print("warning: --wander-initial-legendre must be between 1 and --wander-max-legendre")
+        return 1
+    if args.wander_local_fft_size < 8:
+        print("warning: --wander-local-fft-size must be at least 8")
+        return 1
+    if args.spline_wander_steps < 0:
+        print("warning: --spline-wander-steps must be non-negative")
+        return 1
+    if args.checkline is not None:
+        if not math.isfinite(args.checkline) or args.checkline <= 0.0:
+            print("warning: --checkline must be a positive finite frequency in Hz")
+            return 1
+        if not args.splinewanderfit:
+            print("warning: --checkline only writes diagnostics when --splinewanderfit is used")
+    if (not math.isfinite(args.spline_wander_knot_spacing)
+            or args.spline_wander_knot_spacing <= 0.0):
+        print("warning: --spline-wander-knot-spacing/--spline-wander-tspace must be positive and finite")
+        return 1
+    if (not math.isfinite(args.spline_wander_frequency_width_hz)
+            or args.spline_wander_frequency_width_hz <= 0.0):
+        print("warning: --spline-wander-frequency-width-hz must be positive and finite")
+        return 1
+    if (not math.isfinite(args.spline_wander_frequency_jump_hz)
+            or args.spline_wander_frequency_jump_hz <= 0.0):
+        print("warning: --spline-wander-frequency-jump-hz must be positive and finite")
+        return 1
+    if (not math.isfinite(args.spline_wander_amplitude_width_fraction)
+            or args.spline_wander_amplitude_width_fraction <= 0.0):
+        print("warning: --spline-wander-amplitude-width-fraction must be positive and finite")
+        return 1
+    if (not math.isfinite(args.spline_wander_amplitude_jump_fraction)
+            or args.spline_wander_amplitude_jump_fraction <= 0.0):
+        print("warning: --spline-wander-amplitude-jump-fraction must be positive and finite")
+        return 1
+    if (not math.isfinite(args.spline_wander_uniform_line_prob)
+            or args.spline_wander_uniform_line_prob < 0.0
+            or args.spline_wander_uniform_line_prob > 1.0):
+        print("warning: --spline-wander-uniform-line-prob must be between 0 and 1")
+        return 1
+    if args.flat_amplitude and not args.splinewanderfit:
+        print("warning: --flat-amplitude only affects --splinewanderfit")
+    if args.spline_wander_local_fft_size < 8:
+        print("warning: --spline-wander-local-fft-size must be at least 8")
+        return 1
+    if args.powerfit_steps < 0:
+        print("warning: --powerfit-steps must be non-negative")
+        return 1
+    if (not math.isfinite(args.powerfit_base_frequency)
+            or args.powerfit_base_frequency <= 0.0):
+        print("warning: --powerfit-base-frequency must be positive and finite")
+        return 1
+    if args.powerfit_harmonics < 1:
+        print("warning: --powerfit-harmonics must be at least 1")
+        return 1
+    if (not math.isfinite(args.powerfit_knot_spacing)
+            or args.powerfit_knot_spacing <= 0.0):
+        print("warning: --powerfit-knot-spacing/--powerfit-tspace must be positive and finite")
+        return 1
+    if (not math.isfinite(args.powerfit_frequency_width_hz)
+            or args.powerfit_frequency_width_hz <= 0.0):
+        print("warning: --powerfit-frequency-width-hz must be positive and finite")
+        return 1
+    if (not math.isfinite(args.powerfit_frequency_jump_hz)
+            or args.powerfit_frequency_jump_hz <= 0.0):
+        print("warning: --powerfit-frequency-jump-hz must be positive and finite")
+        return 1
+    if (not math.isfinite(args.powerfit_amplitude_width_fraction)
+            or args.powerfit_amplitude_width_fraction <= 0.0):
+        print("warning: --powerfit-amplitude-width-fraction must be positive and finite")
+        return 1
+    if (not math.isfinite(args.powerfit_amplitude_jump_fraction)
+            or args.powerfit_amplitude_jump_fraction <= 0.0):
+        print("warning: --powerfit-amplitude-jump-fraction must be positive and finite")
+        return 1
+    if args.powerfit_local_fft_size < 8:
+        print("warning: --powerfit-local-fft-size must be at least 8")
         return 1
     if (not math.isfinite(args.gaussian_bump_sigma_min)
             or not math.isfinite(args.gaussian_bump_sigma_max)
@@ -5489,8 +8695,11 @@ def main(argv: list[str]) -> int:
                 print("warning: fetched-data trigger time is missing")
                 return 1
             trigger_time = float(input_spec.trigger_time)
-            analysis_start, analysis_end = segment_bounds(trigger_time, analysis_duration)
+            analysis_start, analysis_end = segment_bounds(trigger_time, analysis_duration, args.post_trigger)
         else:
+            if args.post_trigger > analysis_duration:
+                print("warning: --post-trigger must not exceed the analysis duration")
+                return 1
             if expanded_psd:
                 # A plain file has no trigger metadata or guaranteed naming
                 # convention.  For the two-stage symmetric context run, assume
@@ -5499,7 +8708,7 @@ def main(argv: list[str]) -> int:
                 target_center = available_start + 0.5 * input_duration
                 analysis_start = target_center - 0.5 * analysis_duration
                 analysis_end = analysis_start + analysis_duration
-                trigger_time = analysis_end - TRIGGER_OFFSET_FROM_END
+                trigger_time = analysis_end - args.post_trigger
                 print(
                     "WARNING: user-supplied --expand input assumes the target "
                     f"analysis segment is centered in the file with "
@@ -5510,12 +8719,15 @@ def main(argv: list[str]) -> int:
             else:
                 # Keep the historical file+duration behavior for --expand 1:
                 # treat the file center as the trigger so the analysis segment
-                # keeps the usual trigger+4 end time.
+                # keeps the requested post-trigger end time.
                 trigger_time = float(timeX[0]) + 0.5 * input_duration
-                analysis_start, analysis_end = segment_bounds(trigger_time, analysis_duration)
+                analysis_start, analysis_end = segment_bounds(
+                    trigger_time, analysis_duration, args.post_trigger
+                )
                 print(
                     "WARNING: user-supplied analysis duration assumes the trigger "
-                    f"is at the center of the provided data, GPS {trigger_time:.6f}"
+                    f"is at the center of the provided data, GPS {trigger_time:.6f}; "
+                    f"using {args.post_trigger:g} seconds after the trigger"
                 )
 
         if expanded_psd:
@@ -5841,6 +9053,13 @@ def main(argv: list[str]) -> int:
             collected_context_samples, context_prior_inflate,
             float(args.context_prior_sigma_floor), output_psd_scale
         )
+        bwwpsd_filename = tagged_output_name("BWWpsd.dat", input_spec)
+        np.savetxt(
+            bwwpsd_filename,
+            np.column_stack((target_bptr.freq, output_psd_scale * context_prior_mean)),
+            header="frequency context_welch_median_psd",
+        )
+        print(f"Wrote {bwwpsd_filename} with Welch/context median PSD")
         adapt_context_target_model_caps(target_bptr, args.gaussian_bumps)
         target_fprop = np.zeros(N // 2, dtype=np.float64)
         build_context_line_proposal(target_bptr, target_fprop, context_prior_mean, context_background)
@@ -5903,9 +9122,18 @@ def main(argv: list[str]) -> int:
     # user-facing files back to duration-independent PSD units while scaling the
     # frequency-domain data consistently for ADtest.py's Re/sqrt(2*PSD) check.
     psd_scale = output_psd_scale
-    freq_scale = math.sqrt(16.0 * window_power_correction / Tobs)
+    freq_scale = frequency_data_output_scale(Tobs, window_power_correction)
     freq_out[1:, 1] = freq_scale * fdata[2:N:2]
     freq_out[1:, 2] = freq_scale * fdata[3:N + 1:2]
+    if args.print_raw:
+        raw_freq_out = np.zeros_like(freq_out)
+        raw_freq_out[:, 0] = bw_freq
+        raw_fft_scale = freq_scale * dt / math.sqrt(2.0)
+        raw_freq_out[1:, 1] = raw_fft_scale * dataf_c[1:N // 2].real
+        raw_freq_out[1:, 2] = raw_fft_scale * dataf_c[1:N // 2].imag
+        raw_frequency_data_filename = tagged_output_name("frequency_data_raw.dat", input_spec)
+        np.savetxt(raw_frequency_data_filename, raw_freq_out)
+        print(f"Wrote {raw_frequency_data_filename} with uncleaned Tukey-windowed frequency data")
 
     fairdraw_psd_out = psd_scale * psd.copy()
     if fairdraw_psd_out.size > 1:
@@ -5976,17 +9204,22 @@ def main(argv: list[str]) -> int:
     else:
         np.savetxt("BWpsd_components.dat", np.column_stack((bw_freq, median_psd_out, median_smooth_out, median_line_out)))
     if args.psd_range:
-        std_psd = np.zeros_like(psd)
+        lower_psd = median_psd.copy()
+        upper_psd = median_psd.copy()
         if collected_psd_samples > 0:
-            ddof = 1 if collected_psd_samples > 1 else 0
-            std_psd[bptr.data.imin:bptr.data.imax] = np.std(active_samples, axis=0, ddof=ddof)
-        mean_psd_out = psd_scale * average_psd
-        std_psd_out = psd_scale * std_psd
-        if mean_psd_out.size > 1:
-            mean_psd_out[0] = mean_psd_out[1]
-            std_psd_out[0] = std_psd_out[1]
-        np.savetxt("psd_range.dat", np.column_stack((bw_freq, mean_psd_out, std_psd_out)))
-        print("Wrote psd_range.dat with MCMC-sample mean PSD and standard deviation")
+            lower_psd[bptr.data.imin:bptr.data.imax] = np.percentile(active_samples, 5.0, axis=0)
+            upper_psd[bptr.data.imin:bptr.data.imax] = np.percentile(active_samples, 95.0, axis=0)
+        lower_psd_out = psd_scale * lower_psd
+        upper_psd_out = psd_scale * upper_psd
+        if lower_psd_out.size > 1:
+            lower_psd_out[0] = lower_psd_out[1]
+            upper_psd_out[0] = upper_psd_out[1]
+        np.savetxt(
+            "psd_range.dat",
+            np.column_stack((bw_freq, median_psd_out, lower_psd_out, upper_psd_out)),
+            header="frequency median_psd lower_90_equal_tail upper_90_equal_tail",
+        )
+        print("Wrote psd_range.dat with median PSD and equal-tail 90% interval")
     if args.write_line_params:
         line_params_filename = tagged_output_name("line_parameters.dat", input_spec)
         write_final_line_parameters(bptr, psd_scale, line_params_filename)
@@ -6001,11 +9234,69 @@ def main(argv: list[str]) -> int:
     if args.writewhite:
         write_whitened_line_subtracted_files(bptr, dataf_c, fdata, dt, bptr.rng)
     if args.write_line_subtracted_time:
-        write_line_subtracted_frequency_file(bptr, dataf_c, dt, bptr.rng)
+        write_line_subtracted_frequency_file(bptr, dataf_c, dt, window_power_correction, bptr.rng)
         write_time_domain_line_subtracted_files(bptr, times, dataf_c, fdata, dt, bptr.rng)
     if args.sinefit:
         sinefit(bptr, N, alpha)
         write_sine_subtracted_frequency_file(bptr, dataf_c, dt, N, alpha)
+    if args.oscillatorfit:
+        sinefit(
+            bptr, N, alpha,
+            output_file="oscillatorfit.dat",
+            fit_model="oscillator",
+        )
+        write_sine_subtracted_frequency_file(
+            bptr, dataf_c, dt, N, alpha,
+            output_file="freq_nooscillator.dat",
+            fit_model="oscillator",
+        )
+    if args.wanderfit:
+        write_wandering_subtracted_frequency_file(
+            bptr, dataf_c, dt, N, alpha, bptr.rng,
+            steps=args.wander_steps,
+            initial_legendre=args.wander_initial_legendre,
+            max_legendre=args.wander_max_legendre,
+            local_fft_size=args.wander_local_fft_size,
+            scan_points=SINEFIT_SCAN_POINTS,
+        )
+    powerfit_result = None
+    if args.powerfit or args.splinewanderfit:
+        powerfit_result = write_powerfit_subtracted_frequency_file(
+            bptr, dataf_c, dt, N, alpha, bptr.rng,
+            steps=args.powerfit_steps,
+            base_frequency=args.powerfit_base_frequency,
+            harmonic_count=args.powerfit_harmonics,
+            knot_spacing=args.powerfit_knot_spacing,
+            freq_width_hz=args.powerfit_frequency_width_hz,
+            freq_jump_hz=args.powerfit_frequency_jump_hz,
+            amp_width_fraction=args.powerfit_amplitude_width_fraction,
+            amp_jump_fraction=args.powerfit_amplitude_jump_fraction,
+            local_fft_size=args.powerfit_local_fft_size,
+            scan_points=SINEFIT_SCAN_POINTS,
+        )
+    if args.splinewanderfit:
+        assert powerfit_result is not None
+        powerfit_state, _powerfit_smooth, _powerfit_original, powerfit_residual = powerfit_result
+        powerfit_skip_ranges = powerfit_splinewander_skip_ranges(
+            powerfit_state, bptr.data.t_obs, use_best=False
+        )
+        write_spline_wandering_subtracted_frequency_file(
+            bptr, dataf_c, dt, N, alpha, bptr.rng,
+            steps=args.spline_wander_steps,
+            knot_spacing=args.spline_wander_knot_spacing,
+            freq_width_hz=args.spline_wander_frequency_width_hz,
+            freq_jump_hz=args.spline_wander_frequency_jump_hz,
+            amp_width_fraction=args.spline_wander_amplitude_width_fraction,
+            amp_jump_fraction=args.spline_wander_amplitude_jump_fraction,
+            uniform_line_prob=args.spline_wander_uniform_line_prob,
+            flat_amplitude=args.flat_amplitude,
+            local_fft_size=args.spline_wander_local_fft_size,
+            scan_points=SINEFIT_SCAN_POINTS,
+            checkline_frequency=args.checkline,
+            prefit_residual=powerfit_residual,
+            prefit_powerfit_state=powerfit_state,
+            skip_frequency_ranges=powerfit_skip_ranges,
+        )
     timing_mark("write_outputs")
 
     if args.timing:
